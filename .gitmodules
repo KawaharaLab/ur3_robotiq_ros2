@@ -1,0 +1,3 @@
+[submodule "external/robotiq_2f_gripper_ros2"]
+	path = external/robotiq_2f_gripper_ros2
+	url = git@github.com:jannishaberhausen/robotiq_2f_gripper_ros2.git
