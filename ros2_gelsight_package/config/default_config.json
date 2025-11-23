@@ -1,0 +1,6 @@
+{
+  "camera_width": 640,
+  "camera_height": 480,
+  "border_fraction": 0.1,
+  "default_camera_index": 1
+}

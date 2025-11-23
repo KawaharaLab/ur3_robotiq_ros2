@@ -1,0 +1,22 @@
+# Example configuration for data_capture_tools
+output_root: ./data
+stop_key: q
+bag_record:
+  storage: sqlite3
+  compression_mode: file
+  compression_format: zstd
+topics:
+  - name: /camera/color/image_raw
+    type: sensor_msgs/msg/Image
+    mode: image
+    encoding: bgr8
+  - name: /joint_states
+    type: sensor_msgs/msg/JointState
+    mode: csv
+  - name: /force_torque
+    type: geometry_msgs/msg/WrenchStamped
+    mode: csv
+  - name: /gelsight/image_raw
+    type: sensor_msgs/msg/Image
+    mode: image
+    encoding: bgr8
