@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Entry point for running the Pi0 inference node via ros2 run."""
+
+from vla_adapter.pi0_inference_node import main
+
+
+if __name__ == "__main__":
+    main()

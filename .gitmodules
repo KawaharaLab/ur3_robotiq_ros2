@@ -32,3 +32,7 @@
 	path = external/moveit/moveit2_tutorials
 	url = https://github.com/moveit/moveit2_tutorials
 	branch = humble
+[submodule "external/openpi"]
+	path = external/openpi
+	url = git@github.com:KawaharaLab/openpi.git
+	branch = tk_grad_baseline
