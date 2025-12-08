@@ -33,6 +33,12 @@ class CaptureConfig:
     """Top-level configuration for a capture session."""
 
     output_root: Path
+    task_name: str
+    prompt: str
+    viewer_topics: list[str]
+    image_throttle_hz: float
+    other_throttle_hz: float
+    enable_image_compression: bool
     stop_key: str
     topics: List[TopicSpec]
     bag: BagRecorderConfig
@@ -84,10 +90,27 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     )
 
     output_root = Path(data.get("output_root", "./data")).expanduser().resolve()
+    task_name = str(data.get("task_name", "pick_and_place"))
+    prompt = str(
+        data.get(
+            "prompt",
+            "pick the blue tape and place it in the orange box.",
+        )
+    )
+    viewer_topics = [str(item) for item in data.get("viewer_topics", [])]
+    image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
+    other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
+    enable_image_compression = bool(data.get("enable_image_compression", True))
     stop_key = str(data.get("stop_key", "q"))
 
     return CaptureConfig(
         output_root=output_root,
+        task_name=task_name,
+        prompt=prompt,
+        viewer_topics=viewer_topics,
+        image_throttle_hz=image_throttle_hz,
+        other_throttle_hz=other_throttle_hz,
+        enable_image_compression=enable_image_compression,
         stop_key=stop_key,
         topics=topics,
         bag=bag,

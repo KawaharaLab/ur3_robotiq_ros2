@@ -1,17 +1,44 @@
 # Example configuration for data_capture_tools
 output_root: ./data
+task_name: pick_and_place
+prompt: "pick the blue tape and place it in the orange box."
+viewer_topics:
+  - /camera/camera_fixed/color/image_raw
+  - /camera/camera_wrist/color/image_raw
+image_throttle_hz: 0
+other_throttle_hz: 100.0
+enable_image_compression: true
 stop_key: q
 bag_record:
   storage: sqlite3
   compression_mode: file
   compression_format: zstd
 topics:
-  - name: /camera/color/image_raw
+  - name: /camera/camera_wrist/color/image_raw
     type: sensor_msgs/msg/Image
     mode: image
     encoding: bgr8
+  - name: /camera/camera_fixed/color/image_raw
+    type: sensor_msgs/msg/Image
+    mode: image
+    encoding: bgr8
+  - name: /tf
+    type: tf2_msgs/msg/TFMessage
+    mode: csv
+  - name: /tf_static
+    type: tf2_msgs/msg/TFMessage
+    mode: csv
   - name: /joint_states
     type: sensor_msgs/msg/JointState
+    mode: csv
+  - name: /forward_position_controller/commands
+    type: std_msgs/msg/Float64MultiArray
+    mode: csv
+  - name: /robotiq_2f_gripper/finger_distance_mm
+    type: std_msgs/msg/Float32
+    mode: csv
+  - name: /robotiq_2f_gripper_action_goal
+    type: std_msgs/msg/Float32MultiArray
     mode: csv
   - name: /force_torque
     type: geometry_msgs/msg/WrenchStamped

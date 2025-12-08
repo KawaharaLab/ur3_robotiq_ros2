@@ -52,6 +52,7 @@
 #include <rclcpp/utilities.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <thread>
 #include <cmath>
 #include <array>
@@ -70,10 +71,12 @@ const std::string JOINT_TOPIC = "/servo_node/delta_joint_cmds";
 const std::string EEF_FRAME_ID = "wrist_3_link";
 const std::string BASE_FRAME_ID = "base_link";
 const std::string GRIPPER_ACTION_NAME = "/robotiq_2f_gripper_action";
-const double GRIPPER_OPEN_POSITION = 0.075;
+const std::string GRIPPER_GOAL_LOG_TOPIC = "/robotiq_2f_gripper_action_goal";  // logging-only, for bagging
+const double GRIPPER_OPEN_POSITION = 0.140;
 const double GRIPPER_CLOSE_POSITION = 0.0;
 const double GRIPPER_TARGET_SPEED = 0.15;
 const double GRIPPER_TARGET_FORCE = 0.2;
+const double GRIPPER_STEP = 0.005;  // Smaller increment per joystick event for smoother motion
 
 // Enums for button names -> axis/button array index
 // For XBOX 1 controller
@@ -202,7 +205,6 @@ class JoyToServoPubUr : public rclcpp::Node
 {
   using GripperAction = robotiq_2f_gripper_msgs::action::MoveTwoFingerGripper;
   using GoalHandleGripper = rclcpp_action::ClientGoalHandle<GripperAction>;
-
 public:
   JoyToServoPubUr(const rclcpp::NodeOptions& options)
     : Node("joy_to_twist_publisher", options), frame_to_publish_(BASE_FRAME_ID)
@@ -217,8 +219,12 @@ public:
     collision_pub_ =
         this->create_publisher<moveit_msgs::msg::PlanningScene>("/planning_scene", rclcpp::SystemDefaultsQoS());
 
+    // Logging-only: publish every gripper goal so it can be recorded in bag files.
+    gripper_goal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(GRIPPER_GOAL_LOG_TOPIC, rclcpp::SystemDefaultsQoS());
+
     gripper_action_client_ = rclcpp_action::create_client<GripperAction>(this, GRIPPER_ACTION_NAME);
-    last_button_states_.fill(0);
+    gripper_position_ = GRIPPER_OPEN_POSITION;
+    last_gripper_target_ = gripper_position_;
 
     // Create a service client to start the ServoNode
     servo_start_client_ = this->create_client<std_srvs::srv::Trigger>("/servo_node/start_servo");
@@ -306,11 +312,15 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
   rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr joint_pub_;
   rclcpp::Publisher<moveit_msgs::msg::PlanningScene>::SharedPtr collision_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_goal_pub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr servo_start_client_;
   rclcpp_action::Client<GripperAction>::SharedPtr gripper_action_client_;
 
   std::string frame_to_publish_;
-  std::array<int, static_cast<std::size_t>(Button::BUTTON_COUNT)> last_button_states_;
+  double gripper_position_;
+  double last_gripper_target_;
+  rclcpp::Time last_gripper_send_time_;
+  bool gripper_goal_active_ {false};
 
   std::thread collision_pub_thread_;
 
@@ -321,34 +331,42 @@ private:
       return (idx < buttons.size()) ? buttons[idx] : 0;
     };
 
-    const bool rb_pressed = get_button(RIGHT_BUMPER) > 0;
-    const bool lb_pressed = get_button(LEFT_BUMPER) > 0;
-    const bool rb_edge = rb_pressed && (last_button_states_.at(RIGHT_BUMPER) == 0);
-    const bool lb_edge = lb_pressed && (last_button_states_.at(LEFT_BUMPER) == 0);
+    const bool rb_pressed = get_button(RIGHT_BUMPER) > 0;   // open
+    const bool lb_pressed = get_button(LEFT_BUMPER) > 0;     // close
 
-    if (rb_edge)
+    const double delta = (rb_pressed ? 1.0 : 0.0) - (lb_pressed ? 1.0 : 0.0);
+    if (std::fabs(delta) < 1e-3)
     {
-      sendGripperCommand(GRIPPER_OPEN_POSITION);
-    }
-    else if (lb_edge)
-    {
-      sendGripperCommand(GRIPPER_CLOSE_POSITION);
+      return;  // No gripper request this cycle
     }
 
-    const auto copy_count = std::min(last_button_states_.size(), buttons.size());
-    for (std::size_t i = 0; i < copy_count; ++i)
+    const double new_target = std::clamp(
+        gripper_position_ + delta * GRIPPER_STEP,
+        GRIPPER_CLOSE_POSITION,
+        GRIPPER_OPEN_POSITION);
+
+    // Throttle commands to avoid spamming the action server
+    const auto now = this->now();
+    const bool position_changed = std::fabs(new_target - last_gripper_target_) > 5e-5;
+    const bool time_elapsed = (last_gripper_send_time_.nanoseconds() == 0) ||
+                  ((now - last_gripper_send_time_).seconds() > 0.004);
+
+    gripper_position_ = new_target;
+    if (position_changed && time_elapsed)
     {
-      last_button_states_[i] = buttons[i];
-    }
-    for (std::size_t i = buttons.size(); i < last_button_states_.size(); ++i)
-    {
-      last_button_states_[i] = 0;
+      sendGripperCommand(gripper_position_);
+      last_gripper_target_ = gripper_position_;
+      last_gripper_send_time_ = now;
     }
   }
 
   void sendGripperCommand(double target_position)
   {
     if (!gripper_action_client_)
+      return;
+
+    // Avoid spamming the gripper server with overlapping goals.
+    if (gripper_goal_active_)
       return;
 
     if (!gripper_action_client_->wait_for_action_server(std::chrono::seconds(0)))
@@ -362,8 +380,33 @@ private:
     goal.target_position = target_position;
     goal.target_speed = GRIPPER_TARGET_SPEED;
     goal.target_force = GRIPPER_TARGET_FORCE;
-    gripper_action_client_->async_send_goal(goal,
-                                            rclcpp_action::Client<GripperAction>::SendGoalOptions());
+
+    // Log the goal for bagging/analysis; publish [position, speed, force].
+    if (gripper_goal_pub_)
+    {
+      std_msgs::msg::Float32MultiArray log_msg;
+      log_msg.data = {static_cast<float>(goal.target_position),
+                      static_cast<float>(goal.target_speed),
+                      static_cast<float>(goal.target_force)};
+      gripper_goal_pub_->publish(log_msg);
+    }
+
+    rclcpp_action::Client<GripperAction>::SendGoalOptions options;
+    options.goal_response_callback = [this](auto future)
+    {
+      const auto handle = future.get();
+      if (!handle)
+      {
+        gripper_goal_active_ = false;
+      }
+    };
+    options.result_callback = [this](auto /*result*/)
+    {
+      gripper_goal_active_ = false;
+    };
+
+    gripper_goal_active_ = true;
+    gripper_action_client_->async_send_goal(goal, options);
   }
 };  // class JoyToServoPubUr
 

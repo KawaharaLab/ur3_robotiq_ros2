@@ -6,11 +6,13 @@ import csv
 import shutil
 import subprocess
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, MutableMapping, Optional
 
 import cv2
 from cv_bridge import CvBridge
+from sensor_msgs.msg import CompressedImage, Image
 from rclpy.serialization import deserialize_message
 from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
 from rosidl_runtime_py import message_to_ordereddict
@@ -201,6 +203,7 @@ def convert_bag_to_dataset(
         bridge = CvBridge()
         image_dirs: Dict[str, Path] = {}
         csv_rows: list[dict[str, object]] = []
+        skipped_messages: dict[str, int] = defaultdict(int)
 
         while reader.has_next():
             topic, data, stamp = reader.read_next()
@@ -209,7 +212,15 @@ def convert_bag_to_dataset(
                 continue
 
             msg_cls = message_types[topic]
-            message = deserialize_message(data, msg_cls)
+            try:
+                message = deserialize_message(data, msg_cls)
+            except Exception as exc:  # noqa: BLE001
+                skipped_messages[topic] += 1
+                if logger and skipped_messages[topic] == 1:
+                    logger.warning(
+                        f"Skipping messages for topic {topic}: deserialization failed ({exc})"
+                    )
+                continue
 
             if spec.mode == "image":
                 folder = image_dirs.get(topic)
@@ -217,10 +228,15 @@ def convert_bag_to_dataset(
                     folder = output_dir / "images" / _sanitize_topic(topic)
                     folder.mkdir(parents=True, exist_ok=True)
                     image_dirs[topic] = folder
-                image = bridge.imgmsg_to_cv2(
-                    message,
-                    desired_encoding=spec.encoding or "bgr8",
-                )
+
+                if isinstance(message, CompressedImage):
+                    image = bridge.compressed_imgmsg_to_cv2(message)
+                else:
+                    image = bridge.imgmsg_to_cv2(
+                        message,
+                        desired_encoding=spec.encoding or "bgr8",
+                    )
+
                 filename = folder / f"{stamp}.png"
                 if not cv2.imwrite(str(filename), image) and logger:
                     logger.warning(
@@ -251,6 +267,15 @@ def convert_bag_to_dataset(
                 writer.writerows(csv_rows)
             if logger:
                 logger.info(f"Wrote {len(csv_rows)} rows to {csv_path}")
+
+        if logger and skipped_messages:
+            total_skipped = sum(skipped_messages.values())
+            topics = ", ".join(
+                f"{name} ({count})" for name, count in skipped_messages.items()
+            )
+            logger.warning(
+                f"Skipped {total_skipped} messages due to deserialization errors: {topics}"
+            )
     finally:
         if temp_handle:
             temp_handle.cleanup()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sys
 import threading
 from dataclasses import dataclass
@@ -69,10 +70,11 @@ class Pi0InferenceNode(Node):
 		qos_scalar = QoSProfile(depth=5)
 		qos_scalar.history = QoSHistoryPolicy.KEEP_LAST
 		qos_scalar.reliability = QoSReliabilityPolicy.BEST_EFFORT
+		qos_arm_cmd = QoSProfile(depth=5)
+		qos_arm_cmd.history = QoSHistoryPolicy.KEEP_LAST
+		qos_arm_cmd.reliability = QoSReliabilityPolicy.BEST_EFFORT
 
 		# Topic + policy wiring parameters.
-		self._image_height = self.declare_parameter("image_height", 224).get_parameter_value().integer_value
-		self._image_width = self.declare_parameter("image_width", 224).get_parameter_value().integer_value
 		self._image_encoding = self.declare_parameter("image_encoding", "rgb8").value
 		self._channels_last = self.declare_parameter("channels_last", True).value
 
@@ -102,12 +104,12 @@ class Pi0InferenceNode(Node):
 		self._arm_joint_names = self._get_str_list_param(
 			"arm_joint_names",
 			default=[
+				"shoulder_pan_joint",
 				"shoulder_lift_joint",
 				"elbow_joint",
 				"wrist_1_joint",
 				"wrist_2_joint",
 				"wrist_3_joint",
-				"shoulder_pan_joint",
 			],
 		)
 		canonical_policy_joint_order = [
@@ -132,6 +134,17 @@ class Pi0InferenceNode(Node):
 		self._gripper_target_speed = float(self.declare_parameter("gripper_target_speed", 0.5).value)
 		self._gripper_target_force = float(self.declare_parameter("gripper_target_force", 0.5).value)
 		self._gripper_action_deadband = float(self.declare_parameter("gripper_action_deadband", 0.002).value)
+		self._debug_enabled = bool(self.declare_parameter("debug", False).value)
+		self._debug_dataset_dir = Path(
+			self.declare_parameter(
+				"debug_dataset_dir",
+				str(REPO_ROOT / "data" / "example"),
+			).value
+		)
+		self._debug_csv_filename = self.declare_parameter("debug_csv_filename", "example.csv").value
+		self._debug_single_shot_done = False
+		self._debug_shutdown_requested = False
+		self._debug_joint_positions: Dict[str, float] = {}
 
 		state_order = self._get_str_list_param("state_joint_order", default=[])
 		if state_order:
@@ -139,7 +152,6 @@ class Pi0InferenceNode(Node):
 		else:
 			self._state_joint_order = [*self._policy_arm_joint_order, *self._gripper_joint_names]
 
-		self._state_pad_length = self.declare_parameter("state_pad_length", 14).get_parameter_value().integer_value
 		self._max_data_age = Duration(seconds=self.declare_parameter("max_data_age", 0.5).value)
 		self._action_execution_period = float(self.declare_parameter("action_execution_period", 0.05).value)
 		actions_per_inference_param = self.declare_parameter("actions_per_inference", 16)
@@ -148,14 +160,15 @@ class Pi0InferenceNode(Node):
 		self._inference_period = float(
 			self.declare_parameter("inference_period", default_inference_period).value
 		)
-		self._prompt = self.declare_parameter("default_prompt", "Pick up the blue object and place it in the orange box.").value
+		self._prompt = self.declare_parameter("default_prompt", "Pick up the blue cube.").value
+		# self._prompt = self.declare_parameter("default_prompt", "Pick up the blue object and place it in the orange box.").value
 
 		self._publish_horizon_index = self.declare_parameter("publish_horizon_index", 0).get_parameter_value().integer_value
 		default_arm_action_indices: list[int] = []
 		for joint in self._arm_joint_names:
 			idx = self._policy_arm_index.get(joint)
 			if idx is None:
-				self.get_logger().warning("Joint %s missing from policy order", joint)
+				self.get_logger().warning(f"Joint {joint} missing from policy order")
 				continue
 			default_arm_action_indices.append(idx)
 		if not default_arm_action_indices:
@@ -180,7 +193,7 @@ class Pi0InferenceNode(Node):
 		).value
 
 		self._arm_pub = None if not self._arm_command_topic else self.create_publisher(
-			Float64MultiArray, self._arm_command_topic, 10
+			Float64MultiArray, self._arm_command_topic, qos_arm_cmd
 		)
 		if self._gripper_command_topic:
 			gripper_type = Float64MultiArray if self._gripper_uses_multiarray else Float64
@@ -199,6 +212,15 @@ class Pi0InferenceNode(Node):
 		self._last_joint_stamp: Optional[Time] = None
 		self._pending_actions: Optional[np.ndarray] = None
 		self._pending_action_index = 0
+		self._debug_dataset_row: dict[str, str] | None = None
+
+		if self._debug_enabled:
+			try:
+				self._initialize_debug_dataset()
+				self.get_logger().info(f"Debug dataset preloaded from {self._debug_dataset_dir}")
+			except Exception as exc:
+				self.get_logger().error(f"Failed to prepare debug dataset: {exc}")
+				self._debug_enabled = False
 
 		# Subscriptions.
 		if self._image_slots["wrist"].subscription_topic:
@@ -241,8 +263,10 @@ class Pi0InferenceNode(Node):
 		self._policy = self._create_local_policy()
 
 		# Periodic inference loop.
-		self.create_timer(self._inference_period, self._inference_timer)
-		self.create_timer(self._action_execution_period, self._action_timer)
+		self._inference_timer_handle = self.create_timer(self._inference_period, self._inference_timer)
+		self._action_timer_handle = None
+		if not self._debug_enabled:
+			self._action_timer_handle = self.create_timer(self._action_execution_period, self._action_timer)
 
 		self.get_logger().info(
 			f"Pi0 inference node ready (policy={self._policy_descriptor}, arm_topic={self._arm_joint_topic},"
@@ -270,17 +294,125 @@ class Pi0InferenceNode(Node):
 		return [int(v) for v in default]
 
 	# ---------------------------------------------------------------------
+	# Debug helpers
+	# ---------------------------------------------------------------------
+	def _initialize_debug_dataset(self) -> None:
+		csv_path = self._debug_dataset_dir / self._debug_csv_filename
+		if not csv_path.is_file():
+			raise FileNotFoundError(f"Debug CSV not found: {csv_path}")
+		with csv_path.open(newline="", encoding="utf-8") as handle:
+			reader = csv.DictReader(handle)
+			try:
+				row = next(reader)
+			except StopIteration as exc:
+				raise RuntimeError(f"Debug CSV {csv_path} has no rows") from exc
+
+		self._debug_dataset_row = row
+		self._load_debug_state_from_row(row)
+		self._load_debug_images_from_row(row)
+		self._last_joint_stamp = self.get_clock().now()
+
+	def _load_debug_state_from_row(self, row: dict[str, str]) -> None:
+		missing = []
+		state: Dict[str, float] = {}
+		for joint in self._state_joint_order:
+			value_raw = row.get(joint)
+			if value_raw is None:
+				missing.append(joint)
+				continue
+			value = value_raw.strip()
+			if not value:
+				missing.append(joint)
+				continue
+			try:
+				state[joint] = float(value)
+			except ValueError as exc:
+				raise ValueError(f"Invalid value for joint {joint} in debug CSV: {value}") from exc
+		if missing:
+			raise ValueError(
+				"Debug CSV missing joint columns: " + ",".join(missing),
+			)
+		self._latest_joint_positions.update(state)
+		self._debug_joint_positions = state
+
+	def _load_debug_images_from_row(self, row: dict[str, str]) -> None:
+		now = self.get_clock().now()
+		for slot_name in self._image_slots.keys():
+			column = f"{slot_name}_image"
+			image_rel_raw = row.get(column)
+			if not image_rel_raw:
+				continue
+			image_rel = image_rel_raw.strip()
+			if not image_rel:
+				continue
+			image_path = self._debug_dataset_dir / image_rel
+			if not image_path.is_file():
+				raise FileNotFoundError(f"Debug image missing: {image_path}")
+			image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+			if image is None:
+				raise RuntimeError(f"Failed to load debug image: {image_path}")
+			image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+			if not self._channels_last:
+				image = np.transpose(image, (2, 0, 1))
+			self._latest_images[slot_name] = (now, np.ascontiguousarray(image))
+
+	def _log_debug_action(self, absolute_positions: Sequence[float], flat_vec: np.ndarray) -> None:
+		arm_targets = {
+			self._policy_arm_joint_order[idx]: round(absolute_positions[idx], 4)
+			for idx in self._arm_action_indices
+			if idx < len(self._policy_arm_joint_order)
+		}
+		self.get_logger().info(f"Debug arm command -> {arm_targets}")
+		gripper_values = [float(flat_vec[idx]) for idx in self._gripper_action_indices if idx < len(flat_vec)]
+		if gripper_values:
+			self.get_logger().info(f"Debug gripper delta -> {gripper_values}")
+
+	def _shutdown_debug_mode(self) -> None:
+		if self._debug_shutdown_requested:
+			return
+		self._debug_shutdown_requested = True
+		self.get_logger().info("Debug mode complete. Shutting down rclpy ...")
+		if rclpy.ok():
+			rclpy.shutdown()
+
+	def _run_debug_action_sequence(self, actions: np.ndarray) -> None:
+		sequence = self._extract_action_sequence(actions)
+		if sequence.size == 0:
+			self.get_logger().warning("Debug mode: no actions to execute")
+			self._debug_single_shot_done = True
+			self._shutdown_debug_mode()
+			return
+		max_len = min(self._actions_per_inference, sequence.shape[0])
+		current_policy_positions: list[Optional[float]] = [
+			self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order
+		]
+		for step_idx in range(max_len):
+			action_vec = sequence[step_idx]
+			self._publish_action_vector(action_vec, current_policy_positions)
+			if any(pos is None for pos in current_policy_positions):
+				continue
+			flat_vec = np.asarray(action_vec).ravel()
+			policy_len = len(current_policy_positions)
+			for joint_idx in range(min(policy_len, len(flat_vec))):
+				current_policy_positions[joint_idx] = (
+					float(current_policy_positions[joint_idx]) + float(flat_vec[joint_idx])
+				)
+		self._debug_single_shot_done = True
+		self.get_logger().info(f"Debug inference emitted {max_len} action vectors")
+		self._shutdown_debug_mode()
+
+	# ---------------------------------------------------------------------
 	# Policy wiring
 	# ---------------------------------------------------------------------
 	def _create_local_policy(self) -> PolicyHandle:
 		config_name = self.declare_parameter("policy_config_name", "pi0_ur3_robotiq").value
 		checkpoint_uri = self.declare_parameter(
-			"policy_checkpoint_uri", "gs://openpi-assets/checkpoints/pi0_base"
+			"policy_checkpoint_uri", "gs://openpi-assets/checkpoints/pi0_base_pytorch"
 		).value
 		pytorch_device_param = self.declare_parameter("policy_pytorch_device", "auto").value
 		default_prompt_override = self.declare_parameter("policy_default_prompt", self._prompt).value
-		sample_steps = self.declare_parameter("policy_sample_steps", 10).get_parameter_value().integer_value
-		sample_kwargs = {"num_steps": sample_steps} if sample_steps > 0 else {}
+		# sample_steps = self.declare_parameter("policy_sample_steps", 10).get_parameter_value().integer_value
+		# sample_kwargs = {"num_steps": sample_steps} if sample_steps > 0 else {}
 
 		checkpoint_dir = _download.maybe_download(checkpoint_uri)
 		train_config = _config.get_config(config_name)
@@ -288,14 +420,14 @@ class Pi0InferenceNode(Node):
 		policy = _policy_config.create_trained_policy(
 			train_config,
 			checkpoint_dir,
-			sample_kwargs=sample_kwargs,
-			default_prompt=default_prompt_override or None,
-			pytorch_device=pytorch_device,
+			# sample_kwargs=sample_kwargs,
+			# default_prompt=default_prompt_override,
+			# pytorch_device=pytorch_device,
 		)
 		self._policy_descriptor = f"{config_name} @ {checkpoint_dir}"
 		try:
 			metadata = policy.metadata
-			self.get_logger().info("Loaded OpenPI policy metadata: %s", metadata)
+			self.get_logger().info(f"Loaded OpenPI policy metadata: {metadata}")
 		except Exception:
 			print("Failed to retrieve policy metadata with exception:", sys.exc_info()[1])
 			pass
@@ -305,14 +437,13 @@ class Pi0InferenceNode(Node):
 	# Subscriptions
 	# ---------------------------------------------------------------------
 	def _image_callback(self, slot: str, msg: Image) -> None:
+		if self._debug_enabled:
+			return
 		try:
 			cv_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding=self._image_encoding)
 		except CvBridgeError as exc:
-			self.get_logger().warning("Failed to convert %s image: %s", slot, exc)
+			self.get_logger().warning(f"Failed to convert {slot} image: {exc}")
 			return
-
-		if self._image_height > 0 and self._image_width > 0:
-			cv_image = cv2.resize(cv_image, (self._image_width, self._image_height), interpolation=cv2.INTER_LINEAR)
 
 		if not self._channels_last:
 			cv_image = np.transpose(cv_image, (2, 0, 1))
@@ -323,6 +454,8 @@ class Pi0InferenceNode(Node):
 			self._latest_images[slot] = (stamp, np.ascontiguousarray(cv_image))
 
 	def _joint_state_callback(self, msg: JointState) -> None:
+		if self._debug_enabled:
+			return
 		positions = dict(zip(msg.name, msg.position))
 		stamp = Time.from_msg(msg.header.stamp) if msg.header.stamp else self.get_clock().now()
 		with self._lock:
@@ -333,6 +466,8 @@ class Pi0InferenceNode(Node):
 		"""Handle Float32 gripper distance topics (e.g. finger_distance_mm)."""
 		if not self._gripper_distance_joint_name:
 			return
+		if self._debug_enabled:
+			return
 		stamp = self.get_clock().now()
 		with self._lock:
 			self._latest_joint_positions[self._gripper_distance_joint_name] = float(msg.data)
@@ -342,6 +477,8 @@ class Pi0InferenceNode(Node):
 	# Inference loop
 	# ---------------------------------------------------------------------
 	def _inference_timer(self) -> None:
+		if self._debug_enabled and self._debug_single_shot_done:
+			return
 		with self._lock:
 			obs = self._build_observation_locked()
 		if obs is None:
@@ -351,15 +488,19 @@ class Pi0InferenceNode(Node):
 		try:
 			result = self._policy.infer(obs)
 		except Exception as exc:  # pragma: no cover - depends on server
-			self.get_logger().error("Policy inference failed: %s", exc)
+			self.get_logger().error(f"Policy inference failed: {exc}")
 			return
 
 		actions = result.get("actions")
 		if actions is None:
-			self.get_logger().warning("Policy response missing 'actions' key: %s", result.keys())
+			self.get_logger().warning(f"Policy response missing 'actions' key: {list(result.keys())}")
 			return
-		print(actions[0])
-		self._queue_actions(np.asarray(actions))
+		action_array = np.asarray(actions)
+		print(action_array[0])
+		if self._debug_enabled:
+			self._run_debug_action_sequence(action_array)
+			return
+		queued = self._queue_actions(action_array)
 
 	def _build_observation_locked(self) -> Optional[dict]:
 		now = self.get_clock().now()
@@ -403,8 +544,9 @@ class Pi0InferenceNode(Node):
 	def _build_state_vector(self) -> Optional[np.ndarray]:
 		data = []
 		missing = []
+		source = self._debug_joint_positions if self._debug_enabled and self._debug_joint_positions else self._latest_joint_positions
 		for name in self._state_joint_order:
-			if (value := self._latest_joint_positions.get(name)) is None:
+			if (value := source.get(name)) is None:
 				print(f"Missing joint position for {name}")
 				missing.append(name)
 			else:
@@ -416,22 +558,21 @@ class Pi0InferenceNode(Node):
 			self.get_logger().debug(f"Waiting for joints: {','.join(missing)}")
 			return None
 
-		state = np.zeros(self._state_pad_length, dtype=np.float32)
-		state[: len(data)] = data
-		return state
+		return np.asarray(data, dtype=np.float32)
 
 	# ---------------------------------------------------------------------
 	# Publishing
 	# ---------------------------------------------------------------------
-	def _queue_actions(self, actions: np.ndarray) -> None:
+	def _queue_actions(self, actions: np.ndarray) -> int:
 		sequence = self._extract_action_sequence(actions)
 		if sequence.size == 0:
 			self.get_logger().warning("Policy returned no executable actions")
-			return
+			return 0
 		max_len = min(self._actions_per_inference, sequence.shape[0])
 		with self._lock:
 			self._pending_actions = sequence[:max_len].copy()
 			self._pending_action_index = 0
+			return len(self._pending_actions)
 
 	def _extract_action_sequence(self, actions: np.ndarray) -> np.ndarray:
 		array = np.asarray(actions)
@@ -444,14 +585,12 @@ class Pi0InferenceNode(Node):
 		elif array.ndim == 1:
 			array = array.reshape(1, -1)
 		else:
-			self.get_logger().warning("Unexpected action tensor shape: %s", array.shape)
+			self.get_logger().warning(f"Unexpected action tensor shape: {array.shape}")
 			return np.empty((0, 0), dtype=np.float32)
 
 		if self._publish_horizon_index >= array.shape[0]:
 			self.get_logger().warning(
-				"Publish index %d outside action horizon %d",
-				self._publish_horizon_index,
-				array.shape[0],
+				f"Publish index {self._publish_horizon_index} outside action horizon {array.shape[0]}"
 			)
 			return np.empty((0, 0), dtype=np.float32)
 
@@ -460,8 +599,10 @@ class Pi0InferenceNode(Node):
 	def _action_timer(self) -> None:
 		with self._lock:
 			if self._pending_actions is None:
+				# No queued actions; nothing to publish.
 				return
 			if self._pending_action_index >= len(self._pending_actions):
+				# Finished current batch; clear queue.
 				self._pending_actions = None
 				self._pending_action_index = 0
 				return
@@ -482,7 +623,7 @@ class Pi0InferenceNode(Node):
 		policy_len = len(self._policy_arm_joint_order)
 		if len(flat_vec) < policy_len:
 			self.get_logger().warning(
-				"Action vector dim %d smaller than policy joints %d", len(flat_vec), policy_len
+				f"Action vector dim {len(flat_vec)} smaller than policy joints {policy_len}"
 			)
 			return
 		if any(pos is None for pos in current_policy_positions):
@@ -491,6 +632,10 @@ class Pi0InferenceNode(Node):
 		absolute_policy_positions = [
 			float(current_policy_positions[idx]) + float(flat_vec[idx]) for idx in range(policy_len)
 		]
+
+		if self._debug_enabled:
+			self._log_debug_action(absolute_policy_positions, flat_vec)
+			return
 
 		if self._arm_pub is not None and self._arm_action_indices:
 			arm_cmd = Float64MultiArray()
@@ -501,10 +646,10 @@ class Pi0InferenceNode(Node):
 			]
 			if not arm_cmd.data:
 				self.get_logger().warning(
-					"No arm command indices overlapped with policy joints dim=%d",
-					len(absolute_policy_positions),
+					f"No arm command indices overlapped with policy joints dim={len(absolute_policy_positions)}"
 				)
 			else:
+				self.get_logger().info(f"Publish arm cmd: {arm_cmd.data}")
 				self._arm_pub.publish(arm_cmd)
 
 		if self._gripper_action_indices:
@@ -519,11 +664,16 @@ class Pi0InferenceNode(Node):
 			return False
 
 		if not self._gripper_action_client.wait_for_server(timeout_sec=0.0):
-			self.get_logger().warning("Waiting for %s server", self._gripper_action_name)
+			self.get_logger().warning(f"Waiting for {self._gripper_action_name} server")
 			return False
 
 		clamped = max(0.0, min(1.0, 1.0 - normalized_opening))
 		target = clamped * self._gripper_position_scale
+		if self._debug_enabled:
+			self.get_logger().info(
+				f"Debug gripper target -> {target:.4f} (normalized={normalized_opening:.4f})"
+			)
+			return True
 		if self._last_gripper_target is not None and abs(target - self._last_gripper_target) < self._gripper_action_deadband:
 			return True
 
@@ -537,6 +687,9 @@ class Pi0InferenceNode(Node):
 
 	def _publish_gripper_fallback(self, gripper_values: list[float]) -> None:
 		"""Fallback to publishing on legacy topics if action control is unavailable."""
+		if self._debug_enabled:
+			self.get_logger().info(f"Debug gripper fallback -> {gripper_values}")
+			return
 		if self._gripper_pub is None:
 			return
 		if self._gripper_uses_multiarray:
@@ -557,7 +710,8 @@ def main(args: Optional[Sequence[str]] = None) -> None:
 		pass
 	finally:
 		node.destroy_node()
-		rclpy.shutdown()
+		if rclpy.ok():
+			rclpy.shutdown()
 
 
 if __name__ == "__main__":
