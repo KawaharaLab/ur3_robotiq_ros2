@@ -53,6 +53,9 @@
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <unordered_map>
+#include <map>
 #include <thread>
 #include <cmath>
 #include <array>
@@ -75,8 +78,9 @@ const std::string GRIPPER_GOAL_LOG_TOPIC = "/robotiq_2f_gripper_action_goal";  /
 const double GRIPPER_OPEN_POSITION = 0.140;
 const double GRIPPER_CLOSE_POSITION = 0.0;
 const double GRIPPER_TARGET_SPEED = 0.15;
-const double GRIPPER_TARGET_FORCE = 0.2;
+const double GRIPPER_TARGET_FORCE = 1.0;
 const double GRIPPER_STEP = 0.005;  // Smaller increment per joystick event for smoother motion
+const double GRIPPER_HOME_POSITION = 0.100;  // Desired opening when sending robot to home via D-Pad
 
 // Enums for button names -> axis/button array index
 // For XBOX 1 controller
@@ -168,12 +172,13 @@ bool convertJoyToCmd(const std::vector<float>& axes, const std::vector<int>& but
   }
 
   // The bread and butter: map buttons to twist commands
-  twist->twist.linear.z = axes[RIGHT_STICK_Y];
-  twist->twist.linear.y = axes[RIGHT_STICK_X];
+  // X/Y: use right stick with intuitive mapping (up = forward, right = right).
+  twist->twist.linear.x = -axes[RIGHT_STICK_X];
+  twist->twist.linear.y = -axes[RIGHT_STICK_Y];
 
   double lin_x_right = -0.5 * (axes[RIGHT_TRIGGER] - AXIS_DEFAULTS.at(RIGHT_TRIGGER));
   double lin_x_left = 0.5 * (axes[LEFT_TRIGGER] - AXIS_DEFAULTS.at(LEFT_TRIGGER));
-  twist->twist.linear.x = lin_x_right + lin_x_left;
+  twist->twist.linear.z = -lin_x_right - lin_x_left;
 
   twist->twist.angular.y = axes[LEFT_STICK_Y];
   twist->twist.angular.x = axes[LEFT_STICK_X];
@@ -213,6 +218,10 @@ public:
     joy_sub_ = this->create_subscription<sensor_msgs::msg::Joy>(
         JOY_TOPIC, rclcpp::SystemDefaultsQoS(),
         [this](const sensor_msgs::msg::Joy::ConstSharedPtr& msg) { return joyCB(msg); });
+
+    joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
+        "/joint_states", rclcpp::SystemDefaultsQoS(),
+        [this](const sensor_msgs::msg::JointState::ConstSharedPtr& msg) { jointStateCB(msg); });
 
     twist_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(TWIST_TOPIC, rclcpp::SystemDefaultsQoS());
     joint_pub_ = this->create_publisher<control_msgs::msg::JointJog>(JOINT_TOPIC, rclcpp::SystemDefaultsQoS());
@@ -290,11 +299,17 @@ public:
 
     handleGripperButtons(msg->buttons);
 
+    // If any D-Pad input is pressed, drive toward the predefined home pose using joint jogs.
+    if (handleHomeDpad(msg))
+    {
+      return;
+    }
+
     // Convert the joystick message to Twist or JointJog and publish
     if (convertJoyToCmd(msg->axes, msg->buttons, twist_msg, joint_msg))
     {
-      // publish the TwistStamped
-      twist_msg->header.frame_id = frame_to_publish_;
+      // Publish twist in the end-effector frame so X/Y are relative to the tool orientation.
+      twist_msg->header.frame_id = EEF_FRAME_ID;
       twist_msg->header.stamp = this->now();
       twist_pub_->publish(std::move(twist_msg));
     }
@@ -315,12 +330,28 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_goal_pub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr servo_start_client_;
   rclcpp_action::Client<GripperAction>::SharedPtr gripper_action_client_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
 
   std::string frame_to_publish_;
   double gripper_position_;
   double last_gripper_target_;
   rclcpp::Time last_gripper_send_time_;
   bool gripper_goal_active_ {false};
+
+  bool home_active_ {false};
+
+  std::unordered_map<std::string, double> joint_positions_;
+  bool joint_state_ready_ {false};
+  bool warned_joint_state_missing_ {false};
+
+  const std::map<std::string, double> home_pose_rad_ {
+    {"shoulder_pan_joint", 45.0 * M_PI / 180.0},
+    {"shoulder_lift_joint", -90.0 * M_PI / 180.0},
+    {"elbow_joint", 90.0 * M_PI / 180.0},
+    {"wrist_1_joint", -90.0 * M_PI / 180.0},
+    {"wrist_2_joint", -90.0 * M_PI / 180.0},
+    {"wrist_3_joint", 0.0},
+  };
 
   std::thread collision_pub_thread_;
 
@@ -358,6 +389,106 @@ private:
       last_gripper_target_ = gripper_position_;
       last_gripper_send_time_ = now;
     }
+  }
+
+  bool handleHomeDpad(const sensor_msgs::msg::Joy::ConstSharedPtr& msg)
+  {
+    const auto& buttons = msg->buttons;
+    const auto& axes = msg->axes;
+
+    auto get_button = [&buttons](Button button) {
+      const auto idx = static_cast<std::size_t>(button);
+      return (idx < buttons.size()) ? buttons[idx] : 0;
+    };
+
+    const bool dpad_button_pressed =
+        get_button(F310_DPAD_UP) || get_button(F310_DPAD_DOWN) ||
+        get_button(F310_DPAD_LEFT) || get_button(F310_DPAD_RIGHT);
+
+    auto get_axis = [&axes](Axis axis_index) {
+      if (static_cast<std::size_t>(axis_index) < axes.size())
+      {
+        return axes[axis_index];
+      }
+      return 0.0f;
+    };
+    const double dpad_x_axis = get_axis(D_PAD_X);
+    const double dpad_y_axis = get_axis(D_PAD_Y);
+    const bool dpad_axis_pressed = (std::fabs(dpad_x_axis) > 0.5) || (std::fabs(dpad_y_axis) > 0.5);
+
+    const bool go_home = dpad_button_pressed || dpad_axis_pressed;
+
+    // Latch a home request on the first press; keep running until the arm reaches the deadband.
+    const bool start_home = go_home && !home_active_;
+    if (start_home)
+    {
+      home_active_ = true;
+
+      // Kick the gripper to its home opening once per request.
+      gripper_position_ = GRIPPER_HOME_POSITION;
+      last_gripper_target_ = GRIPPER_HOME_POSITION;
+      sendGripperCommand(GRIPPER_HOME_POSITION);
+    }
+
+    // If no request is active, nothing to do.
+    if (!home_active_)
+    {
+      return false;
+    }
+
+    if (!joint_state_ready_)
+    {
+      if (!warned_joint_state_missing_)
+      {
+        RCLCPP_WARN(this->get_logger(), "Joint state not yet received; cannot drive to home pose");
+        warned_joint_state_missing_ = true;
+      }
+      return true;  // consume while we wait for state
+    }
+
+    auto jog = control_msgs::msg::JointJog();
+    jog.header.stamp = this->now();
+    jog.header.frame_id = BASE_FRAME_ID;
+
+    const double max_vel = 15.0;  // rad/s cap for fast homing
+    const double deadband = 0.01;  // rad
+
+    for (const auto& [name, target] : home_pose_rad_)
+    {
+      auto it = joint_positions_.find(name);
+      if (it == joint_positions_.end())
+      {
+        continue;
+      }
+      const double current = it->second;
+      const double error = target - current;
+      if (std::fabs(error) < deadband)
+      {
+        continue;
+      }
+      const double vel = std::clamp(error, -max_vel, max_vel);
+      jog.joint_names.push_back(name);
+      jog.velocities.push_back(vel);
+    }
+
+    if (!jog.joint_names.empty())
+    {
+      joint_pub_->publish(jog);
+      return true;  // still moving toward home
+    }
+
+    // Reached within the deadband of home.
+    home_active_ = false;
+    return true;
+  }
+
+  void jointStateCB(const sensor_msgs::msg::JointState::ConstSharedPtr& msg)
+  {
+    for (size_t i = 0; i < msg->name.size() && i < msg->position.size(); ++i)
+    {
+      joint_positions_[msg->name[i]] = msg->position[i];
+    }
+    joint_state_ready_ = true;
   }
 
   void sendGripperCommand(double target_position)

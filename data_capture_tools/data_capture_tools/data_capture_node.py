@@ -43,6 +43,8 @@ class DataCaptureNode(Node):
         self.config: CaptureConfig = load_capture_config(config_path)
 
         self._stop_event = threading.Event()
+        self._stop_time_ns: Optional[int] = None
+        self._discard_fast: bool = False
         self._bag_process: Optional[subprocess.Popen] = None
         self._bag_stdout = None
         self._bag_stderr = None
@@ -66,7 +68,7 @@ class DataCaptureNode(Node):
         self._start_rosbag()
         self._user_thread.start()
         self.get_logger().info(
-            "Recording in progress. Use Ctrl+C or the configured stop key to finish."
+            "Recording in progress. Use Ctrl+C, the stop key, or the discard key to finish."
         )
         try:
             while rclpy.ok() and not self._stop_event.is_set():
@@ -74,7 +76,9 @@ class DataCaptureNode(Node):
         except KeyboardInterrupt:
             self.get_logger().info("Keyboard interrupt received, stopping session.")
             self._stop_event.set()
+            self._record_stop_time_if_missing()
         finally:
+            self._record_stop_time_if_missing()
             self._finalize()
 
     def _prepare_session(self) -> None:
@@ -130,8 +134,9 @@ class DataCaptureNode(Node):
             )
             return
         key = self.config.stop_key
+        discard_key = self.config.discard_key
         self.get_logger().info(
-            f"Press '{key}' followed by Enter to stop recording gracefully."
+            f"Press '{key}' followed by Enter to stop and optionally save, or '{discard_key}' to discard fast."
         )
         while not self._stop_event.is_set():
             try:
@@ -140,18 +145,31 @@ class DataCaptureNode(Node):
                 break
             if not line:
                 continue
-            if line.strip() == key:
+            stripped = line.strip()
+            if stripped == discard_key:
+                self.get_logger().info("Discard key received; stopping and discarding.")
+                self._discard_fast = True
+                self._stop_event.set()
+                self._record_stop_time_if_missing()
+                break
+            if stripped == key:
                 self.get_logger().info("Stop key received.")
                 self._stop_event.set()
+                self._record_stop_time_if_missing()
                 break
 
     def _finalize(self) -> None:
-        self._stop_rosbag()
+        self._stop_rosbag(fast=self._discard_fast)
         self._stop_viewers()
         self._stop_aux_processes()
         self._cleanup_existing_viewers()  # ensure stragglers are gone
         if not (self._session_dir and self._bag_uri and self._bag_uri.exists()):
             self.get_logger().error("Bag output not found; skipping conversion.")
+            return
+
+        if self._discard_fast:
+            self.get_logger().info("Discard flag set; skipping save and removing session directory.")
+            shutil.rmtree(self._session_dir, ignore_errors=True)
             return
 
         if not self._confirm_save():
@@ -165,6 +183,7 @@ class DataCaptureNode(Node):
                 self._session_dir,
                 self.config,
                 logger=self.get_logger(),
+                cutoff_stamp_ns=self._stop_time_ns,
             )
             self.get_logger().info(
                 f"Capture complete. Dataset stored in {self._session_dir}"
@@ -172,25 +191,30 @@ class DataCaptureNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f"Failed to convert bag: {exc}")
 
-    def _stop_rosbag(self) -> None:
+    def _stop_rosbag(self, fast: bool = False) -> None:
         if self._bag_process and self._bag_process.poll() is None:
-            self.get_logger().info("Stopping rosbag2 process...")
-            self._bag_process.send_signal(signal.SIGINT)
-            try:
-                self._bag_process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.get_logger().warning(
-                    "rosbag2 did not terminate after SIGINT; sending SIGTERM"
-                )
-                self._bag_process.send_signal(signal.SIGTERM)
+            if fast:
+                self.get_logger().info("Fast discard: sending SIGKILL to rosbag2...")
+                self._bag_process.kill()
+                self._bag_process.wait(timeout=2)
+            else:
+                self.get_logger().info("Stopping rosbag2 process...")
+                self._bag_process.send_signal(signal.SIGINT)
                 try:
-                    self._bag_process.wait(timeout=10)
+                    self._bag_process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     self.get_logger().warning(
-                        "rosbag2 still running after SIGTERM; sending SIGKILL"
+                        "rosbag2 did not terminate after SIGINT; sending SIGTERM"
                     )
-                    self._bag_process.kill()
-                    self._bag_process.wait(timeout=5)
+                    self._bag_process.send_signal(signal.SIGTERM)
+                    try:
+                        self._bag_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.get_logger().warning(
+                            "rosbag2 still running after SIGTERM; sending SIGKILL"
+                        )
+                        self._bag_process.kill()
+                        self._bag_process.wait(timeout=5)
         if self._bag_stdout:
             self._bag_stdout.close()
         if self._bag_stderr:
@@ -414,6 +438,14 @@ class DataCaptureNode(Node):
             return True
 
         return response.strip().lower() not in {"n", "no"}
+
+    def _record_stop_time_if_missing(self) -> None:
+        if self._stop_time_ns is None:
+            try:
+                self._stop_time_ns = self.get_clock().now().nanoseconds
+            except Exception:
+                # Fallback to wall time in nanoseconds if ROS clock is unavailable
+                self._stop_time_ns = int(datetime.now().timestamp() * 1e9)
 
 
 def main() -> None:

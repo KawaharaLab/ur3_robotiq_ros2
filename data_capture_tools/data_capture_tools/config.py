@@ -40,6 +40,7 @@ class CaptureConfig:
     other_throttle_hz: float
     enable_image_compression: bool
     stop_key: str
+    discard_key: str
     topics: List[TopicSpec]
     bag: BagRecorderConfig
     raw: dict[str, Any]
@@ -102,6 +103,7 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
     enable_image_compression = bool(data.get("enable_image_compression", True))
     stop_key = str(data.get("stop_key", "q"))
+    discard_key = str(data.get("discard_key", "x"))
 
     return CaptureConfig(
         output_root=output_root,
@@ -112,6 +114,7 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         other_throttle_hz=other_throttle_hz,
         enable_image_compression=enable_image_compression,
         stop_key=stop_key,
+        discard_key=discard_key,
         topics=topics,
         bag=bag,
         raw=data,

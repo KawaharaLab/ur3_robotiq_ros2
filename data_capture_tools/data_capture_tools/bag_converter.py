@@ -177,6 +177,7 @@ def convert_bag_to_dataset(
     output_dir: Path,
     config: CaptureConfig,
     logger=None,
+    cutoff_stamp_ns: Optional[int] = None,
 ) -> None:
     """Read a rosbag2 recording and emit PNG/CSV artifacts."""
 
@@ -207,6 +208,8 @@ def convert_bag_to_dataset(
 
         while reader.has_next():
             topic, data, stamp = reader.read_next()
+            if cutoff_stamp_ns is not None and stamp > cutoff_stamp_ns:
+                continue
             spec = topic_specs.get(topic)
             if spec is None:
                 continue
