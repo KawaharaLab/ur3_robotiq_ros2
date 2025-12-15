@@ -18,6 +18,7 @@ from rclpy.time import Time
 from rclpy.action import ActionClient
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32, Float64, Float64MultiArray
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from robotiq_2f_gripper_msgs.action import MoveTwoFingerGripper
 
 # Ensure the bundled OpenPI sources are importable without an editable install.
@@ -183,7 +184,7 @@ class Pi0InferenceNode(Node):
 		self._gripper_uses_multiarray = len(self._gripper_action_indices) > 1
 
 		self._arm_command_topic = self.declare_parameter(
-			"arm_command_topic", "/forward_position_controller/commands"
+			"arm_command_topic", "/scaled_joint_trajectory_controller/joint_trajectory"
 		).value
 		self._gripper_command_topic = self.declare_parameter(
 			"gripper_command_topic", "/robotiq_gripper/command"
@@ -193,7 +194,7 @@ class Pi0InferenceNode(Node):
 		).value
 
 		self._arm_pub = None if not self._arm_command_topic else self.create_publisher(
-			Float64MultiArray, self._arm_command_topic, qos_arm_cmd
+			JointTrajectory, self._arm_command_topic, qos_arm_cmd
 		)
 		if self._gripper_command_topic:
 			gripper_type = Float64MultiArray if self._gripper_uses_multiarray else Float64
@@ -638,18 +639,28 @@ class Pi0InferenceNode(Node):
 			return
 
 		if self._arm_pub is not None and self._arm_action_indices:
-			arm_cmd = Float64MultiArray()
-			arm_cmd.data = [
+			joint_names = [
+				self._policy_arm_joint_order[idx]
+				for idx in self._arm_action_indices
+				if idx < len(self._policy_arm_joint_order)
+			]
+			positions = [
 				absolute_policy_positions[idx]
 				for idx in self._arm_action_indices
 				if idx < len(absolute_policy_positions)
 			]
-			if not arm_cmd.data:
+			if not joint_names or not positions:
 				self.get_logger().warning(
 					f"No arm command indices overlapped with policy joints dim={len(absolute_policy_positions)}"
 				)
 			else:
-				self.get_logger().info(f"Publish arm cmd: {arm_cmd.data}")
+				arm_cmd = JointTrajectory()
+				arm_cmd.joint_names = joint_names
+				point = JointTrajectoryPoint()
+				point.positions = positions
+				point.time_from_start.sec = int(self._action_execution_period)
+				point.time_from_start.nanosec = int((self._action_execution_period - int(self._action_execution_period)) * 1e9)
+				arm_cmd.points.append(point)
 				self._arm_pub.publish(arm_cmd)
 
 		if self._gripper_action_indices:

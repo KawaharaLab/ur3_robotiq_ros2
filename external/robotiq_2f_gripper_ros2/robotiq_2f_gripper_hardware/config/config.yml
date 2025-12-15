@@ -1,0 +1,3 @@
+# Robotiq 2F Gripper Configuration
+open_threshold: 0.3
+close_threshold: -0.3

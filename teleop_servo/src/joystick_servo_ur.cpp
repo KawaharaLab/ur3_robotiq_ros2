@@ -54,6 +54,7 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <chrono>
 #include <unordered_map>
 #include <map>
 #include <thread>
@@ -79,7 +80,7 @@ const double GRIPPER_OPEN_POSITION = 0.140;
 const double GRIPPER_CLOSE_POSITION = 0.0;
 const double GRIPPER_TARGET_SPEED = 0.15;
 const double GRIPPER_TARGET_FORCE = 1.0;
-const double GRIPPER_STEP = 0.005;  // Smaller increment per joystick event for smoother motion
+const double GRIPPER_STEP = 0.008;  // Smaller increment per joystick event for smoother motion
 const double GRIPPER_HOME_POSITION = 0.100;  // Desired opening when sending robot to home via D-Pad
 
 // Enums for button names -> axis/button array index
@@ -230,6 +231,9 @@ public:
 
     // Logging-only: publish every gripper goal so it can be recorded in bag files.
     gripper_goal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(GRIPPER_GOAL_LOG_TOPIC, rclcpp::SystemDefaultsQoS());
+    gripper_goal_timer_ = this->create_wall_timer(
+        std::chrono::microseconds(8000),
+        [this]() { publishGripperGoalLog(); });
 
     gripper_action_client_ = rclcpp_action::create_client<GripperAction>(this, GRIPPER_ACTION_NAME);
     gripper_position_ = GRIPPER_OPEN_POSITION;
@@ -331,6 +335,7 @@ private:
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr servo_start_client_;
   rclcpp_action::Client<GripperAction>::SharedPtr gripper_action_client_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+  rclcpp::TimerBase::SharedPtr gripper_goal_timer_;
 
   std::string frame_to_publish_;
   double gripper_position_;
@@ -450,7 +455,7 @@ private:
     jog.header.stamp = this->now();
     jog.header.frame_id = BASE_FRAME_ID;
 
-    const double max_vel = 15.0;  // rad/s cap for fast homing
+    const double max_vel = 1.5;  // rad/s cap for fast homing (avoid overshoot)
     const double deadband = 0.01;  // rad
 
     for (const auto& [name, target] : home_pose_rad_)
@@ -477,7 +482,17 @@ private:
       return true;  // still moving toward home
     }
 
-    // Reached within the deadband of home.
+    // Reached within the deadband of home. Publish a zero-velocity halt to avoid lingering motion.
+    auto halt = control_msgs::msg::JointJog();
+    halt.header.stamp = this->now();
+    halt.header.frame_id = BASE_FRAME_ID;
+    for (const auto& [name, _] : home_pose_rad_)
+    {
+      halt.joint_names.push_back(name);
+      halt.velocities.push_back(0.0);
+    }
+    joint_pub_->publish(halt);
+
     home_active_ = false;
     return true;
   }
@@ -538,6 +553,18 @@ private:
 
     gripper_goal_active_ = true;
     gripper_action_client_->async_send_goal(goal, options);
+  }
+
+  void publishGripperGoalLog()
+  {
+    if (!gripper_goal_pub_)
+      return;
+
+    std_msgs::msg::Float32MultiArray log_msg;
+    log_msg.data = {static_cast<float>(last_gripper_target_),
+                    static_cast<float>(GRIPPER_TARGET_SPEED),
+                    static_cast<float>(GRIPPER_TARGET_FORCE)};
+    gripper_goal_pub_->publish(log_msg);
   }
 };  // class JoyToServoPubUr
 

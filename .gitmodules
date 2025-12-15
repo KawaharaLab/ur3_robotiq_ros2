@@ -1,6 +1,3 @@
-[submodule "external/robotiq_2f_gripper_ros2"]
-	path = external/robotiq_2f_gripper_ros2
-	url = git@github.com:jannishaberhausen/robotiq_2f_gripper_ros2.git
 [submodule "external/moveit/moveit2"]
 	path = external/moveit/moveit2
 	url = https://github.com/moveit/moveit2.git

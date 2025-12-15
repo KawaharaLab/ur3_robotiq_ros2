@@ -31,8 +31,8 @@ topics:
   - name: /joint_states
     type: sensor_msgs/msg/JointState
     mode: csv
-  - name: /forward_position_controller/commands
-    type: std_msgs/msg/Float64MultiArray
+  - name: /scaled_joint_trajectory_controller/controller_state
+    type: control_msgs/msg/JointTrajectoryControllerState
     mode: csv
   - name: /robotiq_2f_gripper/finger_distance_mm
     type: std_msgs/msg/Float32
