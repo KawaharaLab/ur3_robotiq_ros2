@@ -77,11 +77,11 @@ const std::string BASE_FRAME_ID = "base_link";
 const std::string GRIPPER_ACTION_NAME = "/robotiq_2f_gripper_action";
 const std::string GRIPPER_GOAL_LOG_TOPIC = "/robotiq_2f_gripper_action_goal";  // logging-only, for bagging
 const double GRIPPER_OPEN_POSITION = 0.140;
-const double GRIPPER_CLOSE_POSITION = 0.0;
-const double GRIPPER_TARGET_SPEED = 0.15;
-const double GRIPPER_TARGET_FORCE = 1.0;
-const double GRIPPER_STEP = 0.008;  // Smaller increment per joystick event for smoother motion
-const double GRIPPER_HOME_POSITION = 0.100;  // Desired opening when sending robot to home via D-Pad
+const double GRIPPER_CLOSE_POSITION = 0.002;
+const double GRIPPER_TARGET_SPEED = 0.01;
+const double GRIPPER_TARGET_FORCE = 0.1;
+const double GRIPPER_STEP = 0.001;  // Smaller increment per joystick event for smoother motion
+const double GRIPPER_HOME_POSITION = 0.080;  // Desired opening when sending robot to home via D-Pad
 
 // Enums for button names -> axis/button array index
 // For XBOX 1 controller
@@ -215,6 +215,11 @@ public:
   JoyToServoPubUr(const rclcpp::NodeOptions& options)
     : Node("joy_to_twist_publisher", options), frame_to_publish_(BASE_FRAME_ID)
   {
+    home_max_joint_speed_ = this->declare_parameter<double>("home_max_joint_speed", 8.0);
+    home_deadband_ = this->declare_parameter<double>("home_deadband", 0.01);
+    home_min_joint_speed_ = this->declare_parameter<double>("home_min_joint_speed", 0.5);
+    home_velocity_gain_ = this->declare_parameter<double>("home_velocity_gain", 2.0);
+
     // Setup pub/sub
     joy_sub_ = this->create_subscription<sensor_msgs::msg::Joy>(
         JOY_TOPIC, rclcpp::SystemDefaultsQoS(),
@@ -243,47 +248,6 @@ public:
     servo_start_client_ = this->create_client<std_srvs::srv::Trigger>("/servo_node/start_servo");
     servo_start_client_->wait_for_service(std::chrono::seconds(1));
     servo_start_client_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
-
-    // Load the collision scene asynchronously
-    // collision_pub_thread_ = std::thread([this]() {
-    //   rclcpp::sleep_for(std::chrono::seconds(3));
-    //   // Create collision object, in the way of servoing
-    //   moveit_msgs::msg::CollisionObject collision_object;
-    //   collision_object.header.frame_id = "base_link";
-    //   collision_object.id = "box";
-
-    //   shape_msgs::msg::SolidPrimitive table_1;
-    //   table_1.type = table_1.BOX;
-    //   table_1.dimensions = { 0.4, 0.6, 0.03 };
-
-    //   geometry_msgs::msg::Pose table_1_pose;
-    //   table_1_pose.position.x = 0.6;
-    //   table_1_pose.position.y = 0.0;
-    //   table_1_pose.position.z = 0.4;
-
-    //   shape_msgs::msg::SolidPrimitive table_2;
-    //   table_2.type = table_2.BOX;
-    //   table_2.dimensions = { 0.6, 0.4, 0.03 };
-
-    //   geometry_msgs::msg::Pose table_2_pose;
-    //   table_2_pose.position.x = 0.0;
-    //   table_2_pose.position.y = 0.5;
-    //   table_2_pose.position.z = 0.25;
-
-    //   collision_object.primitives.push_back(table_1);
-    //   collision_object.primitive_poses.push_back(table_1_pose);
-    //   collision_object.primitives.push_back(table_2);
-    //   collision_object.primitive_poses.push_back(table_2_pose);
-    //   collision_object.operation = collision_object.ADD;
-
-    //   moveit_msgs::msg::PlanningSceneWorld psw;
-    //   psw.collision_objects.push_back(collision_object);
-
-    //   auto ps = std::make_unique<moveit_msgs::msg::PlanningScene>();
-    //   ps->world = psw;
-    //   ps->is_diff = true;
-    //   collision_pub_->publish(std::move(ps));
-    // });
   }
 
   ~JoyToServoPubUr() override
@@ -348,6 +312,11 @@ private:
   std::unordered_map<std::string, double> joint_positions_;
   bool joint_state_ready_ {false};
   bool warned_joint_state_missing_ {false};
+
+  double home_max_joint_speed_ {8.0};
+  double home_deadband_ {0.01};
+  double home_min_joint_speed_ {0.5};
+  double home_velocity_gain_ {2.0};
 
   const std::map<std::string, double> home_pose_rad_ {
     {"shoulder_pan_joint", 45.0 * M_PI / 180.0},
@@ -455,8 +424,8 @@ private:
     jog.header.stamp = this->now();
     jog.header.frame_id = BASE_FRAME_ID;
 
-    const double max_vel = 1.5;  // rad/s cap for fast homing (avoid overshoot)
-    const double deadband = 0.01;  // rad
+    const double max_vel = home_max_joint_speed_;  // rad/s cap for homing (independent of Servo scale)
+    const double deadband = home_deadband_;  // rad
 
     for (const auto& [name, target] : home_pose_rad_)
     {
@@ -471,7 +440,12 @@ private:
       {
         continue;
       }
-      const double vel = std::clamp(error, -max_vel, max_vel);
+      double vel = error * home_velocity_gain_;
+      const double sign = (vel >= 0.0) ? 1.0 : -1.0;
+      double mag = std::fabs(vel);
+      mag = std::max(mag, home_min_joint_speed_);
+      mag = std::min(mag, max_vel);
+      vel = sign * mag;
       jog.joint_names.push_back(name);
       jog.velocities.push_back(vel);
     }

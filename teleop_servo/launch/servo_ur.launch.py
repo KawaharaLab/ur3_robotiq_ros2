@@ -2,6 +2,8 @@ import os
 import yaml
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
@@ -21,6 +23,11 @@ def load_yaml(package_name, file_path):
 
 def generate_launch_description():
     ur_type = "ur3"
+
+    home_max_joint_speed = LaunchConfiguration("home_max_joint_speed", default="8.0")
+    home_deadband = LaunchConfiguration("home_deadband", default="0.01")
+    home_min_joint_speed = LaunchConfiguration("home_min_joint_speed", default="0.5")
+    home_velocity_gain = LaunchConfiguration("home_velocity_gain", default="2.0")
 
     robot_description = (
         # ParameterBuilder("ur_description")
@@ -103,6 +110,12 @@ def generate_launch_description():
                 parameters=[
                     robot_description,
                     robot_description_semantic,
+                    {
+                        "home_max_joint_speed": home_max_joint_speed,
+                        "home_deadband": home_deadband,
+                        "home_min_joint_speed": home_min_joint_speed,
+                        "home_velocity_gain": home_velocity_gain,
+                    },
                 ],
             ),
             ComposableNode(
@@ -129,6 +142,10 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument("home_max_joint_speed", default_value="8.0"),
+            DeclareLaunchArgument("home_deadband", default_value="0.01"),
+            DeclareLaunchArgument("home_min_joint_speed", default_value="0.5"),
+            DeclareLaunchArgument("home_velocity_gain", default_value="2.0"),
             servo_node,
             container,
         ]

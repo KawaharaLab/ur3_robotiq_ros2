@@ -45,6 +45,8 @@ class DataCaptureNode(Node):
         self._stop_event = threading.Event()
         self._stop_time_ns: Optional[int] = None
         self._discard_fast: bool = False
+        self._force_save: bool = False
+        self._score: Optional[str] = None
         self._bag_process: Optional[subprocess.Popen] = None
         self._bag_stdout = None
         self._bag_stderr = None
@@ -56,6 +58,10 @@ class DataCaptureNode(Node):
         self._viewer_frames: dict[str, object] = {}
         self._viewer_timer = None
         self._bridge = CvBridge()
+        self._convert_after_record: bool = (
+            self.declare_parameter("convert_after_record", False).value
+        )
+        self._prompt_discard_for_zero: bool = False
         self._user_thread = threading.Thread(
             target=self._watch_user_input, daemon=True
         )
@@ -133,10 +139,9 @@ class DataCaptureNode(Node):
                 "stdin is not a TTY; press Ctrl+C to stop recording instead."
             )
             return
-        key = self.config.stop_key
-        discard_key = self.config.discard_key
+        stop_keys = {"0", "1", "2"}
         self.get_logger().info(
-            f"Press '{key}' followed by Enter to stop and optionally save, or '{discard_key}' to discard fast."
+            "Press 1 or 2 to stop and save with that score. Press 0 to stop and be asked whether to discard."
         )
         while not self._stop_event.is_set():
             try:
@@ -146,14 +151,16 @@ class DataCaptureNode(Node):
             if not line:
                 continue
             stripped = line.strip()
-            if stripped == discard_key:
-                self.get_logger().info("Discard key received; stopping and discarding.")
-                self._discard_fast = True
-                self._stop_event.set()
-                self._record_stop_time_if_missing()
-                break
-            if stripped == key:
-                self.get_logger().info("Stop key received.")
+            if stripped in stop_keys:
+                if stripped == "0":
+                    self.get_logger().info("Stop key 0 received; will prompt to discard or save.")
+                    self._prompt_discard_for_zero = True
+                    self._force_save = False
+                    self._score = "0"
+                else:
+                    self.get_logger().info(f"Stop key received with score {stripped}.")
+                    self._force_save = True  # Always save when a scored stop key is used.
+                    self._score = stripped
                 self._stop_event.set()
                 self._record_stop_time_if_missing()
                 break
@@ -172,9 +179,30 @@ class DataCaptureNode(Node):
             shutil.rmtree(self._session_dir, ignore_errors=True)
             return
 
-        if not self._confirm_save():
+        if not self._force_save and not self._confirm_save():
             self.get_logger().info("Discarding captured data at user request.")
             shutil.rmtree(self._session_dir, ignore_errors=True)
+            return
+
+        if self._score is not None:
+            try:
+                (self._session_dir / "score.txt").write_text(f"{self._score}\n", encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(f"Failed to write score.txt: {exc}")
+
+        if self._prompt_discard_for_zero:
+            if not self._confirm_keep_for_zero():
+                self.get_logger().info("Score 0: user chose to discard (default). Removing session directory.")
+                shutil.rmtree(self._session_dir, ignore_errors=True)
+                return
+            else:
+                self.get_logger().info("Score 0: user chose to keep. Proceeding to save.")
+                self._force_save = True
+
+        if not self._convert_after_record:
+            self.get_logger().info(
+                "Conversion disabled (convert_after_record:=false); keeping bag only."
+            )
             return
 
         try:
@@ -193,28 +221,23 @@ class DataCaptureNode(Node):
 
     def _stop_rosbag(self, fast: bool = False) -> None:
         if self._bag_process and self._bag_process.poll() is None:
-            if fast:
-                self.get_logger().info("Fast discard: sending SIGKILL to rosbag2...")
-                self._bag_process.kill()
-                self._bag_process.wait(timeout=2)
-            else:
-                self.get_logger().info("Stopping rosbag2 process...")
-                self._bag_process.send_signal(signal.SIGINT)
+            self.get_logger().info("Stopping rosbag2 process...")
+            self._bag_process.send_signal(signal.SIGINT)
+            try:
+                self._bag_process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.get_logger().warning(
+                    "rosbag2 did not terminate after SIGINT; sending SIGTERM"
+                )
+                self._bag_process.send_signal(signal.SIGTERM)
                 try:
-                    self._bag_process.wait(timeout=30)
+                    self._bag_process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.get_logger().warning(
-                        "rosbag2 did not terminate after SIGINT; sending SIGTERM"
+                        "rosbag2 still running after SIGTERM; sending SIGKILL"
                     )
-                    self._bag_process.send_signal(signal.SIGTERM)
-                    try:
-                        self._bag_process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        self.get_logger().warning(
-                            "rosbag2 still running after SIGTERM; sending SIGKILL"
-                        )
-                        self._bag_process.kill()
-                        self._bag_process.wait(timeout=5)
+                    self._bag_process.kill()
+                    self._bag_process.wait(timeout=5)
         if self._bag_stdout:
             self._bag_stdout.close()
         if self._bag_stderr:
@@ -226,30 +249,9 @@ class DataCaptureNode(Node):
 
         for topic in self.config.topics:
             if topic.mode == "image":
-                source_topic = topic.name
-                # Optional compression via image_transport republish
-                if self.config.enable_image_compression:
-                    compressed_topic = f"{source_topic}/compressed"
-                    cmd = [
-                        "ros2",
-                        "run",
-                        "image_transport",
-                        "republish",
-                        "raw",
-                        "compressed",
-                        "--ros-args",
-                        "-r",
-                        f"in:={source_topic}",
-                        "-r",
-                        f"out:={compressed_topic}",
-                    ]
-                    if self._spawn_aux_process(cmd, desc=f"compress {source_topic}"):
-                        source_topic = compressed_topic
-                        topic.type = "sensor_msgs/msg/CompressedImage"
-                    else:
-                        self.get_logger().warning(
-                            f"Falling back to raw image topic {source_topic} (compression helper failed)"
-                        )
+                # Subscribe directly to compressed images; upstream is expected to publish them.
+                source_topic = f"{topic.name}/compressed"
+                topic.type = "sensor_msgs/msg/CompressedImage"
 
                 if image_rate is None or image_rate <= 0:
                     topic.name = source_topic
@@ -293,9 +295,10 @@ class DataCaptureNode(Node):
             str(rate),
             output_topic,
         ]
-        return self._spawn_aux_process(cmd, desc=f"throttle {input_topic} -> {output_topic} @ {rate} Hz")
+        ok, _ = self._spawn_aux_process(cmd, desc=f"throttle {input_topic} -> {output_topic} @ {rate} Hz")
+        return ok
 
-    def _spawn_aux_process(self, cmd: list[str], desc: str) -> bool:
+    def _spawn_aux_process(self, cmd: list[str], desc: str, required: bool = False) -> tuple[bool, Path]:
         log_dir = self._session_dir / "logs" if self._session_dir else Path(".")
         log_dir.mkdir(parents=True, exist_ok=True)
         slug = "".join(ch if ch.isalnum() else "_" for ch in desc)[:80] or "helper"
@@ -314,20 +317,22 @@ class DataCaptureNode(Node):
                 f"Started helper: {desc} (pid {proc.pid}); logs: {log_path}"
             )
 
-            # Briefly wait to ensure the helper is alive; if it exits immediately, fall back.
-            threading.Event().wait(0.5)
+            # Briefly wait to ensure the helper stays alive; if it exits, treat as failure.
+            threading.Event().wait(1.0)
             if proc.poll() is not None:
-                self.get_logger().warning(
-                    f"Helper '{desc}' exited immediately with code {proc.returncode}; see {log_path}"
-                )
-                return False
+                msg = f"Helper '{desc}' exited early with code {proc.returncode}; see {log_path}"
+                if required:
+                    self.get_logger().error(msg)
+                else:
+                    self.get_logger().warning(msg)
+                return False, log_path
 
-            return True
+            return True, log_path
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(
                 f"Failed to start helper '{desc}': {exc}; see {log_path}"
             )
-            return False
+            return False, log_path
 
     def _start_internal_viewers(self) -> None:
         if not self.config.viewer_topics:
@@ -386,7 +391,7 @@ class DataCaptureNode(Node):
             return
 
         # Arrange windows side-by-side at smaller size.
-        positions = [(100, 300), (800, 300)]
+        positions = [(100, 100), (100, 500)]
         width, height = 640, 360
 
         for idx, (topic, frame) in enumerate(self._viewer_frames.items()):
@@ -438,6 +443,22 @@ class DataCaptureNode(Node):
             return True
 
         return response.strip().lower() not in {"n", "no"}
+
+    def _confirm_keep_for_zero(self) -> bool:
+        """Prompt whether to keep data when stop key 0 was used (default discard)."""
+        if not sys.stdin.isatty():
+            self.get_logger().info(
+                "Non-interactive stdin; defaulting to discard for stop key 0."
+            )
+            return False
+
+        prompt = "Keep captured data for score 0? [y/N]: "
+        try:
+            response = input(prompt)
+        except EOFError:
+            return False
+
+        return response.strip().lower() in {"y", "yes"}
 
     def _record_stop_time_if_missing(self) -> None:
         if self._stop_time_ns is None:

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 from typing import Optional
 
+import cv2
+
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 
 from .config import GSConfig, ConfigModel
@@ -23,12 +25,17 @@ class GelSightMiniPublisher(Node):
         publish_rate_hz: float,
         frame_id: str,
         device_index: Optional[int] = None,
+        device_path: Optional[str] = None,
+        publish_compressed: bool = True,
+        compressed_quality: int = 90,
     ) -> None:
         super().__init__("gelsight_mini_publisher")
         self._bridge = CvBridge()
         self._topic_name = topic_name
         self._frame_id = frame_id
-        self._publish_rate_hz = publish_rate_hz if publish_rate_hz > 0 else 30.0
+        self._publish_rate_hz = publish_rate_hz if publish_rate_hz > 0 else 15.0
+        self._publish_compressed = publish_compressed
+        self._compressed_quality = max(1, min(100, compressed_quality))
 
         self._cam_stream = GelSightMini(
             target_width=config.camera_width,
@@ -37,11 +44,17 @@ class GelSightMiniPublisher(Node):
         )
 
         target_device = device_index if device_index is not None else config.default_camera_index
-        self.get_logger().info(f"Opening GelSight Mini camera (index: {target_device})")
-        self._cam_stream.select_device(target_device)
+        log_target = device_path if device_path else target_device
+        self.get_logger().info(f"Opening GelSight Mini camera (device: {log_target})")
+        self._cam_stream.select_device(target_device, device_path=device_path)
         self._cam_stream.start()
 
         self._publisher = self.create_publisher(Image, topic_name, 10)
+        self._compressed_publisher: Optional[rclpy.publisher.Publisher] = None
+        if self._publish_compressed:
+            self._compressed_publisher = self.create_publisher(
+                CompressedImage, f"{topic_name}/compressed", 10
+            )
         timer_period = 1.0 / self._publish_rate_hz
         self._timer = self.create_timer(timer_period, self._publish_frame)
 
@@ -59,6 +72,27 @@ class GelSightMiniPublisher(Node):
         msg.header.frame_id = self._frame_id
         self._publisher.publish(msg)
 
+        if self._compressed_publisher:
+            try:
+                # Encode to JPEG with configured quality.
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self._compressed_quality]
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                ok, buffer = cv2.imencode('.jpg', bgr, encode_params)
+                if not ok:
+                    self.get_logger().warn(
+                        "Failed to JPEG-encode GelSight frame", throttle_duration_sec=2.0
+                    )
+                    return
+                cmsg = CompressedImage()
+                cmsg.header = msg.header
+                cmsg.format = 'jpeg'
+                cmsg.data = buffer.tobytes()
+                self._compressed_publisher.publish(cmsg)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    f"Compressed publish failed: {exc}", throttle_duration_sec=2.0
+                )
+
     def destroy_node(self) -> None:
         self.get_logger().info("Shutting down GelSight Mini publisher")
         if hasattr(self, "_timer") and self._timer is not None:
@@ -66,6 +100,10 @@ class GelSightMiniPublisher(Node):
         if self._cam_stream and self._cam_stream.camera:
             self._cam_stream.camera.release()
         super().destroy_node()
+
+
+def _str2bool(val: str) -> bool:
+    return str(val).lower() in {"1", "true", "t", "yes", "y"}
 
 
 def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
@@ -85,6 +123,12 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
         help="Camera index override. Falls back to default_camera_index from config.",
     )
     parser.add_argument(
+        "--device-path",
+        type=str,
+        default=None,
+        help="Explicit device path (e.g., /dev/v4l/by-id/...). Overrides device index on Linux.",
+    )
+    parser.add_argument(
         "--topic-name",
         type=str,
         default="gelsight/image_raw",
@@ -99,8 +143,20 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--publish-rate",
         type=float,
-        default=30.0,
+        default=15.0,
         help="Desired publication rate in Hz.",
+    )
+    parser.add_argument(
+        "--publish-compressed",
+        type=_str2bool,
+        default=True,
+        help="Whether to publish JPEG-compressed images at <topic-name>/compressed (default: true).",
+    )
+    parser.add_argument(
+        "--compressed-quality",
+        type=int,
+        default=90,
+        help="JPEG quality (1-100) for compressed output.",
     )
 
     return parser.parse_known_args()
@@ -118,6 +174,9 @@ def main() -> None:
         publish_rate_hz=args.publish_rate,
         frame_id=args.frame_id,
         device_index=args.device_index,
+        device_path=args.device_path,
+        publish_compressed=args.publish_compressed,
+        compressed_quality=args.compressed_quality,
     )
 
     try:

@@ -215,19 +215,23 @@ RobotiqGripperHardwareInterface::on_activate(const rclcpp_lifecycle::State& /*pr
 {
   RCLCPP_DEBUG(kLogger, "on_activate");
 
-  // set some default values for joints
-  if (std::isnan(gripper_position_))
-  {
-    gripper_position_ = 0;
-    gripper_velocity_ = 0;
-    gripper_position_command_ = 0;
-  }
-
   // Activate the gripper.
   try
   {
     driver_->deactivate();
     driver_->activate();
+
+    // Initialize state/command to the current physical position to avoid startup jogs.
+    const auto current_reg_pos = driver_->get_gripper_position();
+    gripper_current_state_.store(current_reg_pos);
+    const double current_pos =
+        gripper_closed_pos_ * (static_cast<double>(current_reg_pos) - kGripperMinPos) / kGripperRange;
+    gripper_position_ = current_pos;
+    gripper_velocity_ = 0.0;
+    gripper_position_command_ = current_pos;
+    write_command_.store(current_reg_pos);
+    write_speed_.store(0xFF);  // keep at max speed by default
+    write_force_.store(0xFF);  // keep at max force by default
 
     communication_thread_is_running_.store(true);
     communication_thread_ = std::thread([this] { this->background_task(); });
@@ -291,6 +295,11 @@ hardware_interface::return_type RobotiqGripperHardwareInterface::read(const rclc
 hardware_interface::return_type RobotiqGripperHardwareInterface::write(const rclcpp::Time& /*time*/,
                                                                        const rclcpp::Duration& /*period*/)
 {
+  if (std::isnan(gripper_position_command_))
+  {
+    return hardware_interface::return_type::OK;
+  }
+
   double gripper_pos = (gripper_position_command_ / gripper_closed_pos_) * kGripperRange + kGripperMinPos;
   gripper_pos = std::max(std::min(gripper_pos, 255.0), 0.0);
   write_command_.store(uint8_t(gripper_pos));

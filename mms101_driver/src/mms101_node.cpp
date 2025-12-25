@@ -23,7 +23,7 @@ public:
     // 注: 24bitデータを物理量(N, Nm)に変換する係数はセンサ個体や型番によるため
     // ここでは仮の値(1.0)としています。評価ソフトの値と比較して調整が必要です。
     this->declare_parameter("force_scale", 0.001); 
-    this->declare_parameter("torque_scale", 0.0001);
+    this->declare_parameter("torque_scale", 0.00001);
 
     port_name_ = this->get_parameter("port").as_string();
     frame_id_ = this->get_parameter("frame_id").as_string();

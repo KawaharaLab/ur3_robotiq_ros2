@@ -203,7 +203,7 @@ def convert_bag_to_dataset(
 
         bridge = CvBridge()
         image_dirs: Dict[str, Path] = {}
-        csv_rows: list[dict[str, object]] = []
+        csv_rows_by_topic: dict[str, list[dict[str, object]]] = defaultdict(list)
         skipped_messages: dict[str, int] = defaultdict(int)
 
         while reader.has_next():
@@ -225,7 +225,8 @@ def convert_bag_to_dataset(
                     )
                 continue
 
-            if spec.mode == "image":
+            # Treat explicit image modes and compressed image types as image outputs.
+            if spec.mode == "image" or spec.type.endswith("CompressedImage"):
                 folder = image_dirs.get(topic)
                 if folder is None:
                     folder = output_dir / "images" / _sanitize_topic(topic)
@@ -254,22 +255,24 @@ def convert_bag_to_dataset(
                 for key, value in flattened.items():
                     column = f"{prefix}.{key}" if key else prefix
                     row[column] = value
-                csv_rows.append(row)
+                csv_rows_by_topic[prefix].append(row)
 
         csv_dir = output_dir / "csv"
         csv_dir.mkdir(parents=True, exist_ok=True)
-        if csv_rows:
+        for prefix, rows in csv_rows_by_topic.items():
+            if not rows:
+                continue
             data_fields = sorted(
-                {key for row in csv_rows for key in row.keys() if key != "stamp_ns"}
+                {key for row in rows for key in row.keys() if key != "stamp_ns"}
             )
             fieldnames = ["stamp_ns", *data_fields]
-            csv_path = csv_dir / "timeseries.csv"
+            csv_path = csv_dir / f"{prefix}.csv"
             with csv_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(csv_rows)
+                writer.writerows(rows)
             if logger:
-                logger.info(f"Wrote {len(csv_rows)} rows to {csv_path}")
+                logger.info(f"Wrote {len(rows)} rows to {csv_path}")
 
         if logger and skipped_messages:
             total_skipped = sum(skipped_messages.values())
@@ -299,3 +302,10 @@ def cli_main():
 
     cfg = load_capture_config(args.config)
     convert_bag_to_dataset(Path(args.bag), Path(args.output), cfg)
+
+
+# Example CLI usage:
+# ros2 run data_capture_tools bag_converter --ros-args \
+#   --param bag:=/home/user/ur3_robotiq_ros2/data/simple/20251219_160944/bag \
+#   --param config:=/home/user/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml \
+#   --param output:=/home/user/ur3_robotiq_ros2/data/simple/20251219_160944

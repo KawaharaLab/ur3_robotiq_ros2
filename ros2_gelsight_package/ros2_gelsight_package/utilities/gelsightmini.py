@@ -32,9 +32,21 @@ class Camera:
         Raises:
             RuntimeError: If the camera cannot be opened.
         """
-        self.cap = cv2.VideoCapture(self.device)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open camera device: {self.device}")
+        # Prefer V4L2 backend on Linux to avoid GStreamer pipeline issues.
+        backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+        last_err = None
+        for backend in backends:
+            cap = cv2.VideoCapture(self.device, backend)
+            if cap.isOpened():
+                self.cap = cap
+                return
+            try:
+                cap.release()
+            except Exception:
+                pass
+            last_err = backend
+
+        raise RuntimeError(f"Could not open camera device: {self.device} (backends tried: {backends}, last={last_err})")
 
     def read_frame(self) -> MatLike:
         """
@@ -148,12 +160,13 @@ class GelSightMini:
         return Camera.list_devices()
 
 
-    def select_device(self, device_idx=None) -> None:
+    def select_device(self, device_idx=None, device_path: Optional[str] = None) -> None:
         """
         Select and open a camera device with the desired resolution.
 
         Args:
-            device_idx (int): The index of the device to select.
+            device_idx (int): The index of the device to select (enumerated from list_devices).
+            device_path (str): Explicit device path (e.g., /dev/v4l/by-id/...). Takes priority on Linux.
         """
 
         #print("platform: ", platform.system())
@@ -169,31 +182,51 @@ class GelSightMini:
 
 
         if platform.system() == "Linux":
-            devices = Camera.list_devices()
-            for ix in range(0,len(devices)):
-                print("Device: ", devices[ix])
-            if isinstance(devices.get(device_idx), str):
-                device_id = devices[device_idx]
+            if device_path:
+                device_id = device_path
+            else:
+                devices = Camera.list_devices()
+                for ix in range(0,len(devices)):
+                    print("Device: ", devices[ix])
+                if isinstance(devices.get(device_idx), str):
+                    device_id = devices[device_idx]
+                else:
+                    device_id = device_idx
+            # Resolve symlink to the underlying /dev/video* node.
+            if isinstance(device_id, str):
+                device_id = os.path.realpath(device_id)
         else:
             device_id = device_idx
 
         if self.camera:
             self.camera.release()
 
-        self.camera = Camera(device=device_id)
-        try:
-            self.camera.open()
+        def try_open(device_value):
+            cam = Camera(device=device_value)
+            cam.open()
             # Set the camera resolution to target width and height.
-            self.camera.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
-            self.camera.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
-
-            current_width = self.camera.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            current_height = self.camera.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+            cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            current_width = cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            current_height = cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             log_message(
                 f"Camera opened successfully with resolution {current_width}x{current_height}!"
             )
+            return cam
+
+        try:
+            self.camera = try_open(device_id)
         except Exception as e:
-            log_message(f"Could not open selected device: {e}")
+            # If a by-id path points to video-index1 (control interface), retry with index0 sibling.
+            if isinstance(device_id, str) and device_id.endswith("-video-index1"):
+                alt = device_id.replace("-video-index1", "-video-index0")
+                log_message(f"Retrying with device {alt} after failure: {e}")
+                try:
+                    self.camera = try_open(alt)
+                except Exception as e2:
+                    log_message(f"Could not open selected device: {e2}")
+            else:
+                log_message(f"Could not open selected device: {e}")
 
     def start(self) -> None:
         """
