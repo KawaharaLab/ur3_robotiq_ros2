@@ -3,3 +3,4 @@ install/
 log/
 data/
 uv.lock
+*.zip

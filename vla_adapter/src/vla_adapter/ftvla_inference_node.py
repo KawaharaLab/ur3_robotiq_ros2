@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Protocol, Sequence
@@ -16,7 +17,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 from rclpy.action import ActionClient
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import Image, JointState, CompressedImage
+from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import Float32, Float64, Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from robotiq_2f_gripper_msgs.action import MoveTwoFingerGripper
@@ -50,14 +52,14 @@ class ImageSlot:
 
 	subscription_topic: str
 	policy_key: str
+	is_compressed: bool = False
 
 
-class Pi0InferenceNode(Node):
+class FTVLAInferenceNode(Node):
 	"""Bridge ROS topics into Pi0 policy calls and publish the resulting commands."""
 
 	def __init__(self) -> None:
-		super().__init__("pi0_inference_node")
-
+		super().__init__("ftvla_inference_node")
 		self._bridge = CvBridge()
 		self._lock = threading.Lock()
 
@@ -80,20 +82,30 @@ class Pi0InferenceNode(Node):
 		self._channels_last = self.declare_parameter("channels_last", True).value
 
 		wrist_topic = self.declare_parameter(
-			"wrist_camera_topic", "camera/camera_wrist/color/image_raw"
+			"wrist_camera_topic", "/camera_wrist/realsense2_camera/color/image_raw"
 		).value
+		wrist_use_compressed = bool(self.declare_parameter("wrist_use_compressed", False).value)
 		fixed_topic = self.declare_parameter(
-			"fixed_camera_topic", "camera/camera_fixed/color/image_raw"
+			"fixed_camera_topic", "/camera_fixed/realsense2_camera/color/image_raw"
 		).value
+		fixed_use_compressed = bool(self.declare_parameter("fixed_use_compressed", False).value)
 		self._image_slots = {
 			"wrist": ImageSlot(
 				subscription_topic=wrist_topic,
 				policy_key=self.declare_parameter("policy_wrist_image_key", "cam_left_wrist").value,
+				is_compressed=wrist_use_compressed,
 			),
 			"fixed": ImageSlot(
 				subscription_topic=fixed_topic,
 				policy_key=self.declare_parameter("policy_fixed_image_key", "cam_high").value,
+				is_compressed=fixed_use_compressed,
 			),
+		}
+
+		# Fixed crop windows (width,height,x_offset,y_offset) tuned for 640x360 inputs.
+		self._image_crops = {
+			"wrist": (360, 360, 230, 0),
+			"fixed": (360, 360, 170, 0),
 		}
 
 		self._arm_joint_topic = self.declare_parameter("arm_joint_topic", "/joint_states").value
@@ -147,6 +159,12 @@ class Pi0InferenceNode(Node):
 		self._debug_shutdown_requested = False
 		self._debug_joint_positions: Dict[str, float] = {}
 
+		self._io_log_path = Path(
+			self.declare_parameter(
+				"io_log_path", str(REPO_ROOT / "data" / "inference_io_log.csv")
+			).value
+		)
+
 		state_order = self._get_str_list_param("state_joint_order", default=[])
 		if state_order:
 			self._state_joint_order = state_order
@@ -182,6 +200,14 @@ class Pi0InferenceNode(Node):
 			"gripper_action_indices", default=default_gripper_indices
 		)
 		self._gripper_uses_multiarray = len(self._gripper_action_indices) > 1
+
+		self._ft_horizon = int(self.declare_parameter("ft_horizon", 300).value)
+		self._ft_topics = {
+			"left": self.declare_parameter("left_ft_topic", "/force_torque/left").value,
+			"right": self.declare_parameter("right_ft_topic", "/force_torque/right").value,
+		}
+		self._ft_buffers = {side: deque(maxlen=self._ft_horizon) for side in ("left", "right")}
+		self._ft_last_stamp: Dict[str, Optional[Time]] = {side: None for side in ("left", "right")}
 
 		self._arm_command_topic = self.declare_parameter(
 			"arm_command_topic", "/scaled_joint_trajectory_controller/joint_trajectory"
@@ -225,15 +251,17 @@ class Pi0InferenceNode(Node):
 
 		# Subscriptions.
 		if self._image_slots["wrist"].subscription_topic:
+			msg_type = CompressedImage if self._image_slots["wrist"].is_compressed else Image
 			self.create_subscription(
-				Image,
+				msg_type,
 				self._image_slots["wrist"].subscription_topic,
 				lambda msg: self._image_callback("wrist", msg),
 				qos_camera,
 			)
 		if self._image_slots["fixed"].subscription_topic:
+			msg_type = CompressedImage if self._image_slots["fixed"].is_compressed else Image
 			self.create_subscription(
-				Image,
+				msg_type,
 				self._image_slots["fixed"].subscription_topic,
 				lambda msg: self._image_callback("fixed", msg),
 				qos_camera,
@@ -260,6 +288,15 @@ class Pi0InferenceNode(Node):
 				qos_scalar,
 			)
 
+		for side, topic in self._ft_topics.items():
+			if topic:
+				self.create_subscription(
+					WrenchStamped,
+					topic,
+					lambda msg, side=side: self._ft_callback(side, msg),
+					qos_scalar,
+				)
+
 		# Load the OpenPI policy directly on this machine (GPU-friendly).
 		self._policy = self._create_local_policy()
 
@@ -270,7 +307,7 @@ class Pi0InferenceNode(Node):
 			self._action_timer_handle = self.create_timer(self._action_execution_period, self._action_timer)
 
 		self.get_logger().info(
-			f"Pi0 inference node ready (policy={self._policy_descriptor}, arm_topic={self._arm_joint_topic},"
+			f"FT-VLA inference node ready (policy={self._policy_descriptor}, arm_topic={self._arm_joint_topic},"
 			f" wrist_cam={self._image_slots['wrist'].subscription_topic},"
 			f" fixed_cam={self._image_slots['fixed'].subscription_topic})"
 		)
@@ -406,16 +443,15 @@ class Pi0InferenceNode(Node):
 	# Policy wiring
 	# ---------------------------------------------------------------------
 	def _create_local_policy(self) -> PolicyHandle:
-		config_name = self.declare_parameter("policy_config_name", "pi0_ur3_robotiq").value
-		checkpoint_uri = self.declare_parameter(
-			"policy_checkpoint_uri", "gs://openpi-assets/checkpoints/pi0_base_pytorch"
+		config_name = self.declare_parameter("policy_config_name", "pi0_ur3_robotiq_ft").value
+		checkpoint_dir = self.declare_parameter(
+			"policy_checkpoint_dir", "/home/user/openpi/checkpoints/10000"
 		).value
 		pytorch_device_param = self.declare_parameter("policy_pytorch_device", "auto").value
 		default_prompt_override = self.declare_parameter("policy_default_prompt", self._prompt).value
 		# sample_steps = self.declare_parameter("policy_sample_steps", 10).get_parameter_value().integer_value
 		# sample_kwargs = {"num_steps": sample_steps} if sample_steps > 0 else {}
 
-		checkpoint_dir = _download.maybe_download(checkpoint_uri)
 		train_config = _config.get_config(config_name)
 		pytorch_device = None if pytorch_device_param in ("", "auto") else pytorch_device_param
 		policy = _policy_config.create_trained_policy(
@@ -441,10 +477,15 @@ class Pi0InferenceNode(Node):
 		if self._debug_enabled:
 			return
 		try:
-			cv_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding=self._image_encoding)
+			if isinstance(msg, CompressedImage):
+				cv_image = self._bridge.compressed_imgmsg_to_cv2(msg, desired_encoding=self._image_encoding)
+			else:
+				cv_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding=self._image_encoding)
 		except CvBridgeError as exc:
 			self.get_logger().warning(f"Failed to convert {slot} image: {exc}")
 			return
+
+		cv_image = self._crop_image(slot, cv_image)
 
 		if not self._channels_last:
 			cv_image = np.transpose(cv_image, (2, 0, 1))
@@ -474,6 +515,26 @@ class Pi0InferenceNode(Node):
 			self._latest_joint_positions[self._gripper_distance_joint_name] = float(msg.data)
 			self._last_joint_stamp = stamp
 
+	def _ft_callback(self, side: str, msg: WrenchStamped) -> None:
+		if self._debug_enabled:
+			return
+		wrench = msg.wrench
+		vec = np.array(
+			[
+				float(wrench.force.x),
+				float(wrench.force.y),
+				float(wrench.force.z),
+				float(wrench.torque.x),
+				float(wrench.torque.y),
+				float(wrench.torque.z),
+			],
+			dtype=np.float32,
+		)
+		stamp = Time.from_msg(msg.header.stamp) if msg.header.stamp else self.get_clock().now()
+		with self._lock:
+			self._ft_buffers[side].append(vec)
+			self._ft_last_stamp[side] = stamp
+
 	# ---------------------------------------------------------------------
 	# Inference loop
 	# ---------------------------------------------------------------------
@@ -498,6 +559,8 @@ class Pi0InferenceNode(Node):
 			return
 		action_array = np.asarray(actions)
 		print(action_array[0])
+		snapshot_action = self._extract_log_action(action_array)
+		self._log_io(obs.get("state"), snapshot_action)
 		if self._debug_enabled:
 			self._run_debug_action_sequence(action_array)
 			return
@@ -528,9 +591,20 @@ class Pi0InferenceNode(Node):
 		if fixed:
 			images[self._image_slots["fixed"].policy_key] = fixed[1]
 
+		force_torques = {
+			"left": self._build_ft_timeseries("left"),
+			"right": self._build_ft_timeseries("right"),
+			"left_ft": self._build_ft_timeseries("left"),
+			"right_ft": self._build_ft_timeseries("right"),
+		}
+		self.get_logger().debug(
+			f"FT shapes -> left {force_torques['left'].shape}, right {force_torques['right'].shape}"
+		)
+
 		obs = {
 			"state": state_vector,
 			"images": images,
+			"force_torques": force_torques,
 		}
 		if self._prompt:
 			obs["prompt"] = self._prompt
@@ -560,6 +634,92 @@ class Pi0InferenceNode(Node):
 			return None
 
 		return np.asarray(data, dtype=np.float32)
+
+	def _extract_log_action(self, actions: np.ndarray) -> Optional[np.ndarray]:
+		array = np.asarray(actions)
+		if array.ndim == 3:
+			if array.shape[0] == 0:
+				return None
+			array = array[0]
+		elif array.ndim == 2:
+			pass
+		elif array.ndim == 1:
+			array = array.reshape(1, -1)
+		else:
+			return None
+
+		if self._publish_horizon_index >= array.shape[0]:
+			return None
+
+		return np.asarray(array[self._publish_horizon_index], dtype=np.float32)
+
+	def _log_io(self, state_vec: Optional[np.ndarray], action_vec: Optional[np.ndarray]) -> None:
+		if state_vec is None or action_vec is None:
+			return
+		try:
+			self._io_log_path.parent.mkdir(parents=True, exist_ok=True)
+		except Exception:
+			return
+
+		with self._lock:
+			positions = {name: self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order}
+			gripper_raw = None
+			if self._gripper_distance_joint_name is not None:
+				gripper_raw = self._latest_joint_positions.get(self._gripper_distance_joint_name)
+
+		row = {}
+		for name in self._policy_arm_joint_order:
+			row[f"in_{name}"] = positions.get(name)
+
+		if gripper_raw is not None and self._gripper_distance_scale > 0.0:
+			row["in_gripper_norm"] = 1.0 - float(gripper_raw) / float(self._gripper_distance_scale)
+		else:
+			row["in_gripper_norm"] = None
+
+		flat_action = np.asarray(action_vec).ravel()
+		for idx, name in enumerate(self._policy_arm_joint_order):
+			if idx < len(flat_action):
+				row[f"out_{name}"] = float(flat_action[idx])
+			else:
+				row[f"out_{name}"] = None
+
+		grip_vals = [float(flat_action[idx]) for idx in self._gripper_action_indices if idx < len(flat_action)] if flat_action.size else []
+		row["out_gripper_norm"] = grip_vals[0] if grip_vals else None
+
+		fieldnames = list(row.keys())
+		try:
+			file_exists = self._io_log_path.is_file()
+			with self._io_log_path.open("a", newline="", encoding="utf-8") as csvfile:
+				writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+				if not file_exists:
+					writer.writeheader()
+				writer.writerow(row)
+		except Exception:
+			return
+
+	def _crop_image(self, slot: str, image: np.ndarray) -> np.ndarray:
+		params = self._image_crops.get(slot)
+		if not params:
+			return image
+		width, height, x_off, y_off = params
+		h, w = image.shape[:2]
+		if h < height or w < width:
+			return image
+		x0 = min(max(0, x_off), w - width)
+		y0 = min(max(0, y_off), h - height)
+		return image[y0 : y0 + height, x0 : x0 + width]
+
+	def _build_ft_timeseries(self, side: str) -> np.ndarray:
+		buffer = self._ft_buffers[side]
+		horizon = self._ft_horizon
+		if not buffer:
+			return np.zeros((6, horizon), dtype=np.float32)
+		arr = np.asarray(buffer, dtype=np.float32).T  # (6, count)
+		count = arr.shape[1]
+		if count < horizon:
+			pad = np.repeat(arr[:, :1], horizon - count, axis=1)
+			arr = np.concatenate([pad, arr], axis=1)
+		return arr[:, -horizon:]
 
 	# ---------------------------------------------------------------------
 	# Publishing
@@ -714,7 +874,7 @@ class Pi0InferenceNode(Node):
 
 def main(args: Optional[Sequence[str]] = None) -> None:
 	rclpy.init(args=args)
-	node = Pi0InferenceNode()
+	node = FTVLAInferenceNode()
 	try:
 		rclpy.spin(node)
 	except KeyboardInterrupt:

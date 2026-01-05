@@ -32,4 +32,4 @@
 [submodule "external/openpi"]
 	path = external/openpi
 	url = git@github.com:KawaharaLab/openpi.git
-	branch = tk_grad_baseline
+	branch = tk_grad_finetune

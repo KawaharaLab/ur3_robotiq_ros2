@@ -11,4 +11,9 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/ftvla_inference_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
