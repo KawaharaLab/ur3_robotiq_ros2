@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +45,31 @@ def _flatten(value, prefix: str = "", out: Optional[MutableMapping[str, object]]
     return out
 
 
+def _format_csv_value(value):
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _load_csv_field_map(path: Optional[Path], logger=None) -> dict[str, dict[str, str]]:
+    if path is None or not path.exists():
+        return {}
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    topics = data.get("topics", {}) if isinstance(data, dict) else {}
+    field_map: dict[str, dict[str, str]] = {}
+    for topic, entry in topics.items():
+        if not isinstance(entry, dict):
+            continue
+        fields = entry.get("fields", {})
+        if isinstance(fields, dict):
+            field_map[str(topic)] = {str(k): str(v) for k, v in fields.items()}
+
+    if logger:
+        logger.info(f"Loaded CSV field map for {len(field_map)} topics from {path}")
+    return field_map
+
+
 def _prepare_message_types(topic_specs: Iterable[TopicSpec]) -> Dict[str, type]:
     mapping: Dict[str, type] = {}
     for spec in topic_specs:
@@ -52,7 +78,10 @@ def _prepare_message_types(topic_specs: Iterable[TopicSpec]) -> Dict[str, type]:
 
 
 def _maybe_decompress_file_bag(
-    bag_uri: Path, config: CaptureConfig, logger=None
+    bag_uri: Path,
+    config: CaptureConfig,
+    logger=None,
+    allow_corrupt_zstd: bool = False,
 ) -> tuple[Path, Optional[tempfile.TemporaryDirectory]]:
     """Decompress bags recorded with file compression if needed."""
 
@@ -81,6 +110,7 @@ def _maybe_decompress_file_bag(
             metadata,
             bag_info,
             logger,
+            allow_corrupt_zstd,
         )
     except Exception:
         temp_dir.cleanup()
@@ -95,6 +125,7 @@ def _decompress_bag_contents(
     metadata: dict,
     bag_info: dict,
     logger=None,
+    allow_corrupt_zstd: bool = False,
 ) -> None:
     """Copy bag contents and expand any *.zstd segments using the zstd CLI."""
 
@@ -124,6 +155,7 @@ def _decompress_bag_contents(
     ]
 
     updated_relative_paths: list[str] = []
+    skipped_paths: set[str] = set()
     for rel_path in rel_paths:
         rel_path = str(rel_path)
         src_path = source_dir / rel_path
@@ -148,8 +180,22 @@ def _decompress_bag_contents(
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                detail = stderr or stdout or "no output"
+                if allow_corrupt_zstd:
+                    skipped_paths.add(rel_path)
+                    if logger:
+                        logger.warning(
+                            f"Skipping corrupt zstd segment {src_path}: {detail}"
+                        )
+                    continue
+                raise RuntimeError(
+                    f"zstd failed (exit {result.returncode}) for {src_path}: {detail}"
+                )
             if logger and result.stderr:
                 logger.debug(result.stderr.strip())
             updated_relative_paths.append(dest_name)
@@ -165,8 +211,23 @@ def _decompress_bag_contents(
 
     for file_entry in bag_info.get("files", []) or []:
         path_value = file_entry.get("path")
-        if isinstance(path_value, str) and path_value.endswith(".zstd"):
-            file_entry["path"] = path_value[: -len(".zstd")]
+        if not isinstance(path_value, str):
+            continue
+        if path_value.endswith(".zstd"):
+            path_value = path_value[: -len(".zstd")]
+            file_entry["path"] = path_value
+        if any(
+            path_value == skipped[: -len(".zstd")] or path_value == skipped
+            for skipped in skipped_paths
+        ):
+            file_entry["path"] = None
+
+    if skipped_paths:
+        bag_info["files"] = [
+            entry
+            for entry in bag_info.get("files", []) or []
+            if entry.get("path")
+        ]
 
     target_metadata = target_dir / "metadata.yaml"
     target_metadata.write_text(yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8")
@@ -178,13 +239,19 @@ def convert_bag_to_dataset(
     config: CaptureConfig,
     logger=None,
     cutoff_stamp_ns: Optional[int] = None,
+    allow_corrupt_zstd: bool = False,
 ) -> None:
     """Read a rosbag2 recording and emit PNG/CSV artifacts."""
 
     if logger:
         logger.info(f"Converting bag '{bag_uri}' into '{output_dir}'")
 
-    bag_to_read, temp_handle = _maybe_decompress_file_bag(bag_uri, config, logger)
+    bag_to_read, temp_handle = _maybe_decompress_file_bag(
+        bag_uri,
+        config,
+        logger,
+        allow_corrupt_zstd,
+    )
 
     try:
         reader = SequentialReader()
@@ -205,6 +272,10 @@ def convert_bag_to_dataset(
         image_dirs: Dict[str, Path] = {}
         csv_rows_by_topic: dict[str, list[dict[str, object]]] = defaultdict(list)
         skipped_messages: dict[str, int] = defaultdict(int)
+        csv_field_map = _load_csv_field_map(
+            getattr(config, "csv_config_path", None),
+            logger,
+        )
 
         while reader.has_next():
             topic, data, stamp = reader.read_next()
@@ -254,7 +325,16 @@ def convert_bag_to_dataset(
                 prefix = _sanitize_topic(topic)
                 for key, value in flattened.items():
                     column = f"{prefix}.{key}" if key else prefix
-                    row[column] = value
+                    row[column] = _format_csv_value(value)
+                field_map = csv_field_map.get(topic)
+                if field_map:
+                    remapped = {}
+                    for src, dst in field_map.items():
+                        if src == "stamp_ns":
+                            remapped[dst] = stamp
+                        else:
+                            remapped[dst] = row.get(src)
+                    row = remapped
                 csv_rows_by_topic[prefix].append(row)
 
         csv_dir = output_dir / "csv"
@@ -294,18 +374,36 @@ def cli_main():
 
     parser = argparse.ArgumentParser(description="Convert rosbag2 data into PNG/CSV outputs")
     parser.add_argument("--bag", required=True, help="Path to the rosbag2 directory (metadata.yaml parent)")
-    parser.add_argument("--config", required=True, help="Path to the capture YAML config")
-    parser.add_argument("--output", required=True, help="Directory to place converted artifacts")
+    parser.add_argument("--config", required=False, help="Path to the capture YAML config")
+    parser.add_argument("--output", required=False, help="Directory to place converted artifacts")
+    parser.add_argument(
+        "--csv-config",
+        required=False,
+        help="CSV field map YAML (defaults to output_dir/csv_fields.yaml if present)",
+    )
+    parser.add_argument(
+        "--skip-corrupt-zstd",
+        action="store_true",
+        help="Skip zstd segments that fail to decompress",
+    )
     args = parser.parse_args()
 
     from .config import load_capture_config
 
-    cfg = load_capture_config(args.config)
-    convert_bag_to_dataset(Path(args.bag), Path(args.output), cfg)
+    bag_path = Path(args.bag)
+    output_dir = bag_path.resolve().parent.parent
+    config_path = Path(args.config) if args.config else output_dir / "config.yaml"
+    cfg = load_capture_config(config_path)
+    csv_config_path = (
+        Path(args.csv_config) if args.csv_config else output_dir / "csv_fields.yaml"
+    )
+    cfg.csv_config_path = csv_config_path if csv_config_path.exists() else None
+    convert_bag_to_dataset(
+        bag_path,
+        output_dir,
+        cfg,
+        allow_corrupt_zstd=args.skip_corrupt_zstd,
+    )
 
 
-# Example CLI usage:
-# ros2 run data_capture_tools bag_converter --ros-args \
-#   --param bag:=/home/user/ur3_robotiq_ros2/data/simple/20251219_160944/bag \
-#   --param config:=/home/user/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml \
-#   --param output:=/home/user/ur3_robotiq_ros2/data/simple/20251219_160944
+# usage: bag_to_dataset [-h] --bag BAG --config CONFIG --output OUTPUT
