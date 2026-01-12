@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import sys
 import threading
+import time
 from collections import deque
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Protocol, Sequence
@@ -58,10 +60,11 @@ class ImageSlot:
 class FTVLAInferenceNode(Node):
 	"""Bridge ROS topics into Pi0 policy calls and publish the resulting commands."""
 
-	def __init__(self) -> None:
+	def __init__(self, forward_mode: bool = False) -> None:
 		super().__init__("ftvla_inference_node")
 		self._bridge = CvBridge()
 		self._lock = threading.Lock()
+		self._forward_mode = forward_mode
 
 		# QoS policies tuned per stream type.
 		qos_camera = QoSProfile(depth=5)
@@ -212,6 +215,9 @@ class FTVLAInferenceNode(Node):
 		self._arm_command_topic = self.declare_parameter(
 			"arm_command_topic", "/scaled_joint_trajectory_controller/joint_trajectory"
 		).value
+		self._forward_command_topic = self.declare_parameter(
+			"forward_command_topic", "/forward_position_controller/commands"
+		).value if self._forward_mode else None
 		self._gripper_command_topic = self.declare_parameter(
 			"gripper_command_topic", "/robotiq_gripper/command"
 		).value
@@ -219,9 +225,12 @@ class FTVLAInferenceNode(Node):
 			"gripper_action_name", "/robotiq_2f_gripper_action"
 		).value
 
-		self._arm_pub = None if not self._arm_command_topic else self.create_publisher(
+		self._arm_pub = None if (self._forward_mode or not self._arm_command_topic) else self.create_publisher(
 			JointTrajectory, self._arm_command_topic, qos_arm_cmd
 		)
+		self._forward_pub = None
+		if self._forward_mode and self._forward_command_topic:
+			self._forward_pub = self.create_publisher(Float64MultiArray, self._forward_command_topic, qos_arm_cmd)
 		if self._gripper_command_topic:
 			gripper_type = Float64MultiArray if self._gripper_uses_multiarray else Float64
 			self._gripper_pub = self.create_publisher(gripper_type, self._gripper_command_topic, 10)
@@ -239,6 +248,7 @@ class FTVLAInferenceNode(Node):
 		self._last_joint_stamp: Optional[Time] = None
 		self._pending_actions: Optional[np.ndarray] = None
 		self._pending_action_index = 0
+		self._pending_absolute_positions: Optional[np.ndarray] = None
 		self._debug_dataset_row: dict[str, str] | None = None
 
 		if self._debug_enabled:
@@ -421,20 +431,20 @@ class FTVLAInferenceNode(Node):
 			self._shutdown_debug_mode()
 			return
 		max_len = min(self._actions_per_inference, sequence.shape[0])
-		current_policy_positions: list[Optional[float]] = [
+		base_policy_positions: list[Optional[float]] = [
 			self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order
 		]
 		for step_idx in range(max_len):
 			action_vec = sequence[step_idx]
-			self._publish_action_vector(action_vec, current_policy_positions)
-			if any(pos is None for pos in current_policy_positions):
+			if any(pos is None for pos in base_policy_positions):
 				continue
 			flat_vec = np.asarray(action_vec).ravel()
-			policy_len = len(current_policy_positions)
-			for joint_idx in range(min(policy_len, len(flat_vec))):
-				current_policy_positions[joint_idx] = (
-					float(current_policy_positions[joint_idx]) + float(flat_vec[joint_idx])
-				)
+			policy_len = len(base_policy_positions)
+			abs_positions = [
+				float(base_policy_positions[j_idx]) + float(flat_vec[j_idx])
+				for j_idx in range(min(policy_len, len(flat_vec)))
+			]
+			self._publish_action_vector(action_vec, abs_positions)
 		self._debug_single_shot_done = True
 		self.get_logger().info(f"Debug inference emitted {max_len} action vectors")
 		self._shutdown_debug_mode()
@@ -445,7 +455,7 @@ class FTVLAInferenceNode(Node):
 	def _create_local_policy(self) -> PolicyHandle:
 		config_name = self.declare_parameter("policy_config_name", "pi0_ur3_robotiq_ft").value
 		checkpoint_dir = self.declare_parameter(
-			"policy_checkpoint_dir", "/home/user/openpi/checkpoints/10000"
+			"policy_checkpoint_dir", "/home/user/openpi/checkpoints/pi0_ur3_robotiq_ft/rosy-hill-3"
 		).value
 		pytorch_device_param = self.declare_parameter("policy_pytorch_device", "auto").value
 		default_prompt_override = self.declare_parameter("policy_default_prompt", self._prompt).value
@@ -542,13 +552,16 @@ class FTVLAInferenceNode(Node):
 		if self._debug_enabled and self._debug_single_shot_done:
 			return
 		with self._lock:
-			obs = self._build_observation_locked()
-		if obs is None:
+			obs, arm_snapshot = self._build_observation_locked()
+		if obs is None or arm_snapshot is None:
 			print("No observation available for inference")
 			return
 		print("obs: ", obs["state"])
 		try:
+			start_time = time.perf_counter()
 			result = self._policy.infer(obs)
+			duration_ms = (time.perf_counter() - start_time) * 1000.0
+			print(f"Inference latency: {duration_ms:.1f} ms")
 		except Exception as exc:  # pragma: no cover - depends on server
 			self.get_logger().error(f"Policy inference failed: {exc}")
 			return
@@ -564,9 +577,9 @@ class FTVLAInferenceNode(Node):
 		if self._debug_enabled:
 			self._run_debug_action_sequence(action_array)
 			return
-		queued = self._queue_actions(action_array)
+		queued = self._queue_actions(action_array, arm_snapshot)
 
-	def _build_observation_locked(self) -> Optional[dict]:
+	def _build_observation_locked(self) -> tuple[Optional[dict], Optional[list[float]]]:
 		now = self.get_clock().now()
 
 		wrist = self._latest_images.get("wrist")
@@ -583,7 +596,13 @@ class FTVLAInferenceNode(Node):
 		state_vector = self._build_state_vector()
 		if state_vector is None:
 			print("State vector is not available for inference")
-			return None
+			return None, None
+
+		arm_snapshot: list[Optional[float]] = [self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order]
+		if any(val is None for val in arm_snapshot):
+			missing = [self._policy_arm_joint_order[idx] for idx, val in enumerate(arm_snapshot) if val is None]
+			self.get_logger().debug(f"Waiting for arm joints: {','.join(missing)}")
+			return None, None
 
 		images: Dict[str, np.ndarray] = {}
 		if wrist:
@@ -608,7 +627,7 @@ class FTVLAInferenceNode(Node):
 		}
 		if self._prompt:
 			obs["prompt"] = self._prompt
-		return obs
+		return obs, [float(v) for v in arm_snapshot]
 
 	def _is_fresh(self, entry: Optional[tuple[Time, np.ndarray]], now: Time) -> bool:
 		if entry is None:
@@ -724,14 +743,27 @@ class FTVLAInferenceNode(Node):
 	# ---------------------------------------------------------------------
 	# Publishing
 	# ---------------------------------------------------------------------
-	def _queue_actions(self, actions: np.ndarray) -> int:
+	def _queue_actions(self, actions: np.ndarray, base_positions: Sequence[float]) -> int:
 		sequence = self._extract_action_sequence(actions)
 		if sequence.size == 0:
 			self.get_logger().warning("Policy returned no executable actions")
 			return 0
-		max_len = min(self._actions_per_inference, sequence.shape[0])
+		policy_len = len(self._policy_arm_joint_order)
+		if sequence.shape[1] < policy_len:
+			self.get_logger().warning(
+				f"Action vector dim {sequence.shape[1]} smaller than policy joints {policy_len}"
+			)
+			return 0
+		base_array = np.asarray(base_positions, dtype=np.float32)
+		if base_array.shape[0] != policy_len:
+			self.get_logger().warning("Base joint snapshot length mismatch; skipping action queue")
+			return 0
+
+		# Use the full policy horizon (e.g., 50 steps) and overwrite any pending queue.
+		absolute_positions = base_array + sequence[:, :policy_len]
 		with self._lock:
-			self._pending_actions = sequence[:max_len].copy()
+			self._pending_actions = sequence.copy()
+			self._pending_absolute_positions = absolute_positions
 			self._pending_action_index = 0
 			return len(self._pending_actions)
 
@@ -765,20 +797,25 @@ class FTVLAInferenceNode(Node):
 			if self._pending_action_index >= len(self._pending_actions):
 				# Finished current batch; clear queue.
 				self._pending_actions = None
+				self._pending_absolute_positions = None
 				self._pending_action_index = 0
 				return
-			action_vec = self._pending_actions[self._pending_action_index]
+			idx = self._pending_action_index
+			action_vec = self._pending_actions[idx]
+			abs_positions = None
+			if self._pending_absolute_positions is not None and idx < len(self._pending_absolute_positions):
+				abs_positions = self._pending_absolute_positions[idx]
 			self._pending_action_index += 1
-			current_policy_positions = [
-				self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order
-			]
 
-		self._publish_action_vector(action_vec, current_policy_positions)
+		if abs_positions is None:
+			self.get_logger().debug("No base snapshot available; skipping action publish")
+			return
+		self._publish_action_vector(action_vec, abs_positions)
 
 	def _publish_action_vector(
 		self,
 		action_vec: np.ndarray,
-		current_policy_positions: Sequence[Optional[float]],
+		absolute_policy_positions: Sequence[float],
 	) -> None:
 		flat_vec = np.asarray(action_vec).ravel()
 		policy_len = len(self._policy_arm_joint_order)
@@ -787,41 +824,54 @@ class FTVLAInferenceNode(Node):
 				f"Action vector dim {len(flat_vec)} smaller than policy joints {policy_len}"
 			)
 			return
-		if any(pos is None for pos in current_policy_positions):
-			self.get_logger().debug("Waiting for complete joint state before applying deltas")
+		if len(absolute_policy_positions) < policy_len:
+			self.get_logger().warning("Absolute positions length smaller than policy joints")
 			return
-		absolute_policy_positions = [
-			float(current_policy_positions[idx]) + float(flat_vec[idx]) for idx in range(policy_len)
-		]
 
 		if self._debug_enabled:
 			self._log_debug_action(absolute_policy_positions, flat_vec)
 			return
 
-		if self._arm_pub is not None and self._arm_action_indices:
-			joint_names = [
-				self._policy_arm_joint_order[idx]
-				for idx in self._arm_action_indices
-				if idx < len(self._policy_arm_joint_order)
-			]
-			positions = [
-				absolute_policy_positions[idx]
-				for idx in self._arm_action_indices
-				if idx < len(absolute_policy_positions)
-			]
-			if not joint_names or not positions:
+		csv_joint_order = [
+			"shoulder_pan_joint",
+			"shoulder_lift_joint",
+			"elbow_joint",
+			"wrist_1_joint",
+			"wrist_2_joint",
+			"wrist_3_joint",
+		]
+		positions: list[float] = []
+		for name in csv_joint_order:
+			idx = self._policy_arm_index.get(name)
+			if idx is None or idx >= len(absolute_policy_positions):
 				self.get_logger().warning(
-					f"No arm command indices overlapped with policy joints dim={len(absolute_policy_positions)}"
+					f"Missing joint {name} in policy positions dim={len(absolute_policy_positions)}"
 				)
-			else:
-				arm_cmd = JointTrajectory()
-				arm_cmd.joint_names = joint_names
-				point = JointTrajectoryPoint()
-				point.positions = positions
-				point.time_from_start.sec = int(self._action_execution_period)
-				point.time_from_start.nanosec = int((self._action_execution_period - int(self._action_execution_period)) * 1e9)
-				arm_cmd.points.append(point)
-				self._arm_pub.publish(arm_cmd)
+				return
+			positions.append(float(absolute_policy_positions[idx]))
+
+		if self._forward_mode and self._forward_pub is not None:
+			msg = Float64MultiArray()
+			msg.data = positions
+			msg.layout.data_offset = 0
+			self._forward_pub.publish(msg)
+			# keep going to allow gripper publish
+
+		if self._arm_pub is not None and self._arm_action_indices:
+			arm_cmd = JointTrajectory()
+			arm_cmd.header.frame_id = "world"
+			arm_cmd.header.stamp.sec = 0
+			arm_cmd.header.stamp.nanosec = 0
+			arm_cmd.joint_names = csv_joint_order
+			point = JointTrajectoryPoint()
+			point.positions = positions
+			point.velocities = []
+			point.accelerations = []
+			point.effort = []
+			point.time_from_start.sec = 0
+			point.time_from_start.nanosec = 50_000_000
+			arm_cmd.points.append(point)
+			self._arm_pub.publish(arm_cmd)
 
 		if self._gripper_action_indices:
 			gripper_values = [float(flat_vec[idx]) for idx in self._gripper_action_indices if idx < len(flat_vec)]
@@ -873,8 +923,11 @@ class FTVLAInferenceNode(Node):
 			self._gripper_pub.publish(msg_scalar)
 
 def main(args: Optional[Sequence[str]] = None) -> None:
-	rclpy.init(args=args)
-	node = FTVLAInferenceNode()
+	parser = argparse.ArgumentParser(add_help=False)
+	parser.add_argument("--forward", action="store_true")
+	parsed, remaining = parser.parse_known_args(args)
+	rclpy.init(args=remaining)
+	node = FTVLAInferenceNode(forward_mode=parsed.forward)
 	try:
 		rclpy.spin(node)
 	except KeyboardInterrupt:

@@ -16,4 +16,14 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/follow_trajectory
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/follow_trajectory_simple
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

@@ -213,6 +213,7 @@ class Pi0InferenceNode(Node):
 		self._last_joint_stamp: Optional[Time] = None
 		self._pending_actions: Optional[np.ndarray] = None
 		self._pending_action_index = 0
+		self._pending_absolute_positions: Optional[np.ndarray] = None
 		self._debug_dataset_row: dict[str, str] | None = None
 
 		if self._debug_enabled:
@@ -384,20 +385,20 @@ class Pi0InferenceNode(Node):
 			self._shutdown_debug_mode()
 			return
 		max_len = min(self._actions_per_inference, sequence.shape[0])
-		current_policy_positions: list[Optional[float]] = [
+		base_policy_positions: list[Optional[float]] = [
 			self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order
 		]
 		for step_idx in range(max_len):
 			action_vec = sequence[step_idx]
-			self._publish_action_vector(action_vec, current_policy_positions)
-			if any(pos is None for pos in current_policy_positions):
+			if any(pos is None for pos in base_policy_positions):
 				continue
 			flat_vec = np.asarray(action_vec).ravel()
-			policy_len = len(current_policy_positions)
-			for joint_idx in range(min(policy_len, len(flat_vec))):
-				current_policy_positions[joint_idx] = (
-					float(current_policy_positions[joint_idx]) + float(flat_vec[joint_idx])
-				)
+			policy_len = len(base_policy_positions)
+			abs_positions = [
+				float(base_policy_positions[j_idx]) + float(flat_vec[j_idx])
+				for j_idx in range(min(policy_len, len(flat_vec)))
+			]
+			self._publish_action_vector(action_vec, abs_positions)
 		self._debug_single_shot_done = True
 		self.get_logger().info(f"Debug inference emitted {max_len} action vectors")
 		self._shutdown_debug_mode()
@@ -481,8 +482,8 @@ class Pi0InferenceNode(Node):
 		if self._debug_enabled and self._debug_single_shot_done:
 			return
 		with self._lock:
-			obs = self._build_observation_locked()
-		if obs is None:
+			obs, arm_snapshot = self._build_observation_locked()
+		if obs is None or arm_snapshot is None:
 			print("No observation available for inference")
 			return
 		print("obs: ", obs["state"])
@@ -501,9 +502,9 @@ class Pi0InferenceNode(Node):
 		if self._debug_enabled:
 			self._run_debug_action_sequence(action_array)
 			return
-		queued = self._queue_actions(action_array)
+		queued = self._queue_actions(action_array, arm_snapshot)
 
-	def _build_observation_locked(self) -> Optional[dict]:
+	def _build_observation_locked(self) -> tuple[Optional[dict], Optional[list[float]]]:
 		now = self.get_clock().now()
 
 		wrist = self._latest_images.get("wrist")
@@ -520,7 +521,7 @@ class Pi0InferenceNode(Node):
 		state_vector = self._build_state_vector()
 		if state_vector is None:
 			print("State vector is not available for inference")
-			return None
+			return None, None
 
 		images: Dict[str, np.ndarray] = {}
 		if wrist:
@@ -528,13 +529,19 @@ class Pi0InferenceNode(Node):
 		if fixed:
 			images[self._image_slots["fixed"].policy_key] = fixed[1]
 
+		arm_snapshot: list[Optional[float]] = [self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order]
+		if any(val is None for val in arm_snapshot):
+			missing = [self._policy_arm_joint_order[idx] for idx, val in enumerate(arm_snapshot) if val is None]
+			self.get_logger().debug(f"Waiting for arm joints: {','.join(missing)}")
+			return None, None
+
 		obs = {
 			"state": state_vector,
 			"images": images,
 		}
 		if self._prompt:
 			obs["prompt"] = self._prompt
-		return obs
+		return obs, [float(v) for v in arm_snapshot]
 
 	def _is_fresh(self, entry: Optional[tuple[Time, np.ndarray]], now: Time) -> bool:
 		if entry is None:
@@ -564,14 +571,27 @@ class Pi0InferenceNode(Node):
 	# ---------------------------------------------------------------------
 	# Publishing
 	# ---------------------------------------------------------------------
-	def _queue_actions(self, actions: np.ndarray) -> int:
+	def _queue_actions(self, actions: np.ndarray, base_positions: Sequence[float]) -> int:
 		sequence = self._extract_action_sequence(actions)
 		if sequence.size == 0:
 			self.get_logger().warning("Policy returned no executable actions")
 			return 0
+		policy_len = len(self._policy_arm_joint_order)
+		if sequence.shape[1] < policy_len:
+			self.get_logger().warning(
+				f"Action vector dim {sequence.shape[1]} smaller than policy joints {policy_len}"
+			)
+			return 0
+		base_array = np.asarray(base_positions, dtype=np.float32)
+		if base_array.shape[0] != policy_len:
+			self.get_logger().warning("Base joint snapshot length mismatch; skipping action queue")
+			return 0
+
 		max_len = min(self._actions_per_inference, sequence.shape[0])
+		absolute_positions = base_array + sequence[:max_len, :policy_len]
 		with self._lock:
 			self._pending_actions = sequence[:max_len].copy()
+			self._pending_absolute_positions = absolute_positions
 			self._pending_action_index = 0
 			return len(self._pending_actions)
 
@@ -605,20 +625,24 @@ class Pi0InferenceNode(Node):
 			if self._pending_action_index >= len(self._pending_actions):
 				# Finished current batch; clear queue.
 				self._pending_actions = None
+				self._pending_absolute_positions = None
 				self._pending_action_index = 0
 				return
 			action_vec = self._pending_actions[self._pending_action_index]
+			abs_positions = None
+			if self._pending_absolute_positions is not None and self._pending_action_index < len(self._pending_absolute_positions):
+				abs_positions = self._pending_absolute_positions[self._pending_action_index]
 			self._pending_action_index += 1
-			current_policy_positions = [
-				self._latest_joint_positions.get(name) for name in self._policy_arm_joint_order
-			]
 
-		self._publish_action_vector(action_vec, current_policy_positions)
+		if abs_positions is None:
+			self.get_logger().debug("No base snapshot available; skipping action publish")
+			return
+		self._publish_action_vector(action_vec, abs_positions)
 
 	def _publish_action_vector(
 		self,
 		action_vec: np.ndarray,
-		current_policy_positions: Sequence[Optional[float]],
+		absolute_policy_positions: Sequence[float],
 	) -> None:
 		flat_vec = np.asarray(action_vec).ravel()
 		policy_len = len(self._policy_arm_joint_order)
@@ -627,12 +651,9 @@ class Pi0InferenceNode(Node):
 				f"Action vector dim {len(flat_vec)} smaller than policy joints {policy_len}"
 			)
 			return
-		if any(pos is None for pos in current_policy_positions):
-			self.get_logger().debug("Waiting for complete joint state before applying deltas")
+		if len(absolute_policy_positions) < policy_len:
+			self.get_logger().warning("Absolute positions length smaller than policy joints")
 			return
-		absolute_policy_positions = [
-			float(current_policy_positions[idx]) + float(flat_vec[idx]) for idx in range(policy_len)
-		]
 
 		if self._debug_enabled:
 			self._log_debug_action(absolute_policy_positions, flat_vec)
