@@ -167,6 +167,14 @@ class FTVLAInferenceNode(Node):
 				"io_log_path", str(REPO_ROOT / "data" / "inference_io_log.csv")
 			).value
 		)
+		self._input_log_dir = Path(
+			self.declare_parameter(
+				"input_log_dir", str(REPO_ROOT / "data" / "inference_inputs")
+			).value
+		)
+		self._input_log_dir.mkdir(parents=True, exist_ok=True)
+		self._input_index_path = self._input_log_dir / "inputs.csv"
+		self._inference_sequence = 0
 
 		state_order = self._get_str_list_param("state_joint_order", default=[])
 		if state_order:
@@ -556,6 +564,8 @@ class FTVLAInferenceNode(Node):
 		if obs is None or arm_snapshot is None:
 			print("No observation available for inference")
 			return
+		snapshot_stamp = self.get_clock().now()
+		self._record_inference_input(obs, snapshot_stamp)
 		print("obs: ", obs["state"])
 		try:
 			start_time = time.perf_counter()
@@ -715,6 +725,77 @@ class FTVLAInferenceNode(Node):
 				writer.writerow(row)
 		except Exception:
 			return
+
+	def _record_inference_input(self, obs: dict, stamp: Time) -> None:
+		"""Persist the exact inputs seen by the policy for inspection."""
+		try:
+			inference_id = f"{stamp.nanoseconds}_{self._inference_sequence}"
+			self._inference_sequence += 1
+			timestamp_sec = float(stamp.nanoseconds) / 1e9
+
+			image_paths: Dict[str, str] = {}
+			for key, image in obs.get("images", {}).items():
+				img_path = self._input_log_dir / f"{inference_id}_{key}.png"
+				self._save_image(image, img_path)
+				image_paths[key] = img_path.name
+
+			force_paths: Dict[str, str] = {}
+			force_torques = obs.get("force_torques", {}) or {}
+			for side in ("left", "right"):
+				ft = force_torques.get(side)
+				if ft is None:
+					continue
+				ft_path = self._input_log_dir / f"{inference_id}_{side}_ft.csv"
+				self._save_force_timeseries(ft, ft_path)
+				force_paths[side] = ft_path.name
+
+			state_vec = obs.get("state")
+			row: Dict[str, float | str | None] = {
+				"inference_id": inference_id,
+				"timestamp_sec": timestamp_sec,
+			}
+			for slot in self._image_slots.values():
+				row[f"image_{slot.policy_key}"] = image_paths.get(slot.policy_key)
+			row.update({"ft_left_file": force_paths.get("left"), "ft_right_file": force_paths.get("right")})
+			if state_vec is not None:
+				for idx, name in enumerate(self._state_joint_order):
+					if idx < len(state_vec):
+						row[f"state_{name}"] = float(state_vec[idx])
+
+			fieldnames = list(row.keys())
+			file_exists = self._input_index_path.is_file()
+			with self._input_index_path.open("a", newline="", encoding="utf-8") as csvfile:
+				writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+				if not file_exists:
+					writer.writeheader()
+				writer.writerow(row)
+		except Exception as exc:
+			self.get_logger().warning(f"Failed to record inference input: {exc}")
+
+	def _save_image(self, image: np.ndarray, path: Path) -> None:
+		"""Persist image arrays to PNG for later inspection."""
+		arr = np.asarray(image)
+		if arr.ndim == 3 and not self._channels_last and arr.shape[0] in (1, 3):
+			arr = np.transpose(arr, (1, 2, 0))
+		if arr.dtype != np.uint8:
+			arr = np.clip(arr, 0, 255).astype(np.uint8)
+		if arr.ndim == 3 and arr.shape[2] == 3:
+			arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+		cv2.imwrite(str(path), arr)
+
+	def _save_force_timeseries(self, ft: np.ndarray, path: Path) -> None:
+		"""Write force-torque horizon to CSV with step indices."""
+		arr = np.asarray(ft, dtype=np.float32)
+		if arr.ndim == 1:
+			arr = arr.reshape(6, -1)
+		with path.open("w", newline="", encoding="utf-8") as handle:
+			writer = csv.writer(handle)
+			writer.writerow(["step", "fx", "fy", "fz", "tx", "ty", "tz"])
+			if arr.shape[0] < 6:
+				return
+			steps = arr.shape[1]
+			for idx in range(steps):
+				writer.writerow([idx, arr[0, idx], arr[1, idx], arr[2, idx], arr[3, idx], arr[4, idx], arr[5, idx]])
 
 	def _crop_image(self, slot: str, image: np.ndarray) -> np.ndarray:
 		params = self._image_crops.get(slot)
