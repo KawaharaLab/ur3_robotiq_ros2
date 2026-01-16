@@ -463,7 +463,7 @@ class FTVLAInferenceNode(Node):
 	def _create_local_policy(self) -> PolicyHandle:
 		config_name = self.declare_parameter("policy_config_name", "pi0_ur3_robotiq_ft").value
 		checkpoint_dir = self.declare_parameter(
-			"policy_checkpoint_dir", "/home/user/openpi/checkpoints/pi0_ur3_robotiq_ft/rosy-hill-3"
+			"policy_checkpoint_dir", "/home/user/openpi/checkpoints/pi0_ur3_robotiq_ft/30000"
 		).value
 		pytorch_device_param = self.declare_parameter("policy_pytorch_device", "auto").value
 		default_prompt_override = self.declare_parameter("policy_default_prompt", self._prompt).value

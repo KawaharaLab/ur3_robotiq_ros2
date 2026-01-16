@@ -1,6 +1,6 @@
 # Example configuration for data_capture_tools
 output_root: ./data
-task_name: lan
+task_name: lan_forward
 prompt: "pick the cable connector and insert it into the white socket until it snaps. Then, push the red button."
 viewer_topics:
   - /camera_fixed/realsense2_camera/color/image_raw
@@ -41,6 +41,12 @@ topics:
     mode: csv
   - name: /scaled_joint_trajectory_controller/controller_state
     type: control_msgs/msg/JointTrajectoryControllerState
+    mode: csv
+  - name: /scaled_joint_trajectory_controller/joint_trajectory
+    type: trajectory_msgs/msg/JointTrajectory
+    mode: csv
+  - name: /forward_position_controller/commands
+    type: std_msgs/msg/Float64MultiArray
     mode: csv
   - name: /robotiq_2f_gripper/finger_distance_mm
     type: std_msgs/msg/Float32
