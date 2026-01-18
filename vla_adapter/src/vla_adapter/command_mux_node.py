@@ -7,14 +7,17 @@ import threading
 import subprocess
 import signal
 import pty
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import yaml
 
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import Float64, Float64MultiArray
+from std_msgs.msg import Float64, Float64MultiArray, String
 from robotiq_2f_gripper_msgs.action import MoveTwoFingerGripper
 
 
@@ -58,11 +61,20 @@ class CommandMuxNode(Node):
 
         # Data capture integration (runs data_capture_node via subprocess with pseudo-tty input)
         self._capture_cmd = self.declare_parameter(
-            "data_capture_command", "ros2 run data_capture_tools data_capture_manager --ros-args -p config:=/home/user/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml"
+            "data_capture_command", "ros2 run data_capture_tools data_capture_manager"
+        ).value
+        self._capture_config_path = self.declare_parameter(
+            "data_capture_config", "/home/user/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml"
         ).value
         self._capture_proc: Optional[subprocess.Popen] = None
         self._capture_master_fd: Optional[int] = None
         self._capture_lock = threading.Lock()
+        self._capture_output_root: Optional[Path] = None
+        self._capture_task_name: Optional[str] = None
+
+        self._session_topic = self.declare_parameter("session_dir_topic", "/ftvla/session_dir").value
+        self._session_pub = self.create_publisher(String, self._session_topic, 1)
+        self._current_session_dir: Optional[Path] = None
 
         self._pub = self.create_publisher(Float64MultiArray, self._output_topic, qos)
         self.create_subscription(Float64MultiArray, self._topic_vla, self._vla_cb, qos)
@@ -166,7 +178,17 @@ class CommandMuxNode(Node):
                 self.get_logger().info("data_capture already running")
                 return
 
+        self._load_capture_config()
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir: Optional[Path] = None
+        if self._capture_output_root and self._capture_task_name:
+            session_dir = self._capture_output_root / self._capture_task_name / session_id
+
         cmd = shlex.split(self._capture_cmd)
+        if "--ros-args" not in cmd:
+            cmd.extend(["--ros-args"])
+        cmd.extend(["-p", f"config:={self._capture_config_path}"])
+        cmd.extend(["-p", f"session_id:={session_id}"])
         log_dir = Path.home() / ".ros" / "command_mux_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_log = log_dir / "data_capture_stdout.log"
@@ -195,6 +217,11 @@ class CommandMuxNode(Node):
         )
         self._set_active("vla")
 
+        if session_dir:
+            self._current_session_dir = session_dir
+            self._session_pub.publish(String(data=str(session_dir)))
+            self.get_logger().info(f"Session dir announced to FT-VLA: {session_dir}")
+
     def _send_capture_key(self, key: str) -> None:
         with self._capture_lock:
             proc = self._capture_proc
@@ -205,7 +232,10 @@ class CommandMuxNode(Node):
             return
 
         try:
-            os.write(master_fd, f"{key}\n".encode("utf-8"))
+            if key == "0":
+                os.write(master_fd, b"0\ny\n")  # auto-confirm save even for score 0
+            else:
+                os.write(master_fd, f"{key}\n".encode("utf-8"))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f"Failed to send key to data_capture: {exc}")
 
@@ -221,6 +251,8 @@ class CommandMuxNode(Node):
                         pass
                     self._capture_master_fd = None
         self.get_logger().info(f"data_capture exited with code {proc.returncode}")
+        self._current_session_dir = None
+        self._session_pub.publish(String(data=""))
         self._set_active("teleop")
 
     def _stop_capture(self, force: bool = False) -> None:
@@ -245,6 +277,23 @@ class CommandMuxNode(Node):
                 pass
             with self._capture_lock:
                 self._capture_master_fd = None
+
+    def _load_capture_config(self) -> None:
+        if self._capture_output_root and self._capture_task_name:
+            return
+        try:
+            with open(self._capture_config_path, "r", encoding="utf-8") as cfg_file:
+                config = yaml.safe_load(cfg_file)
+            self._capture_output_root = Path(config.get("output_root", "")).expanduser()
+            task_name = config.get("task_name")
+            self._capture_task_name = str(task_name) if task_name else None
+            self.get_logger().info(
+                f"Loaded capture config: output_root={self._capture_output_root}, task={self._capture_task_name}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"Failed to load capture config {self._capture_config_path}: {exc}")
+            self._capture_output_root = None
+            self._capture_task_name = None
 
 
 def main(args: Optional[list[str]] = None) -> None:

@@ -21,7 +21,7 @@ from rclpy.time import Time
 from rclpy.action import ActionClient
 from sensor_msgs.msg import Image, JointState, CompressedImage
 from geometry_msgs.msg import WrenchStamped
-from std_msgs.msg import Float32, Float64, Float64MultiArray
+from std_msgs.msg import Float32, Float64, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from robotiq_2f_gripper_msgs.action import MoveTwoFingerGripper
 
@@ -167,13 +167,12 @@ class FTVLAInferenceNode(Node):
 				"io_log_path", str(REPO_ROOT / "data" / "inference_io_log.csv")
 			).value
 		)
-		self._input_log_dir = Path(
-			self.declare_parameter(
-				"input_log_dir", str(REPO_ROOT / "data" / "inference_inputs")
-			).value
-		)
-		self._input_log_dir.mkdir(parents=True, exist_ok=True)
-		self._input_index_path = self._input_log_dir / "inputs.csv"
+
+		self._session_dir_topic = self.declare_parameter(
+			"session_dir_topic", "/ftvla/session_dir"
+		).value
+		self._input_log_dir: Optional[Path] = None
+		self._input_index_path: Optional[Path] = None
 		self._inference_sequence = 0
 
 		state_order = self._get_str_list_param("state_joint_order", default=[])
@@ -312,6 +311,8 @@ class FTVLAInferenceNode(Node):
 				self._gripper_distance_callback,
 				qos_scalar,
 			)
+
+		self.create_subscription(String, self._session_dir_topic, self._session_dir_callback, qos_scalar)
 
 		for side, topic in self._ft_topics.items():
 			if topic:
@@ -735,14 +736,22 @@ class FTVLAInferenceNode(Node):
 
 	def _record_inference_input(self, obs: dict, stamp: Time) -> None:
 		"""Persist the exact inputs seen by the policy for inspection."""
+		with self._lock:
+			log_dir = self._input_log_dir
+			index_path = self._input_index_path
+			inference_id = f"{stamp.nanoseconds}_{self._inference_sequence}" if log_dir else None
+			if log_dir:
+				self._inference_sequence += 1
+
+		if log_dir is None or index_path is None or inference_id is None:
+			return
+
 		try:
-			inference_id = f"{stamp.nanoseconds}_{self._inference_sequence}"
-			self._inference_sequence += 1
 			timestamp_sec = float(stamp.nanoseconds) / 1e9
 
 			image_paths: Dict[str, str] = {}
 			for key, image in obs.get("images", {}).items():
-				img_path = self._input_log_dir / f"{inference_id}_{key}.png"
+				img_path = log_dir / f"{inference_id}_{key}.png"
 				self._save_image(image, img_path)
 				image_paths[key] = img_path.name
 
@@ -752,7 +761,7 @@ class FTVLAInferenceNode(Node):
 				ft = force_torques.get(side)
 				if ft is None:
 					continue
-				ft_path = self._input_log_dir / f"{inference_id}_{side}_ft.csv"
+				ft_path = log_dir / f"{inference_id}_{side}_ft.csv"
 				self._save_force_timeseries(ft, ft_path)
 				force_paths[side] = ft_path.name
 
@@ -770,14 +779,34 @@ class FTVLAInferenceNode(Node):
 						row[f"state_{name}"] = float(state_vec[idx])
 
 			fieldnames = list(row.keys())
-			file_exists = self._input_index_path.is_file()
-			with self._input_index_path.open("a", newline="", encoding="utf-8") as csvfile:
+			file_exists = index_path.is_file()
+			with index_path.open("a", newline="", encoding="utf-8") as csvfile:
 				writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 				if not file_exists:
 					writer.writeheader()
 				writer.writerow(row)
 		except Exception as exc:
 			self.get_logger().warning(f"Failed to record inference input: {exc}")
+
+	def _session_dir_callback(self, msg: String) -> None:
+		data = msg.data.strip()
+		with self._lock:
+			if not data:
+				self._input_log_dir = None
+				self._input_index_path = None
+				self._inference_sequence = 0
+				self.get_logger().info("Inference input logging disabled (no active session)")
+				return
+			try:
+				session_root = Path(data)
+				log_dir = session_root / "inference_inputs"
+				log_dir.mkdir(parents=True, exist_ok=True)
+				self._input_log_dir = log_dir
+				self._input_index_path = log_dir / "inputs.csv"
+				self._inference_sequence = 0
+				self.get_logger().info(f"Logging inference inputs to {log_dir}")
+			except Exception as exc:  # noqa: BLE001
+				self.get_logger().warning(f"Failed to set session dir for inference inputs: {exc}")
 
 	def _save_image(self, image: np.ndarray, path: Path) -> None:
 		"""Persist image arrays to PNG for later inspection."""

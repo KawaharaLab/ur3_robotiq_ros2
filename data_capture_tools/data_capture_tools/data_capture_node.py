@@ -42,6 +42,10 @@ class DataCaptureNode(Node):
         )
         self.config: CaptureConfig = load_capture_config(config_path)
 
+        self._session_id_override = (
+            self.declare_parameter("session_id", "").get_parameter_value().string_value
+        )
+
         self._stop_event = threading.Event()
         self._stop_time_ns: Optional[int] = None
         self._snapped_time_ns: Optional[int] = None
@@ -89,7 +93,7 @@ class DataCaptureNode(Node):
             self._finalize()
 
     def _prepare_session(self) -> None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = self._session_id_override or datetime.now().strftime("%Y%m%d_%H%M%S")
         session_dir = self.config.output_root / self.config.task_name / timestamp
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "bag").mkdir(exist_ok=True)
