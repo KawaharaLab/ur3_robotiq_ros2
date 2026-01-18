@@ -156,15 +156,9 @@ class DataCaptureNode(Node):
                 self._record_snapped_time()
                 continue
             if stripped in stop_keys:
-                if stripped == "0":
-                    self.get_logger().info("Stop key 0 received; will prompt to discard or save.")
-                    self._prompt_discard_for_zero = True
-                    self._force_save = False
-                    self._score = "0"
-                else:
-                    self.get_logger().info(f"Stop key received with score {stripped}.")
-                    self._force_save = True  # Always save when a scored stop key is used.
-                    self._score = stripped
+                self.get_logger().info(f"Stop key received with score {stripped}.")
+                self._force_save = True  # Always save when a scored stop key is used.
+                self._score = stripped
                 self._stop_event.set()
                 self._record_stop_time_if_missing()
                 break

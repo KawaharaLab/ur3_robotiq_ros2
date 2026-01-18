@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+import shlex
 import sys
 import threading
+import subprocess
+import signal
+import pty
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +55,14 @@ class CommandMuxNode(Node):
 
         self._gripper_last_target: float | None = None
         self._gripper_action = ActionClient(self, MoveTwoFingerGripper, self._gripper_action_name)
+
+        # Data capture integration (runs data_capture_node via subprocess with pseudo-tty input)
+        self._capture_cmd = self.declare_parameter(
+            "data_capture_command", "ros2 run data_capture_tools data_capture_manager --ros-args -p config:=/home/user/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml"
+        ).value
+        self._capture_proc: Optional[subprocess.Popen] = None
+        self._capture_master_fd: Optional[int] = None
+        self._capture_lock = threading.Lock()
 
         self._pub = self.create_publisher(Float64MultiArray, self._output_topic, qos)
         self.create_subscription(Float64MultiArray, self._topic_vla, self._vla_cb, qos)
@@ -105,7 +118,7 @@ class CommandMuxNode(Node):
     # ------------------------------------------------------------------
     def _keyboard_loop(self) -> None:
         prompt = (
-            "[mux] type 'v' for VLA, 't' for teleop, 'q' to quit. "
+            "[mux] commands: v=VLA, t=teleop, c=start capture, 0/1/2/f -> capture, q=quit. "
             f"(current={self._active})\n"
         )
         sys.stdout.write(prompt)
@@ -120,11 +133,15 @@ class CommandMuxNode(Node):
                 self._set_active("vla")
             elif cmd == "t":
                 self._set_active("teleop")
+            elif cmd == "c":
+                self._start_capture()
+            elif cmd in {"0", "1", "2", "f"}:
+                self._send_capture_key(cmd)
             elif cmd == "q":
                 rclpy.shutdown()
                 break
             else:
-                sys.stdout.write("[mux] use v/t/q\n")
+                sys.stdout.write("[mux] use v/t/c/0/1/2/f/q\n")
                 sys.stdout.flush()
 
     def _set_active(self, source: str) -> None:
@@ -137,7 +154,97 @@ class CommandMuxNode(Node):
     # ------------------------------------------------------------------
     def destroy_node(self) -> bool:
         self._shutdown.set()
+        self._stop_capture(force=True)
         return super().destroy_node()
+
+    # ------------------------------------------------------------------
+    # Data capture helpers
+    # ------------------------------------------------------------------
+    def _start_capture(self) -> None:
+        with self._capture_lock:
+            if self._capture_proc and self._capture_proc.poll() is None:
+                self.get_logger().info("data_capture already running")
+                return
+
+        cmd = shlex.split(self._capture_cmd)
+        log_dir = Path.home() / ".ros" / "command_mux_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = log_dir / "data_capture_stdout.log"
+        stderr_log = log_dir / "data_capture_stderr.log"
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=slave_fd,
+                stdout=stdout_log.open("a", encoding="utf-8"),
+                stderr=stderr_log.open("a", encoding="utf-8"),
+                text=True,
+                env=os.environ.copy(),
+            )
+        finally:
+            os.close(slave_fd)
+
+        with self._capture_lock:
+            self._capture_proc = proc
+            self._capture_master_fd = master_fd
+
+        threading.Thread(target=self._watch_capture_proc, args=(proc,), daemon=True).start()
+        self.get_logger().info(
+            f"Started data_capture (pid={proc.pid}); logs at {stdout_log} / {stderr_log}"
+        )
+        self._set_active("vla")
+
+    def _send_capture_key(self, key: str) -> None:
+        with self._capture_lock:
+            proc = self._capture_proc
+            master_fd = self._capture_master_fd
+
+        if not proc or proc.poll() is not None or master_fd is None:
+            self.get_logger().info("data_capture not running; ignoring key")
+            return
+
+        try:
+            os.write(master_fd, f"{key}\n".encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"Failed to send key to data_capture: {exc}")
+
+    def _watch_capture_proc(self, proc: subprocess.Popen) -> None:
+        proc.wait()
+        with self._capture_lock:
+            if self._capture_proc is proc:
+                self._capture_proc = None
+                if self._capture_master_fd is not None:
+                    try:
+                        os.close(self._capture_master_fd)
+                    except Exception:
+                        pass
+                    self._capture_master_fd = None
+        self.get_logger().info(f"data_capture exited with code {proc.returncode}")
+        self._set_active("teleop")
+
+    def _stop_capture(self, force: bool = False) -> None:
+        with self._capture_lock:
+            proc = self._capture_proc
+            master_fd = self._capture_master_fd
+        if not proc or proc.poll() is not None:
+            return
+
+        if not force:
+            self._send_capture_key("0")
+            return
+
+        try:
+            proc.send_signal(signal.SIGINT)
+        except Exception:
+            proc.kill()
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            with self._capture_lock:
+                self._capture_master_fd = None
 
 
 def main(args: Optional[list[str]] = None) -> None:
