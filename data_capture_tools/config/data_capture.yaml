@@ -1,6 +1,6 @@
 # Example configuration for data_capture_tools
 output_root: ./data
-task_name: lan_forward
+task_name: lan_eval_0118
 prompt: "pick the cable connector and insert it into the white socket until it snaps. Then, push the red button."
 viewer_topics:
   - /camera_fixed/realsense2_camera/color/image_raw

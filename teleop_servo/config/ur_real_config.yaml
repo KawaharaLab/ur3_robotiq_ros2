@@ -65,7 +65,7 @@ joint_topic: /joint_states
 status_topic: ~/status # Publish status to this topic
 # command_out_topic: /scaled_joint_trajectory_controller/joint_trajectory # Publish outgoing commands here
 # command_out_topic: /forward_velocity_controller/commands # Publish outgoing commands here
-command_out_topic: /forward_position_controller/commands # Publish outgoing commands here
+command_out_topic: /forward_position_controller/commands_teleop # Publish outgoing commands here
 
 ## Collision checking for the entire robot body
 check_collisions: false # Check collisions?

@@ -52,7 +52,9 @@
 #include <rclcpp/utilities.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <chrono>
 #include <unordered_map>
@@ -82,6 +84,7 @@ const double GRIPPER_TARGET_SPEED = 0.01;
 const double GRIPPER_TARGET_FORCE = 0.1;
 const double GRIPPER_STEP = 0.001;  // Smaller increment per joystick event for smoother motion
 const double GRIPPER_HOME_POSITION = 0.080;  // Desired opening when sending robot to home via D-Pad
+const std::string GRIPPER_MUX_TOPIC = "/robotiq_gripper/command_teleop";
 
 // Enums for button names -> axis/button array index
 // For XBOX 1 controller
@@ -236,6 +239,7 @@ public:
 
     // Logging-only: publish every gripper goal so it can be recorded in bag files.
     gripper_goal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(GRIPPER_GOAL_LOG_TOPIC, rclcpp::SystemDefaultsQoS());
+    gripper_mux_pub_ = this->create_publisher<std_msgs::msg::Float64>(GRIPPER_MUX_TOPIC, rclcpp::SystemDefaultsQoS());
     gripper_goal_timer_ = this->create_wall_timer(
         std::chrono::microseconds(8000),
         [this]() { publishGripperGoalLog(); });
@@ -296,6 +300,7 @@ private:
   rclcpp::Publisher<control_msgs::msg::JointJog>::SharedPtr joint_pub_;
   rclcpp::Publisher<moveit_msgs::msg::PlanningScene>::SharedPtr collision_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_goal_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr gripper_mux_pub_;
   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr servo_start_client_;
   rclcpp_action::Client<GripperAction>::SharedPtr gripper_action_client_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
@@ -482,6 +487,15 @@ private:
 
   void sendGripperCommand(double target_position)
   {
+    // Prefer mux topic; fall back to action client if unavailable.
+    if (gripper_mux_pub_)
+    {
+      std_msgs::msg::Float64 mux_msg;
+      mux_msg.data = target_position;
+      gripper_mux_pub_->publish(mux_msg);
+      return;
+    }
+
     if (!gripper_action_client_)
       return;
 

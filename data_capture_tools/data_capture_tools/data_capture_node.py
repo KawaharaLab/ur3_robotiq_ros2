@@ -44,6 +44,7 @@ class DataCaptureNode(Node):
 
         self._stop_event = threading.Event()
         self._stop_time_ns: Optional[int] = None
+        self._snapped_time_ns: Optional[int] = None
         self._discard_fast: bool = False
         self._force_save: bool = False
         self._score: Optional[str] = None
@@ -151,6 +152,9 @@ class DataCaptureNode(Node):
             if not line:
                 continue
             stripped = line.strip()
+            if stripped.lower() == "f":
+                self._record_snapped_time()
+                continue
             if stripped in stop_keys:
                 if stripped == "0":
                     self.get_logger().info("Stop key 0 received; will prompt to discard or save.")
@@ -467,6 +471,35 @@ class DataCaptureNode(Node):
             except Exception:
                 # Fallback to wall time in nanoseconds if ROS clock is unavailable
                 self._stop_time_ns = int(datetime.now().timestamp() * 1e9)
+
+    def _record_snapped_time(self) -> None:
+        if self._snapped_time_ns is not None:
+            return
+
+        try:
+            snapped_time_ns = self.get_clock().now().nanoseconds
+        except Exception:
+            snapped_time_ns = int(datetime.now().timestamp() * 1e9)
+
+        self._snapped_time_ns = snapped_time_ns
+        self.get_logger().info(f"Snapped time recorded at {snapped_time_ns} ns.")
+
+        if not self._session_dir:
+            return
+
+        snapped_file = self._session_dir / "snapped_time.txt"
+        try:
+            snapped_file.write_text(f"{snapped_time_ns}\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"Failed to write snapped_time.txt: {exc}")
+
+        config_copy = self._session_dir / "config.yaml"
+        if config_copy.exists():
+            try:
+                with config_copy.open("a", encoding="utf-8") as config_file:
+                    config_file.write(f"\nsnapped_time_ns: {snapped_time_ns}\n")
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(f"Failed to append snapped_time to config.yaml: {exc}")
 
 
 def main() -> None:

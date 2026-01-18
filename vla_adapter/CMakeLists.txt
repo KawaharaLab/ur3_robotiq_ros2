@@ -26,4 +26,9 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/command_mux_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

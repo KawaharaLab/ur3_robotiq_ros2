@@ -212,7 +212,7 @@ class FTVLAInferenceNode(Node):
 		)
 		self._gripper_uses_multiarray = len(self._gripper_action_indices) > 1
 
-		self._ft_horizon = int(self.declare_parameter("ft_horizon", 300).value)
+		self._ft_horizon = int(self.declare_parameter("ft_horizon", 200).value)
 		self._ft_topics = {
 			"left": self.declare_parameter("left_ft_topic", "/force_torque/left").value,
 			"right": self.declare_parameter("right_ft_topic", "/force_torque/right").value,
@@ -224,11 +224,15 @@ class FTVLAInferenceNode(Node):
 			"arm_command_topic", "/scaled_joint_trajectory_controller/joint_trajectory"
 		).value
 		self._forward_command_topic = self.declare_parameter(
-			"forward_command_topic", "/forward_position_controller/commands"
+			"forward_command_topic", "/forward_position_controller/commands_vla"
 		).value if self._forward_mode else None
 		self._gripper_command_topic = self.declare_parameter(
 			"gripper_command_topic", "/robotiq_gripper/command"
 		).value
+		self._gripper_mux_topic = self.declare_parameter(
+			"gripper_mux_topic", "/robotiq_gripper/command_vla"
+		).value
+		self._gripper_mux_enabled = bool(self.declare_parameter("gripper_mux_enabled", True).value)
 		self._gripper_action_name = self.declare_parameter(
 			"gripper_action_name", "/robotiq_2f_gripper_action"
 		).value
@@ -239,11 +243,14 @@ class FTVLAInferenceNode(Node):
 		self._forward_pub = None
 		if self._forward_mode and self._forward_command_topic:
 			self._forward_pub = self.create_publisher(Float64MultiArray, self._forward_command_topic, qos_arm_cmd)
+		self._gripper_mux_pub = None
 		if self._gripper_command_topic:
 			gripper_type = Float64MultiArray if self._gripper_uses_multiarray else Float64
 			self._gripper_pub = self.create_publisher(gripper_type, self._gripper_command_topic, 10)
 		else:
 			self._gripper_pub = None
+		if self._gripper_mux_enabled and self._gripper_mux_topic:
+			self._gripper_mux_pub = self.create_publisher(Float64, self._gripper_mux_topic, 10)
 
 		self._gripper_action_client: ActionClient | None = None
 		self._last_gripper_target: float | None = None
@@ -962,6 +969,17 @@ class FTVLAInferenceNode(Node):
 
 	def _send_gripper_goal(self, normalized_opening: float) -> bool:
 		"""Send gripper command via action interface. Returns True if handled."""
+		clamped = max(0.0, min(1.0, 1.0 - normalized_opening))
+		target = clamped * self._gripper_position_scale
+
+		# If mux publishing is enabled, send to mux topic and stop here.
+		if self._gripper_mux_pub is not None:
+			msg = Float64()
+			msg.data = target
+			self._gripper_mux_pub.publish(msg)
+			self._last_gripper_target = target
+			return True
+
 		if self._gripper_action_client is None:
 			return False
 
@@ -969,8 +987,6 @@ class FTVLAInferenceNode(Node):
 			self.get_logger().warning(f"Waiting for {self._gripper_action_name} server")
 			return False
 
-		clamped = max(0.0, min(1.0, 1.0 - normalized_opening))
-		target = clamped * self._gripper_position_scale
 		if self._debug_enabled:
 			self.get_logger().info(
 				f"Debug gripper target -> {target:.4f} (normalized={normalized_opening:.4f})"
