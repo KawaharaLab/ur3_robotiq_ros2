@@ -1,0 +1,62 @@
+# Example configuration for data_capture_tools
+output_root: ./data
+task_name: lan_eval_0118
+prompt: "pick the cable connector and insert it into the white socket until it snaps. Then, push the red button."
+viewer_topics:
+  - /camera_fixed/realsense2_camera/color/image_raw
+  - /camera_wrist/realsense2_camera/color/image_raw
+image_throttle_hz: 0
+other_throttle_hz: 0
+enable_image_compression: true
+stop_key: q
+bag_record:
+  storage: sqlite3
+  compression_mode: file
+  compression_format: zstd
+topics:
+  - name: /camera_wrist/realsense2_camera/color/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    mode: image
+    encoding: bgr8
+  - name: /camera_fixed/realsense2_camera/color/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    mode: image
+    encoding: bgr8
+  - name: /gelsight/left/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    mode: image
+    encoding: bgr8
+  - name: /gelsight/right/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    mode: image
+    encoding: bgr8
+  - name: /tf
+    type: tf2_msgs/msg/TFMessage
+    mode: csv
+  - name: /tf_static
+    type: tf2_msgs/msg/TFMessage
+    mode: csv
+  - name: /joint_states
+    type: sensor_msgs/msg/JointState
+    mode: csv
+  - name: /scaled_joint_trajectory_controller/controller_state
+    type: control_msgs/msg/JointTrajectoryControllerState
+    mode: csv
+  - name: /scaled_joint_trajectory_controller/joint_trajectory
+    type: trajectory_msgs/msg/JointTrajectory
+    mode: csv
+  - name: /forward_position_controller/commands
+    type: std_msgs/msg/Float64MultiArray
+    mode: csv
+  - name: /robotiq_2f_gripper/finger_distance_mm
+    type: std_msgs/msg/Float32
+    mode: csv
+  - name: /robotiq_2f_gripper_action_goal
+    type: std_msgs/msg/Float32MultiArray
+    mode: csv
+  - name: /force_torque/left
+    type: geometry_msgs/msg/WrenchStamped
+    mode: csv
+  - name: /force_torque/right
+    type: geometry_msgs/msg/WrenchStamped
+    mode: csv
