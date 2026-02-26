@@ -17,6 +17,7 @@ from cv_bridge import CvBridge
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String, Int32  # 追加: 通信用メッセージ
 from ament_index_python.packages import get_package_share_directory
 from ament_index_python.packages import PackageNotFoundError
 
@@ -29,6 +30,7 @@ class DataCaptureNode(Node):
 
     def __init__(self) -> None:
         super().__init__("data_capture_manager")
+        # --- 既存の初期化処理 ---
         default_share: Optional[Path] = None
         try:
             default_share = Path(get_package_share_directory("data_capture_tools"))
@@ -42,10 +44,17 @@ class DataCaptureNode(Node):
         )
         self.config: CaptureConfig = load_capture_config(config_path)
 
+        # --- C++ノード連携用の設定 ---
+        self._cmd_pub = self.create_publisher(String, "/robot_cmd", 10)
+        self._phase_sub = self.create_subscription(Int32, "/current_phase", self._phase_cb, 10)
+        self._sequence_finished_event = threading.Event()
+        self._current_phase = 0
+        self._is_active_session = False
+
+        # --- 既存のメンバ変数 ---
         self._session_id_override = (
             self.declare_parameter("session_id", "").get_parameter_value().string_value
         )
-
         self._stop_event = threading.Event()
         self._stop_time_ns: Optional[int] = None
         self._snapped_time_ns: Optional[int] = None
@@ -61,36 +70,128 @@ class DataCaptureNode(Node):
         self._aux_processes: list[subprocess.Popen] = []
         self._viewer_subscriptions: list = []
         self._viewer_frames: dict[str, object] = {}
-        self._viewer_timer = None
         self._bridge = CvBridge()
         self._convert_after_record: bool = (
             self.declare_parameter("convert_after_record", False).value
         )
-        self._prompt_discard_for_zero: bool = False
         self._user_thread = threading.Thread(
             target=self._watch_user_input, daemon=True
         )
 
+    def _phase_cb(self, msg: Int32) -> None:
+        """C++側からのフェーズ情報を受信."""
+        self._current_phase = msg.data
+        # 動作中（Phase > 0）から待機（Phase == 0）に変わった瞬間にイベントをセット
+        if self._is_active_session and self._current_phase == 0:
+            self._sequence_finished_event.set()
+
     def run(self) -> None:
-        self._prepare_session()
-        self._cleanup_existing_viewers()
-        self._start_internal_viewers()
-        self._start_throttles_and_compressors()
-        self._start_rosbag()
+        """メインの実行ループ."""
+        self._cleanup_existing_viewers() #
+        self._start_internal_viewers() #
+        self._start_throttles_and_compressors() #
+        
         self._user_thread.start()
-        self.get_logger().info(
-            "Recording in progress. Use Ctrl+C, the stop key, or the discard key to finish."
-        )
+        self.get_logger().info("Data Capture Node Ready. Press 'i' to init or 's' to start sequence.")
+        
         try:
             while rclpy.ok() and not self._stop_event.is_set():
-                rclpy.spin_once(self, timeout_sec=0.2)
-        except KeyboardInterrupt:
-            self.get_logger().info("Keyboard interrupt received, stopping session.")
-            self._stop_event.set()
-            self._record_stop_time_if_missing()
+                rclpy.spin_once(self, timeout_sec=0.1)
         finally:
-            self._record_stop_time_if_missing()
-            self._finalize()
+            self._finalize_all()
+
+    def _watch_user_input(self) -> None:
+        while not self._stop_event.is_set():
+            print("\n" + "="*40)
+            print(" [i]: Init Arm (Move to start pose)")
+            print(" [s]: Start Trial (Record & Run)")
+            print(" [q]: Quit")
+            print("="*40)
+            
+            line = sys.stdin.readline().strip().lower()
+            if not line: continue
+
+            if line == 'i':
+                self.get_logger().info("Sending 'init' command...")
+                self._is_active_session = True # 完了検知を有効化
+                self._sequence_finished_event.clear()
+                self._cmd_pub.publish(String(data="init"))
+                
+                self.get_logger().info("Moving to init pose... Please wait.")
+                self._sequence_finished_event.wait() # 動作完了までブロック
+                self._is_active_session = False
+                self.get_logger().info("Init pose reached.")
+
+            elif line == 's':
+                self._execute_trial() # 録画ありの施行
+            
+            elif line == 'q':
+                self._stop_event.set()
+                break
+
+    def _execute_trial(self) -> None:
+        """1回の施行（録画・動作・スコアリング）を実行."""
+        self.get_logger().info("Starting new trial...")
+        
+        # 1. 準備と録画開始
+        self._prepare_session() #
+        self._start_rosbag() #
+        
+        # 2. ロボット動作開始命令
+        self._is_active_session = True
+        self._sequence_finished_event.clear()
+        self._cmd_pub.publish(String(data="run"))
+        
+        # 3. 動作完了（Phase 0）を待機
+        self.get_logger().info("Sequence in progress. Waiting for completion...")
+        self._sequence_finished_event.wait()
+        
+        # 4. 録画停止
+        self._record_stop_time_if_missing() #
+        self._stop_rosbag() #
+        self._is_active_session = False
+        
+        # 5. スコア入力待ち
+        print("\nTrial finished. Enter score (1 or 2 to save, 0 to discard): ")
+        score_line = sys.stdin.readline().strip()
+        if score_line in {"0", "1", "2"}:
+            self._score = score_line
+            self._force_save = (score_line != "0")
+            self._finalize_session()
+        else:
+            self.get_logger().warning("Invalid score. Discarding trial.")
+            self._discard_session()
+
+    def _finalize_session(self) -> None:
+        """セッションごとのデータ保存処理."""
+        # 元の _finalize() のロジックをベースにセッション保存
+        if self._score is not None and self._session_dir:
+            (self._session_dir / "score.txt").write_text(f"{self._score}\n")
+            
+        if self._force_save:
+            self.get_logger().info(f"Saving session to {self._session_dir}")
+            if self._convert_after_record:
+                # 必要に応じて変換実行
+                pass 
+        else:
+            self._discard_session()
+        
+        # 次の施行のためにリセット
+        self._score = None
+        self._force_save = False
+
+    def _discard_session(self) -> None:
+        """現在のセッションデータを破棄."""
+        if self._session_dir and self._session_dir.exists():
+            shutil.rmtree(self._session_dir, ignore_errors=True)
+            self.get_logger().info("Session discarded.")
+
+    def _finalize_all(self) -> None:
+        """ノード終了時のクリーンアップ."""
+        self._stop_viewers() #
+        self._stop_aux_processes() #
+        self._cleanup_existing_viewers() #
+
 
     def _prepare_session(self) -> None:
         timestamp = self._session_id_override or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -138,35 +239,7 @@ class DataCaptureNode(Node):
             env=os.environ.copy(),
         )
 
-    def _watch_user_input(self) -> None:
-        if not sys.stdin.isatty():
-            self.get_logger().warning(
-                "stdin is not a TTY; press Ctrl+C to stop recording instead."
-            )
-            return
-        stop_keys = {"0", "1", "2"}
-        self.get_logger().info(
-            "Press 1 or 2 to stop and save with that score. Press 0 to stop and be asked whether to discard."
-        )
-        while not self._stop_event.is_set():
-            try:
-                line = sys.stdin.readline()
-            except Exception:
-                break
-            if not line:
-                continue
-            stripped = line.strip()
-            if stripped.lower() == "f":
-                self._record_snapped_time()
-                continue
-            if stripped in stop_keys:
-                self.get_logger().info(f"Stop key received with score {stripped}.")
-                self._force_save = True  # Always save when a scored stop key is used.
-                self._score = stripped
-                self._stop_event.set()
-                self._record_stop_time_if_missing()
-                break
-
+    
     def _finalize(self) -> None:
         self._stop_rosbag(fast=self._discard_fast)
         self._stop_viewers()

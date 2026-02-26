@@ -8,6 +8,8 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/int32.hpp"
 
 #include "builtin_interfaces/msg/duration.hpp"
 #include "control_msgs/action/follow_joint_trajectory.hpp"
@@ -22,63 +24,43 @@ using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using GoalHandleFollow = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
 using GoalHandleGripper = rclcpp_action::ClientGoalHandle<MoveGripper>;
 
-enum class StepType
-{
+enum class StepType {
     ArmTrajectory,
     GripperMove
 };
 
-struct SequenceStep
-{
+// 動作ステップの構造体
+struct SequenceStep {
     StepType type{StepType::GripperMove};
+    int phase_id{0}; // データ収集時のタイムスタンプ用ID
     FollowJointTrajectory::Goal arm_goal;
     MoveGripper::Goal gripper_goal;
     std::chrono::nanoseconds post_delay{std::chrono::seconds(1)};
 };
 
-struct RawTrajectoryPoint
-{
+struct RawTrajectoryPoint {
     std::array<double, 6> positions{};
     std::array<double, 6> velocities{};
     std::chrono::seconds time_from_start{0};
 };
 
-SequenceStep make_arm_step(FollowJointTrajectory::Goal goal, std::chrono::nanoseconds delay)
-{
+// --- ヘルパー関数群 ---
+SequenceStep make_arm_step(FollowJointTrajectory::Goal goal, std::chrono::nanoseconds delay, int phase = 0) {
     SequenceStep step;
     step.type = StepType::ArmTrajectory;
+    step.phase_id = phase;
     step.arm_goal = std::move(goal);
     step.post_delay = delay;
     return step;
 }
 
-SequenceStep make_gripper_step(MoveGripper::Goal goal, std::chrono::nanoseconds delay)
-{
+SequenceStep make_gripper_step(MoveGripper::Goal goal, std::chrono::nanoseconds delay, int phase = 0) {
     SequenceStep step;
     step.type = StepType::GripperMove;
+    step.phase_id = phase;
     step.gripper_goal = std::move(goal);
     step.post_delay = delay;
     return step;
-}
-
-std::string follow_result_to_string(int32_t error_code)
-{
-    switch (error_code) {
-        case FollowJointTrajectory::Result::SUCCESSFUL:
-            return "SUCCESSFUL";
-        case FollowJointTrajectory::Result::INVALID_GOAL:
-            return "INVALID_GOAL";
-        case FollowJointTrajectory::Result::INVALID_JOINTS:
-            return "INVALID_JOINTS";
-        case FollowJointTrajectory::Result::OLD_HEADER_TIMESTAMP:
-            return "OLD_HEADER_TIMESTAMP";
-        case FollowJointTrajectory::Result::PATH_TOLERANCE_VIOLATED:
-            return "PATH_TOLERANCE_VIOLATED";
-        case FollowJointTrajectory::Result::GOAL_TOLERANCE_VIOLATED:
-            return "GOAL_TOLERANCE_VIOLATED";
-        default:
-            return "UNKNOWN";
-    }
 }
 
 FollowJointTrajectory::Goal create_follow_joint_goal(
@@ -87,364 +69,143 @@ FollowJointTrajectory::Goal create_follow_joint_goal(
 {
     FollowJointTrajectory::Goal goal;
     goal.trajectory.joint_names = joint_names;
+    goal.trajectory.header.stamp = rclcpp::Clock().now(); // タイムスタンプ拒否対策
 
-    goal.goal_time_tolerance.sec = 0;
-    goal.goal_time_tolerance.nanosec = 500000000; // 0.5s
-
-    goal.goal_tolerance.clear();
-    goal.goal_tolerance.reserve(joint_names.size());
-    for (const auto &name : joint_names) {
-        control_msgs::msg::JointTolerance tolerance;
-        tolerance.name = name;
-        tolerance.position = 0.01;
-        tolerance.velocity = 0.01;
-        tolerance.acceleration = 0.0;
-        goal.goal_tolerance.push_back(tolerance);
-    }
-
-    goal.trajectory.points.reserve(points.size());
     for (const auto &raw_point : points) {
         trajectory_msgs::msg::JointTrajectoryPoint point;
         point.positions.assign(raw_point.positions.begin(), raw_point.positions.end());
         point.velocities.assign(raw_point.velocities.begin(), raw_point.velocities.end());
-        point.accelerations.assign(raw_point.velocities.size(), 0.0);
         point.time_from_start.sec = static_cast<int32_t>(raw_point.time_from_start.count());
-        point.time_from_start.nanosec = 0;
         goal.trajectory.points.push_back(point);
     }
-
     return goal;
 }
 
-class PickPlaceClient : public rclcpp::Node
-{
+class PickPlaceClient : public rclcpp::Node {
 public:
-    PickPlaceClient(std::string controller_name,
-                    std::vector<SequenceStep> steps)
+    PickPlaceClient(std::string controller_name)
     : rclcpp::Node("pick_place_client"),
       controller_action_name_(std::move(controller_name) + "/follow_joint_trajectory"),
-      arm_client_(rclcpp_action::create_client<FollowJointTrajectory>(
-          this, controller_action_name_)),
-      gripper_client_(rclcpp_action::create_client<MoveGripper>(
-          this, "/robotiq_2f_gripper_action")),
-      steps_(std::move(steps)),
+      arm_client_(rclcpp_action::create_client<FollowJointTrajectory>(this, controller_action_name_)),
+      gripper_client_(rclcpp_action::create_client<MoveGripper>(this, "/robotiq_2f_gripper_action")),
       current_step_index_(0),
       action_in_progress_(false)
     {
-        if (steps_.empty()) {
-            RCLCPP_WARN(this->get_logger(), "ステップが設定されていません。処理を終了します。");
-            rclcpp::shutdown();
-            return;
-        }
+        // 外部（Python）からのコマンド受信
+        cmd_sub_ = this->create_subscription<std_msgs::msg::String>(
+            "/robot_cmd", 10, std::bind(&PickPlaceClient::on_command_received, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(),
-                    "アームアクションサーバ %s を待機中...", controller_action_name_.c_str());
-        if (!arm_client_->wait_for_action_server(std::chrono::seconds(10))) {
-            RCLCPP_ERROR(this->get_logger(), "アームアクションサーバが見つかりません。");
-            rclcpp::shutdown();
-            return;
-        }
+        // 現在のフェーズIDの通知用
+        phase_pub_ = this->create_publisher<std_msgs::msg::Int32>("/current_phase", 10);
 
-        RCLCPP_INFO(this->get_logger(),
-                    "グリッパアクションサーバ /robotiq_2f_gripper_action を待機中...");
-        if (!gripper_client_->wait_for_action_server(std::chrono::seconds(10))) {
-            RCLCPP_ERROR(this->get_logger(), "グリッパアクションサーバが見つかりません。");
-            rclcpp::shutdown();
-            return;
-        }
-
-        RCLCPP_INFO(this->get_logger(), "全アクションサーバを検出しました。シーケンスを開始します。");
-        schedule_next_step(std::chrono::seconds(0));
+        RCLCPP_INFO(this->get_logger(), "PickPlaceClient準備完了。'/robot_cmd' を待機中...");
     }
 
 private:
-    void schedule_next_step(const std::chrono::nanoseconds &delay)
-    {
-        if (timer_) {
-            timer_->cancel();
-        }
-
-        timer_ = this->create_wall_timer(
-            delay,
-            [this]() {
-                if (timer_) {
-                    timer_->cancel();
-                }
-                send_next_step();
-            });
-    }
-
-    void send_next_step()
-    {
+    void on_command_received(const std_msgs::msg::String::SharedPtr msg) {
         if (action_in_progress_) {
-            RCLCPP_WARN(this->get_logger(), "前のアクションがまだ進行中です。");
+            RCLCPP_WARN(this->get_logger(), "アクション実行中のためコマンドを無視します。");
             return;
         }
 
+        if (msg->data == "init") {
+            prepare_init_sequence(); // 最初の一回用
+        } else if (msg->data == "run") {
+            prepare_run_sequence();  // 繰り返しデータ収集用
+        } else {
+            return;
+        }
+
+        current_step_index_ = 0;
+        send_next_step();
+    }
+
+    void prepare_init_sequence() {
+        steps_.clear();
+        const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
+        
+        // 1. グリッパを開く
+        MoveGripper::Goal open_goal;
+        open_goal.target_position = 0.08f; open_goal.target_speed = 0.1f; open_goal.target_force = 0.1f;
+        steps_.push_back(make_gripper_step(open_goal, std::chrono::seconds(1), 9));
+
+        // 2. アームを初期位置へ移動
+        // const std::vector<RawTrajectoryPoint> point = {{{1.03128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
+        const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
+        // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, point), std::chrono::seconds(2), 0));
+        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, points), std::chrono::seconds(2), 9));
+
+        RCLCPP_INFO(this->get_logger(), "初期化シーケンスを準備しました。");
+    }
+
+    void prepare_run_sequence() {
+        steps_.clear();
+        // const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
+        
+        auto make_g = [](float pos) {
+            MoveGripper::Goal g; g.target_position = pos; g.target_speed = 0.1f; g.target_force = 0.1f; return g;
+        };
+        // 開(1) -> 閉(2) -> 開(3) のサイクル
+        steps_.push_back(make_gripper_step(make_g(0.08f), std::chrono::seconds(1), 1));
+        // const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
+        // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, points), std::chrono::seconds(2), 0));
+        steps_.push_back(make_gripper_step(make_g(0.05f), std::chrono::seconds(2), 2));
+        steps_.push_back(make_gripper_step(make_g(0.08f), std::chrono::seconds(1), 3));
+        RCLCPP_INFO(this->get_logger(), "データ収集シーケンスを準備しました。");
+    }
+
+    void send_next_step() {
         if (current_step_index_ >= steps_.size()) {
-            RCLCPP_INFO(this->get_logger(), "全てのステップが完了しました。");
-            rclcpp::shutdown();
+            RCLCPP_INFO(this->get_logger(), "シーケンス完了。待機します。");
+            action_in_progress_ = false;
+            auto p = std_msgs::msg::Int32(); p.data = 0; phase_pub_->publish(p); // 待機フェーズ
             return;
         }
 
-        const auto step_index = current_step_index_;
-        const auto &step = steps_.at(step_index);
-
-        switch (step.type) {
-            case StepType::ArmTrajectory:
-                send_arm_goal(step_index, step.arm_goal);
-                break;
-            case StepType::GripperMove:
-                send_gripper_goal(step_index, step.gripper_goal);
-                break;
-        }
-    }
-
-    void send_arm_goal(std::size_t step_index,
-                       const FollowJointTrajectory::Goal &goal)
-    {
-        RCLCPP_INFO(this->get_logger(), "ステップ%zu: アーム軌道を送信します。", step_index + 1);
         action_in_progress_ = true;
+        const auto &step = steps_.at(current_step_index_);
+        
+        auto phase_msg = std_msgs::msg::Int32();
+        phase_msg.data = step.phase_id;
+        phase_pub_->publish(phase_msg); // 現在のフェーズを通知
 
-        auto options = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
-        options.goal_response_callback =
-            [this, step_index](const GoalHandleFollow::SharedPtr &goal_handle) {
-                if (!goal_handle) {
-                    handle_failure("アーム軌道がサーバに拒否されました。");
-                    return;
-                }
-                RCLCPP_INFO(this->get_logger(), "ステップ%zu: ゴールが受理されました。", step_index + 1);
-            };
-
-        options.feedback_callback =
-            [this](GoalHandleFollow::SharedPtr,
-                   const std::shared_ptr<const FollowJointTrajectory::Feedback> feedback) {
-                if (!feedback) {
-                    return;
-                }
-                if (!feedback->actual.positions.empty()) {
-                    RCLCPP_DEBUG(this->get_logger(), "現在位置[0]=%.3f", feedback->actual.positions.front());
-                }
-            };
-
-        options.result_callback =
-            [this, step_index](const GoalHandleFollow::WrappedResult &result) {
-                handle_arm_result(step_index, result);
-            };
-
-        arm_client_->async_send_goal(goal, options);
-    }
-
-    void handle_arm_result(std::size_t step_index,
-                           const GoalHandleFollow::WrappedResult &result)
-    {
-        const auto &step = steps_.at(step_index);
-
-        if (result.code != rclcpp_action::ResultCode::SUCCEEDED) {
-            std::string code_str;
-            switch (result.code) {
-                case rclcpp_action::ResultCode::ABORTED:
-                    code_str = "ABORTED";
-                    break;
-                case rclcpp_action::ResultCode::CANCELED:
-                    code_str = "CANCELED";
-                    break;
-                default:
-                    code_str = "UNKNOWN";
-                    break;
-            }
-            handle_failure("アーム軌道が失敗しました: " + code_str);
-            return;
-        }
-
-        if (!result.result) {
-            handle_failure("アーム軌道の結果が取得できませんでした。");
-            return;
-        }
-
-        if (result.result->error_code != FollowJointTrajectory::Result::SUCCESSFUL) {
-            handle_failure("アーム軌道エラー: " +
-                           follow_result_to_string(result.result->error_code));
-            return;
-        }
-
-        RCLCPP_INFO(this->get_logger(), "ステップ%zu: アーム軌道が正常に完了しました。",
-                    step_index + 1);
-        handle_step_completion(step_index, step);
-    }
-
-    void send_gripper_goal(std::size_t step_index,
-                           const MoveGripper::Goal &goal)
-    {
-        RCLCPP_INFO(this->get_logger(),
-                    "ステップ%zu: グリッパ目標 position=%.3f speed=%.3f force=%.3f を送信します。",
-                    step_index + 1, goal.target_position, goal.target_speed, goal.target_force);
-        action_in_progress_ = true;
-
-        auto options = rclcpp_action::Client<MoveGripper>::SendGoalOptions();
-        options.goal_response_callback =
-            [this, step_index](const GoalHandleGripper::SharedPtr &goal_handle) {
-                if (!goal_handle) {
-                    handle_failure("グリッパ目標がサーバに拒否されました。");
-                    return;
-                }
-                RCLCPP_INFO(this->get_logger(), "ステップ%zu: グリッパ目標が受理されました。",
-                            step_index + 1);
-            };
-
-        options.feedback_callback =
-            [this](GoalHandleGripper::SharedPtr,
-                   const std::shared_ptr<const MoveGripper::Feedback> feedback) {
-                if (!feedback) {
-                    return;
-                }
-                RCLCPP_INFO(this->get_logger(), "グリッパフィードバック: %s", feedback->feedback.c_str());
-            };
-
-        options.result_callback =
-            [this, step_index](const GoalHandleGripper::WrappedResult &result) {
-                handle_gripper_result(step_index, result);
-            };
-
-        gripper_client_->async_send_goal(goal, options);
-    }
-
-    void handle_gripper_result(std::size_t step_index,
-                               const GoalHandleGripper::WrappedResult &result)
-    {
-        const auto &step = steps_.at(step_index);
-
-        switch (result.code) {
-            case rclcpp_action::ResultCode::SUCCEEDED:
-                if (result.result && result.result->success) {
-                    RCLCPP_INFO(this->get_logger(), "ステップ%zu: グリッパ成功 (success=true)。",
-                                step_index + 1);
-                    handle_step_completion(step_index, step);
-                } else {
-                    handle_failure("グリッパ目標は完了しましたが success=false でした。");
-                }
-                break;
-            case rclcpp_action::ResultCode::ABORTED:
-                handle_failure("グリッパ目標が中断されました (ABORTED)。");
-                break;
-            case rclcpp_action::ResultCode::CANCELED:
-                handle_failure("グリッパ目標がキャンセルされました (CANCELED)。");
-                break;
-            default:
-                handle_failure("グリッパ目標が不明なコードで終了しました。");
-                break;
+        if (step.type == StepType::ArmTrajectory) {
+            auto opts = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
+            opts.result_callback = [this](const auto &) { this->on_step_completed(); };
+            arm_client_->async_send_goal(step.arm_goal, opts);
+        } else {
+            auto opts = rclcpp_action::Client<MoveGripper>::SendGoalOptions();
+            opts.result_callback = [this](const auto &) { this->on_step_completed(); };
+            gripper_client_->async_send_goal(step.gripper_goal, opts);
         }
     }
 
-    void handle_step_completion(std::size_t step_index,
-                                const SequenceStep &step)
-    {
-        action_in_progress_ = false;
-        current_step_index_ = step_index + 1;
-
-        if (current_step_index_ >= steps_.size()) {
-            RCLCPP_INFO(this->get_logger(), "全てのステップが完了しました。ノードを終了します。");
-            rclcpp::shutdown();
-            return;
-        }
-
-        schedule_next_step(step.post_delay);
+    void on_step_completed() {
+        auto delay = steps_.at(current_step_index_).post_delay;
+        current_step_index_++;
+        timer_ = this->create_wall_timer(delay, [this]() {
+            this->timer_->cancel();
+            this->send_next_step();
+        });
     }
 
-    void handle_failure(const std::string &message)
-    {
-        RCLCPP_ERROR(this->get_logger(), "%s", message.c_str());
-        action_in_progress_ = false;
-        rclcpp::shutdown();
-    }
-
+    // メンバ変数
     std::string controller_action_name_;
     rclcpp_action::Client<FollowJointTrajectory>::SharedPtr arm_client_;
     rclcpp_action::Client<MoveGripper>::SharedPtr gripper_client_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cmd_sub_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr phase_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
     std::vector<SequenceStep> steps_;
     std::size_t current_step_index_;
     bool action_in_progress_;
-    rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
-
     const std::string controller_name = "scaled_joint_trajectory_controller";
-    const std::vector<std::string> joints = {
-        "shoulder_pan_joint",
-        "shoulder_lift_joint",
-        "elbow_joint",
-        "wrist_1_joint",
-        "wrist_2_joint",
-        "wrist_3_joint"
-    };
-
-    const std::vector<RawTrajectoryPoint> traj0_points = {
-        {
-            {1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(4)
-        },
-        {
-            {1.23128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(8)
-        }
-    };
-
-    // const std::vector<RawTrajectoryPoint> traj1_points = {
-    //     {
-    //         {0.93128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
-    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    //         std::chrono::seconds(0)
-    //     },
-    //     {
-    //         {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
-    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    //         std::chrono::seconds(8)
-    //     }
-    // };
-
-    // const std::vector<RawTrajectoryPoint> traj2_points = {
-    //     {
-    //         {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
-    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    //         std::chrono::seconds(0)
-    //     },
-    //     {
-    //         {0.93128, -1.70093, 0.902027, -1.57, -1.57, 0.0},
-    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-    //         std::chrono::seconds(8)
-    //     }
-    // };
-
-    FollowJointTrajectory::Goal traj0_goal = create_follow_joint_goal(joints, traj0_points);
-    // FollowJointTrajectory::Goal traj1_goal = create_follow_joint_goal(joints, traj1_points);
-    // FollowJointTrajectory::Goal traj2_goal = create_follow_joint_goal(joints, traj2_points);
-
-    const auto make_gripper_goal = [](float position) {
-        MoveGripper::Goal goal;
-        goal.target_position = position;
-        goal.target_speed = 0.1f;
-        goal.target_force = 0.1f;
-        return goal;
-    };
-
-    std::vector<SequenceStep> steps;
-    steps.reserve(6);
-    steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
-    steps.emplace_back(make_arm_step(std::move(traj0_goal), std::chrono::seconds(2)));
-    steps.emplace_back(make_gripper_step(make_gripper_goal(0.05f), std::chrono::seconds(2)));
-    steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(2)));
-    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
-    // steps.emplace_back(make_arm_step(std::move(traj0_goal), std::chrono::seconds(2)));
-    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.05f), std::chrono::seconds(1)));
-    // steps.emplace_back(make_arm_step(std::move(traj1_goal), std::chrono::seconds(2)));
-    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
-    // steps.emplace_back(make_arm_step(std::move(traj2_goal), std::chrono::seconds(1)));
-
-    rclcpp::spin(std::make_shared<PickPlaceClient>(controller_name, std::move(steps)));
+    // メインループ（spin）を開始
+    rclcpp::spin(std::make_shared<PickPlaceClient>(controller_name));
+    rclcpp::shutdown();
     return EXIT_SUCCESS;
 }
