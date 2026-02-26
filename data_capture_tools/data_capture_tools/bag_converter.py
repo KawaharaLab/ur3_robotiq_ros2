@@ -368,19 +368,13 @@ def convert_bag_to_dataset(
 
 
 def cli_main():
-    """Entry point for manual conversion via ros2 run."""
+    """Entry point for manual conversion via ros2 run with fixed config."""
 
     import argparse
 
     parser = argparse.ArgumentParser(description="Convert rosbag2 data into PNG/CSV outputs")
     parser.add_argument("--bag", required=True, help="Path to the rosbag2 directory (metadata.yaml parent)")
-    parser.add_argument("--config", required=False, help="Path to the capture YAML config")
-    parser.add_argument("--output", required=False, help="Directory to place converted artifacts")
-    parser.add_argument(
-        "--csv-config",
-        required=False,
-        help="CSV field map YAML (defaults to output_dir/csv_fields.yaml if present)",
-    )
+    # --config 引数は不要になるため削除またはコメントアウト
     parser.add_argument(
         "--skip-corrupt-zstd",
         action="store_true",
@@ -390,20 +384,30 @@ def cli_main():
 
     from .config import load_capture_config
 
+    # バッグのパスを解決
     bag_path = Path(args.bag)
+    # 出力先はバッグディレクトリの2階層上（施行フォルダ直下）に設定
     output_dir = bag_path.resolve().parent.parent
-    config_path = Path(args.config) if args.config else output_dir / "config.yaml"
-    cfg = load_capture_config(config_path)
-    csv_config_path = (
-        Path(args.csv_config) if args.csv_config else output_dir / "csv_fields.yaml"
-    )
+
+    # --- 固定パスの設定 ---
+    FIXED_CONFIG_PATH = Path("/home/tsumura/my_robotiq_ws/src/ur3_robotiq_ros2/data_capture_tools/config/data_capture_extract.yaml")
+    
+    if not FIXED_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"固定設定ファイルが見つかりません: {FIXED_CONFIG_PATH}")
+
+    # 設定の読み込み
+    cfg = load_capture_config(FIXED_CONFIG_PATH)
+    
+    # CSVフィールド設定（もしあれば）
+    csv_config_path = output_dir / "csv_fields.yaml"
     cfg.csv_config_path = csv_config_path if csv_config_path.exists() else None
+
+    # 変換実行
     convert_bag_to_dataset(
         bag_path,
         output_dir,
         cfg,
         allow_corrupt_zstd=args.skip_corrupt_zstd,
     )
-
 
 # usage: bag_to_dataset [-h] --bag BAG --config CONFIG --output OUTPUT
