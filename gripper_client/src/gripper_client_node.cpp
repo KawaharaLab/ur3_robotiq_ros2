@@ -383,46 +383,46 @@ int main(int argc, char **argv)
 
     const std::vector<RawTrajectoryPoint> traj0_points = {
         {
-            {0.93128, -1.70093, 0.902027, -1.57, -1.57, 0.0},
+            {1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0},
             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
             std::chrono::seconds(4)
         },
         {
-            {0.93128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
+            {1.23128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
             std::chrono::seconds(8)
         }
     };
 
-    const std::vector<RawTrajectoryPoint> traj1_points = {
-        {
-            {0.93128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(0)
-        },
-        {
-            {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(8)
-        }
-    };
+    // const std::vector<RawTrajectoryPoint> traj1_points = {
+    //     {
+    //         {0.93128, -0.982256, 0.955627, -1.57, -1.57, -0.0},
+    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    //         std::chrono::seconds(0)
+    //     },
+    //     {
+    //         {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
+    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    //         std::chrono::seconds(8)
+    //     }
+    // };
 
-    const std::vector<RawTrajectoryPoint> traj2_points = {
-        {
-            {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(0)
-        },
-        {
-            {0.93128, -1.70093, 0.902027, -1.57, -1.57, 0.0},
-            {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
-            std::chrono::seconds(8)
-        }
-    };
+    // const std::vector<RawTrajectoryPoint> traj2_points = {
+    //     {
+    //         {0.30493, -0.982258, 0.955637, -1.57, -1.57, 0.0},
+    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    //         std::chrono::seconds(0)
+    //     },
+    //     {
+    //         {0.93128, -1.70093, 0.902027, -1.57, -1.57, 0.0},
+    //         {0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    //         std::chrono::seconds(8)
+    //     }
+    // };
 
     FollowJointTrajectory::Goal traj0_goal = create_follow_joint_goal(joints, traj0_points);
-    FollowJointTrajectory::Goal traj1_goal = create_follow_joint_goal(joints, traj1_points);
-    FollowJointTrajectory::Goal traj2_goal = create_follow_joint_goal(joints, traj2_points);
+    // FollowJointTrajectory::Goal traj1_goal = create_follow_joint_goal(joints, traj1_points);
+    // FollowJointTrajectory::Goal traj2_goal = create_follow_joint_goal(joints, traj2_points);
 
     const auto make_gripper_goal = [](float position) {
         MoveGripper::Goal goal;
@@ -436,10 +436,14 @@ int main(int argc, char **argv)
     steps.reserve(6);
     steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
     steps.emplace_back(make_arm_step(std::move(traj0_goal), std::chrono::seconds(2)));
-    steps.emplace_back(make_gripper_step(make_gripper_goal(0.02f), std::chrono::seconds(1)));
-    steps.emplace_back(make_arm_step(std::move(traj1_goal), std::chrono::seconds(2)));
-    steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
-    steps.emplace_back(make_arm_step(std::move(traj2_goal), std::chrono::seconds(1)));
+    steps.emplace_back(make_gripper_step(make_gripper_goal(0.05f), std::chrono::seconds(2)));
+    steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(2)));
+    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
+    // steps.emplace_back(make_arm_step(std::move(traj0_goal), std::chrono::seconds(2)));
+    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.05f), std::chrono::seconds(1)));
+    // steps.emplace_back(make_arm_step(std::move(traj1_goal), std::chrono::seconds(2)));
+    // steps.emplace_back(make_gripper_step(make_gripper_goal(0.08f), std::chrono::seconds(1)));
+    // steps.emplace_back(make_arm_step(std::move(traj2_goal), std::chrono::seconds(1)));
 
     rclcpp::spin(std::make_shared<PickPlaceClient>(controller_name, std::move(steps)));
     return EXIT_SUCCESS;
