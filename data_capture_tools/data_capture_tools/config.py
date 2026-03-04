@@ -36,6 +36,9 @@ class CaptureConfig:
     task_name: str
     prompt: str
     label: str
+    target_diameter: float  # in meters
+    gripper_offset: float  # in meters
+    initial_arm_pose: list[float]  # in radians
     viewer_topics: list[str]
     image_throttle_hz: float
     other_throttle_hz: float
@@ -101,6 +104,9 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     )
     label = str(data.get("label", ""))
     viewer_topics = [str(item) for item in data.get("viewer_topics", [])]
+    target_diameter = float(data.get("target_diameter", 0.05))
+    gripper_offset = float(data.get("gripper_offset", 0.0))
+    initial_arm_pose = data.get("initial_arm_pose", [1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0])
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
     enable_image_compression = bool(data.get("enable_image_compression", True))
@@ -112,6 +118,9 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         task_name=task_name,
         prompt=prompt,
         label=label,
+        target_diameter=target_diameter,
+        gripper_offset=gripper_offset,
+        initial_arm_pose=initial_arm_pose,
         viewer_topics=viewer_topics,
         image_throttle_hz=image_throttle_hz,
         other_throttle_hz=other_throttle_hz,

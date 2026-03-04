@@ -102,16 +102,40 @@ public:
     }
 
 private:
+    // 2. コマンド受信部分で文字列をパースする
     void on_command_received(const std_msgs::msg::String::SharedPtr msg) {
-        if (action_in_progress_) {
-            RCLCPP_WARN(this->get_logger(), "アクション実行中のためコマンドを無視します。");
-            return;
-        }
+        if (action_in_progress_) return;
 
-        if (msg->data == "init") {
-            prepare_init_sequence(); // 最初の一回用
-        } else if (msg->data == "run") {
-            prepare_run_sequence();  // 繰り返しデータ収集用
+        std::string cmd = msg->data;
+        if (cmd.find("init") == 0) {
+            std::vector<double> joints_pos = {1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}; // デフォルト
+            
+            if (cmd.length() > 5) {
+                std::stringstream ss(cmd.substr(5));
+                std::vector<double> parsed_pos;
+                double val;
+                while (ss >> val) parsed_pos.push_back(val);
+                
+                if (parsed_pos.size() == 6) {
+                    joints_pos = parsed_pos;
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "関節数が正しくありません(6つ必要)。デフォルトを使用。");
+                }
+            }
+            prepare_init_sequence(joints_pos);
+        }
+        else if (cmd.find("run") == 0) { // "run" で始まる場合
+            double target_pos = 0.05; // デフォルト値
+            
+            // "run 0.045" のように数値が含まれていれば抽出
+            if (cmd.length() > 4) {
+                try {
+                    target_pos = std::stod(cmd.substr(4));
+                } catch (...) {
+                    RCLCPP_ERROR(this->get_logger(), "数値のパースに失敗しました。デフォルト値を使用します。");
+                }
+            }
+            prepare_run_sequence(target_pos);
         } else {
             return;
         }
@@ -120,25 +144,30 @@ private:
         send_next_step();
     }
 
-    void prepare_init_sequence() {
+    void prepare_init_sequence(const std::vector<double>& joints_pos) {
         steps_.clear();
         const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
         
         // 1. グリッパを開く
         MoveGripper::Goal open_goal;
-        open_goal.target_position = 0.08f; open_goal.target_speed = 0.1f; open_goal.target_force = 0.1f;
+        open_goal.target_position = 0.1f; open_goal.target_speed = 0.1f; open_goal.target_force = 0.1f;
         steps_.push_back(make_gripper_step(open_goal, std::chrono::seconds(1), 9));
+        
+        // 受け取った角度をセット
+        RawTrajectoryPoint p;
+        std::copy(joints_pos.begin(), joints_pos.end(), p.positions.begin());
+        p.velocities = {0,0,0,0,0,0};
+        p.time_from_start = std::chrono::seconds(5);
 
         // 2. アームを初期位置へ移動
         // const std::vector<RawTrajectoryPoint> point = {{{1.03128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
-        const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
+        // const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
         // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, point), std::chrono::seconds(2), 0));
-        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, points), std::chrono::seconds(2), 9));
-
+        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, {p}), std::chrono::seconds(2), 9));
         RCLCPP_INFO(this->get_logger(), "初期化シーケンスを準備しました。");
     }
 
-    void prepare_run_sequence() {
+    void prepare_run_sequence(double target_pos) {
         steps_.clear();
         // const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
         
@@ -146,13 +175,12 @@ private:
             MoveGripper::Goal g; g.target_position = pos; g.target_speed = 0.1f; g.target_force = 0.1f; return g;
         };
         // 開(1) -> 閉(2) -> 開(3) のサイクル
-        steps_.push_back(make_gripper_step(make_g(0.08f), std::chrono::seconds(1), 1));
+        steps_.push_back(make_gripper_step(make_g(0.1f), std::chrono::seconds(1), 1));
         // const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
         // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, points), std::chrono::seconds(2), 0));
-        steps_.push_back(make_gripper_step(make_g(0.05f), std::chrono::seconds(2), 2));
-        steps_.push_back(make_gripper_step(make_g(0.08f), std::chrono::seconds(1), 3));
-        RCLCPP_INFO(this->get_logger(), "データ収集シーケンスを準備しました。");
-    }
+        steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos)), std::chrono::seconds(3), 2));
+        steps_.push_back(make_gripper_step(make_g(0.1f), std::chrono::seconds(1), 3));
+        RCLCPP_INFO(this->get_logger(), "データ収集シーケンス準備完了 (Target: %f m)", target_pos);    }
 
     void send_next_step() {
         if (current_step_index_ >= steps_.size()) {

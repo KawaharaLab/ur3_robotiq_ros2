@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import threading
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -103,8 +104,9 @@ class DataCaptureNode(Node):
     def _watch_user_input(self) -> None:
         while not self._stop_event.is_set():
             print("\n" + "="*40)
-            print(" [i]: Init Arm (Move to start pose)")
-            print(" [s]: Start Trial (Record & Run)")
+            print(" [i]: Init Arm (Move to start pose manually)")
+            print(" [s]: Start Single Trial (Record & Run)")
+            print(" [a]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [q]: Quit")
             print("="*40)
             
@@ -112,35 +114,118 @@ class DataCaptureNode(Node):
             if not line: continue
 
             if line == 'i':
-                self.get_logger().info("Sending 'init' command...")
-                self._is_active_session = True # 完了検知を有効化
-                self._sequence_finished_event.clear()
-                self._cmd_pub.publish(String(data="init"))
-                
-                self.get_logger().info("Moving to init pose... Please wait.")
-                self._sequence_finished_event.wait() # 動作完了までブロック
-                self._is_active_session = False
-                self.get_logger().info("Init pose reached.")
-
+                # 手動でのみ実行
+                self._run_init_sequence()
             elif line == 's':
-                self._execute_trial() # 録画ありの施行
-            
+                self._execute_trial()
+            elif line == 'a':
+                self._execute_auto_loop()
             elif line == 'q':
                 self._stop_event.set()
                 break
 
+    def _execute_auto_loop(self) -> None:
+        """指定された回数、初期化をスキップして連続でデータを収集する"""
+        print("Enter number of trials to repeat: ", end="", flush=True)
+        count_line = sys.stdin.readline().strip()
+        try:
+            total_count = int(count_line)
+            if total_count <= 0: return
+        except ValueError:
+            self.get_logger().warning("Invalid number.")
+            return
+
+        print(f"Starting auto loop for {total_count} trials.")
+        print("Press Ctrl+C in this terminal if you need to abort after the current trial.")
+        
+        # 1. YAMLから値を読み取って計算 (configクラスに属性がある前提)
+        target_m = max(0.0,self.config.target_diameter - self.config.gripper_offset) # 負の値にならないようガード
+        
+        for i in range(total_count):
+            self.get_logger().info(f"--- Auto Trial {i+1} / {total_count} ---")
+            
+            # 1. 準備と録画開始 (初期化は行わない)
+            self._prepare_session()
+            self._start_rosbag()
+            
+            # 2. ロボット動作開始命令 (指の開閉動作)
+            self._is_active_session = True
+            self._sequence_finished_event.clear()
+            self.get_logger().info(f"Sending run command with target: {target_m}m")
+            self._cmd_pub.publish(String(data=f"run {target_m}"))
+            
+            self.get_logger().info(f"Trial {i+1} in progress...")
+            
+            # 3. 動作完了（Phase 0）を待機
+            # 完了時に指が開いた状態（初期状態）に戻っている想定
+            self._sequence_finished_event.wait()
+            
+            # 4. 録画停止
+            self._record_stop_time_if_missing()
+            self._stop_rosbag()
+            self._is_active_session = False
+            
+            # 5. 自動保存
+            self._score = "1"  # 自動ループ分は成功扱いとする
+            self._force_save = True
+            self._finalize_session()
+            self.get_logger().info(f"Trial {i+1} saved. Moving to next...")
+
+            # 次の録画開始まで少しだけ間隔を空ける（ファイルIOの安定のため）
+            if i < total_count - 1:
+                threading.Event().wait(0.5)
+
+            if self._stop_event.is_set():
+                break
+
+        self.get_logger().info("All auto trials completed.")
+
+    def _run_init_sequence(self) -> bool:
+        """手動初期化用：初期化ポーズへの移動を実行し、完了まで待機する"""
+        # 1. YAMLからリストを取得し、"init 1.23 -0.98 ..." という形式に変換
+        # ※configクラスで initial_arm_pose がロードされている前提
+
+        degrees = self.config.initial_arm_pose
+        
+        # 2. すべての要素を Radian に変換
+        radians = [math.radians(d) for d in degrees]
+
+        # 3. スペース区切りの文字列にする
+        joints_str = " ".join(map(str, radians))
+        
+        self.get_logger().info(f"Sending 'init' command with joints: {joints_str}")
+        self._is_active_session = True
+        self._sequence_finished_event.clear()
+        
+        # コマンド送信
+        self._cmd_pub.publish(String(data=f"init {joints_str}"))
+        
+        success = self._sequence_finished_event.wait(timeout=30.0) 
+        self._is_active_session = False
+        
+        if success:
+            self.get_logger().info("Init pose reached.")
+        else:
+            self.get_logger().error("Init sequence timed out.")
+        return success
+
     def _execute_trial(self) -> None:
         """1回の施行（録画・動作・スコアリング）を実行."""
         self.get_logger().info("Starting new trial...")
+
+        # 1. YAMLから値を読み取って計算 (configクラスに属性がある前提)
+        target_m = max(0.0,self.config.target_diameter - self.config.gripper_offset) # 負の値にならないようガード
         
         # 1. 準備と録画開始
         self._prepare_session() #
         self._start_rosbag() #
+
         
         # 2. ロボット動作開始命令
         self._is_active_session = True
         self._sequence_finished_event.clear()
-        self._cmd_pub.publish(String(data="run"))
+        self.get_logger().info(f"Sending run command with target: {target_m}m")
+        self._cmd_pub.publish(String(data=f"run {target_m}"))
         
         # 3. 動作完了（Phase 0）を待機
         self.get_logger().info("Sequence in progress. Waiting for completion...")
