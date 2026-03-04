@@ -203,6 +203,9 @@ class DataCaptureNode(Node):
         (session_dir / "prompt.txt").write_text(
             self.config.prompt + "\n", encoding="utf-8"
         )
+        (session_dir / "label.txt").write_text(
+            self.config.label + "\n", encoding="utf-8"
+        )
 
         bag_uri = session_dir / "bag" / f"session_{timestamp}"
         self._session_dir = session_dir

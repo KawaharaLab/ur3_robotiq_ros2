@@ -35,6 +35,7 @@ class CaptureConfig:
     output_root: Path
     task_name: str
     prompt: str
+    label: str
     viewer_topics: list[str]
     image_throttle_hz: float
     other_throttle_hz: float
@@ -98,6 +99,7 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
             "pick the blue tape and place it in the orange box.",
         )
     )
+    label = str(data.get("label", ""))
     viewer_topics = [str(item) for item in data.get("viewer_topics", [])]
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
@@ -109,6 +111,7 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         output_root=output_root,
         task_name=task_name,
         prompt=prompt,
+        label=label,
         viewer_topics=viewer_topics,
         image_throttle_hz=image_throttle_hz,
         other_throttle_hz=other_throttle_hz,
