@@ -1,0 +1,23 @@
+2026-04-01 23:56:43,458 [INFO] 🔍 Scanning directories under /home/tsumura/my_robotiq_ws/data/colorball_test_0303...
+2026-04-01 23:56:43,472 [INFO] Found 0 bags to process. (Skipped: 0)
+2026-04-01 23:56:43,472 [INFO] ✨ No new bags to process.
+2026-04-02 00:01:38,361 [INFO] 🔍 Scanning directories under: /home/tsumura/my_robotiq_ws/data/colorball_test_0303
+2026-04-02 00:01:38,368 [INFO] 🚀 Found 3 sessions to process.
+2026-04-02 00:01:38,368 [INFO] [1/3] Processing: 20260304_214345
+2026-04-02 00:01:38,395 [ERROR] ❌ Error in 20260304_214345: zstd failed (exit 1) for /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_214345/bag/session_20260304_214345/session_20260304_214345_0.db3.zstd: 04_214345_0.db3.zstd : 0 MB...     04_214345_0.db3.zstd : Read error (39) : premature end
+2026-04-02 00:01:38,395 [INFO] [2/3] Processing: 20260304_214421
+2026-04-02 00:01:38,419 [ERROR] ❌ Error in 20260304_214421: zstd failed (exit 1) for /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_214421/bag/session_20260304_214421/session_20260304_214421_0.db3.zstd: 04_214421_0.db3.zstd : 0 MB...     04_214421_0.db3.zstd : Read error (39) : premature end
+2026-04-02 00:01:38,419 [INFO] [3/3] Processing: 20260304_215243
+2026-04-02 00:01:38,447 [ERROR] ❌ Error in 20260304_215243: zstd failed (exit 1) for /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_215243/bag/session_20260304_215243/session_20260304_215243_0.db3.zstd: 04_215243_0.db3.zstd : 0 MB...     04_215243_0.db3.zstd : Read error (39) : premature end
+
+========================================
+🎯 Process Completed!
+📅 Date: 2026-04-02 00:01:38
+✅ Success: 0
+❌ Failed:  3
+
+Failed folders:
+  - /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_214345/bag/session_20260304_214345
+  - /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_214421/bag/session_20260304_214421
+  - /home/tsumura/my_robotiq_ws/data/colorball_test_0303/20260304_215243/bag/session_20260304_215243
+========================================
