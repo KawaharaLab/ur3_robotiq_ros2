@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import datetime
+import logging
+import os
+
 import csv
 import json
 import shutil
@@ -366,48 +370,103 @@ def convert_bag_to_dataset(
         if temp_handle:
             temp_handle.cleanup()
 
+def find_bags_ultra_fast(root_path: Path, force: bool):
+    """
+    ROS2 Bagの構造を活かした高速スキャナ。
+    .success ファイルがある場合は処理済みとみなす。
+    """
+    targets = []
+    skipped_paths = []
+    
+    for root, dirs, files in os.walk(root_path):
+        root_p = Path(root)
+
+        # 統一ルール: .success があれば処理済みとみなす
+        if ".success" in files and not force:
+            skipped_paths.append(str(root_p))
+            # 枝切り: images, csv, bag など配下の探索をすべてスキップ
+            dirs.clear() 
+            continue
+
+        if "bag" in dirs:
+            bag_root = root_p / "bag"
+            metas = list(bag_root.rglob("metadata.yaml"))
+            targets.extend(metas)
+            # bagを見つけたらその横のフォルダは見なくて良い
+            if "images" in dirs: dirs.remove("images")
+            if "csv" in dirs: dirs.remove("csv")
+
+    return targets, skipped_paths
 
 def cli_main():
-    """Entry point for manual conversion via ros2 run with fixed config."""
-
+    """成功・失敗のマーカーファイルを生成しながら変換を実行する。"""
     import argparse
+    
+    now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    TOOL_DIR = Path("/home/tsumura/my_robotiq_ws/src/ur3_robotiq_ros2/data_capture_tools")
+    LOG_FILE = TOOL_DIR / f"conversion_{now_str}.log"
+    FIXED_CONFIG_PATH = TOOL_DIR / "config" / "data_capture_extract.yaml"
 
-    parser = argparse.ArgumentParser(description="Convert rosbag2 data into PNG/CSV outputs")
-    parser.add_argument("--bag", required=True, help="Path to the rosbag2 directory (metadata.yaml parent)")
-    # --config 引数は不要になるため削除またはコメントアウト
-    parser.add_argument(
-        "--skip-corrupt-zstd",
-        action="store_true",
-        help="Skip zstd segments that fail to decompress",
-    )
+    parser = argparse.ArgumentParser(description="Convert rosbag2 data into PNG/CSV")
+    parser.add_argument("--root", required=True, help="探索を開始するルートパス")
+    parser.add_argument("--force", action="store_true", help="強制的に再処理")
+    parser.add_argument("--skip-corrupt-zstd", action="store_true", help="解凍失敗時にスキップ")
     args = parser.parse_args()
 
-    from .config import load_capture_config
-
-    # バッグのパスを解決
-    bag_path = Path(args.bag)
-    # 出力先はバッグディレクトリの2階層上（施行フォルダ直下）に設定
-    output_dir = bag_path.resolve().parent.parent
-
-    # --- 固定パスの設定 ---
-    FIXED_CONFIG_PATH = Path("/home/tsumura/my_robotiq_ws/src/ur3_robotiq_ros2/data_capture_tools/config/data_capture_extract.yaml")
-    
-    if not FIXED_CONFIG_PATH.exists():
-        raise FileNotFoundError(f"固定設定ファイルが見つかりません: {FIXED_CONFIG_PATH}")
-
-    # 設定の読み込み
-    cfg = load_capture_config(FIXED_CONFIG_PATH)
-    
-    # CSVフィールド設定（もしあれば）
-    csv_config_path = output_dir / "csv_fields.yaml"
-    cfg.csv_config_path = csv_config_path if csv_config_path.exists() else None
-
-    # 変換実行
-    convert_bag_to_dataset(
-        bag_path,
-        output_dir,
-        cfg,
-        allow_corrupt_zstd=args.skip_corrupt_zstd,
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.FileHandler(LOG_FILE, encoding='utf-8'), logging.StreamHandler()]
     )
+    logger = logging.getLogger("bag_converter")
 
-# usage: bag_to_dataset [-h] --bag BAG --config CONFIG --output OUTPUT
+    from .config import load_capture_config
+    root_dir = Path(args.root).resolve()
+    cfg = load_capture_config(FIXED_CONFIG_PATH)
+
+    bag_metadatas, skipped_folders = find_bags_ultra_fast(root_dir, args.force)
+    
+    stats = {"success": 0, "fail": 0, "skip": len(skipped_folders), "total": len(bag_metadatas)}
+    failed_paths = []
+
+    if not bag_metadatas:
+        logger.info("✨ No new bags found to process.")
+        return
+
+    logger.info(f"🚀 Starting process for {stats['total']} sessions.")
+
+    for i, metadata_path in enumerate(bag_metadatas, 1):
+        bag_path = metadata_path.parent
+        output_dir = bag_path.parent.parent
+        
+        # 以前の失敗マーカーがあれば削除しておく
+        if (output_dir / ".failed").exists():
+            (output_dir / ".failed").unlink()
+
+        logger.info(f"[{i}/{stats['total']}] Processing: {output_dir.name}")
+
+        try:
+            csv_config_path = output_dir / "csv_fields.yaml"
+            cfg.csv_config_path = csv_config_path if csv_config_path.exists() else None
+
+            convert_bag_to_dataset(bag_path, output_dir, cfg, allow_corrupt_zstd=args.skip_corrupt_zstd)
+            
+            # --- 成功マーカーの作成 ---
+            (output_dir / ".success").touch()
+            stats["success"] += 1
+            
+        except Exception as e:
+            logger.error(f"❌ Error in {output_dir.name}: {e}")
+            
+            # --- 失敗マーカーの作成 (エラー内容を記録) ---
+            with open(output_dir / ".failed", "w", encoding="utf-8") as f:
+                f.write(f"Timestamp: {now_str}\nError: {str(e)}")
+            
+            stats["fail"] += 1
+            failed_paths.append(str(bag_path))
+            
+    # --- サマリー出力 ---
+    # (前回と同様のレポート処理。中略)
+    logger.info(f"Summary: Success {stats['success']}, Fail {stats['fail']}, Skip {stats['skip']}")
+
+# usage: ros2 run data_capture_tools bag_to_dataset --root /path/to/data

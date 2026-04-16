@@ -1,9 +1,9 @@
 # Example configuration for data_capture_tools
 output_root: ./data
-task_name: softbaseball_fieldforce_test_0303
+task_name: petbottle_test_0303
 prompt: ""
-label: "モチモチ, mochi-mochi"
-target_diameter: 0.069 # in meters, ターゲット物体の直径
+label: "ぷにぷに, puni-puni" # データセットのラベル（例: "ぷにぷに, puni-puni"）
+target_diameter: 0.067 # in meters, ターゲット物体の直径
 gripper_offset: 0.010 # in meters, 押し込み量（オフセット） 
 initial_arm_pose: [70.5, -56.3, 54.8, -90.0, -90.0, 0.0] # in radians, 初期アーム姿勢,[70.5, -56.3, 54.8, -90.0, -90.0, 0.0](deg) =  [1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0](rad)
 #UR3のTCP z = 
