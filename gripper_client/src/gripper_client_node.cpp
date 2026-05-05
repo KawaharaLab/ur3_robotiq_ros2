@@ -162,6 +162,23 @@ private:
             
             prepare_run_sequence(target_pos, target_speed);
         }
+        else if (cmd.find("gripper") == 0) {
+            double target_pos = 0.1; 
+            double target_speed = 0.1; 
+
+            // substr(3) にして "run" の直後（スペース含む）から読み込ませるか、
+            // 明示的にスペースをスキップさせます
+            std::string params = cmd.substr(7); 
+            std::stringstream ss(params);
+            
+            if (ss >> target_pos >> target_speed) {
+                RCLCPP_INFO(this->get_logger(), "Parsed command: pos=%.3f, speed=%.3f", target_pos, target_speed);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Parse failed for: %s. Using default speed 0.1", cmd.c_str());
+            }
+            
+            prepare_gripper_sequence(target_pos, target_speed);
+        }
         else {
             return;
         }
@@ -221,6 +238,23 @@ private:
         // Phase 3: 開く
         steps_.push_back(make_gripper_step(make_g(0.140f, 0.1f), std::chrono::seconds(1), 3));
     }
+
+    void prepare_gripper_sequence(double target_pos, double target_speed) {
+        steps_.clear();
+        // 引数で受け取った target_speed を適用する
+        auto make_g = [target_speed](float pos, float force) {
+            MoveGripper::Goal g; 
+            g.target_position = pos; 
+            g.target_speed = static_cast<float>(target_speed); 
+            g.target_force = force; 
+            return g;
+        };
+
+        // Phase 1: 開閉
+        steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos), 0.5f), std::chrono::seconds(3), 10));
+        
+    }
+
     void send_next_step() {
         if (current_step_index_ >= steps_.size()) {
             RCLCPP_INFO(this->get_logger(), "シーケンス完了。待機します。");

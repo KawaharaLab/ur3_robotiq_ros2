@@ -1,4 +1,0 @@
-2026-04-02 01:01:12,017 [INFO] 🚀 Starting process for 1 sessions.
-2026-04-02 01:01:12,017 [INFO] [1/1] Processing: 20260226_211254
-2026-04-02 01:01:12,057 [ERROR] ❌ Error in 20260226_211254: zstd failed (exit 1) for /home/tsumura/my_robotiq_ws/data/lan_eval_0118/20260226_211254/bag/session_20260226_211254/session_20260226_211254_0.db3.zstd: 26_211254_0.db3.zstd : 0 MB...     26_211254_0.db3.zstd : Read error (39) : premature end
-2026-04-02 01:01:12,058 [INFO] Summary: Success 0, Fail 1, Skip 24
