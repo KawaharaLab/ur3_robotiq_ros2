@@ -113,7 +113,7 @@ class DataCaptureNode(Node):
             
     def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0, speed = 0.3):
         w_obj = self.config.target_diameter
-        dist = w_obj / 2.0
+        dist = w_obj / 2.0 - 0.00
         if not init:
             dist = 0
         
@@ -206,7 +206,7 @@ class DataCaptureNode(Node):
             self.get_logger().info(f"--- Executing Trial {trial_idx} ---")
 
             # 3. 本番動作（run）
-            start_msg = f"START,trial:{trial_idx},speed:{random_speed}"
+            start_msg = f"START,trial:{trial_idx},push_speed:{random_speed}, model:push"
             self._marker_pub.publish(String(data=start_msg)) #
             
             self._is_active_session = True
@@ -230,14 +230,7 @@ class DataCaptureNode(Node):
 
     def _execute_push_slide_loop(self) -> None:
         """10回ごとにBagを切り替えながら、補正済み角度へリセットして連続試行を行う"""
-        print("Enter total number of trials: ", end="", flush=True)
-        try:
-            line = sys.stdin.readline().strip()
-            if not line: return
-            total_count = int(line)
-            if total_count <= 0: return
-        except ValueError:
-            return
+        total_count = 9
         
         batch_size = 10 
         target_m = (self.config.target_diameter - 
@@ -252,12 +245,14 @@ class DataCaptureNode(Node):
                 self._prepare_session() #
                 self._start_rosbag() #
                 threading.Event().wait(3.5)
+                
+            actual_speed = 0.03 + (i - 4) * 0.0015
 
             trial_idx = i + 1
             self.get_logger().info(f"--- Push & Slide (45deg) Trial {trial_idx}/{total_count} ---")
             
             # マーカー送信
-            self._marker_pub.publish(String(data=f"START,trial:{trial_idx},mode:slide"))
+            self._marker_pub.publish(String(data=f"START,trial:{trial_idx},slide_speed:{actual_speed:.4f},mode:slide"))
             
             # 1. グリッパを閉じる (C++側の run コマンドを再利用)
             self._sequence_finished_event.clear()
@@ -267,7 +262,7 @@ class DataCaptureNode(Node):
 
             # 2. なぞり動作 (URScript)
             # 押し込みは終わっているので、移動だけのスクリプトを送る
-            script = self._calculate_target_pose(False, 0.03, 0.0, 0.3) # 45度スライドロジックを適用した関数
+            script = self._calculate_target_pose(False, 0.03, 0.0, actual_speed) # 45度スライドロジックを適用した関数
             self._urscript_pub.publish(String(data=script))
             
             # 3. 物理的な移動を待つ
