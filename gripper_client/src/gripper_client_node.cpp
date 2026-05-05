@@ -184,7 +184,7 @@ private:
         
         // --- デバッグ用：開始の合図（一度全閉にする） ---
         MoveGripper::Goal debug_start;
-        debug_start.target_position = 0.0f; // 全閉
+        debug_start.target_position = 0.13f; // 全閉
         debug_start.target_speed = 0.5f;
         steps_.push_back(make_gripper_step(debug_start, std::chrono::seconds(1), 91)); // Phase 91
 

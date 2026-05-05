@@ -111,9 +111,11 @@ class DataCaptureNode(Node):
         except (ValueError, IndexError):
             pass
             
-    def _calculate_target_pose(self, lateral_offset=0.0, vertical_offset=0.0):
+    def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0):
         w_obj = self.config.target_diameter
         dist = w_obj / 2.0
+        if not init:
+            dist = 0
         
         # 接近方向: 135度
         # 垂直方向: 45度 (ここに lateral_offset を適用)
@@ -152,7 +154,7 @@ class DataCaptureNode(Node):
             print(" [i]: Init Arm (Move to start pose manually)")
             print(" [s]: Start Single Trial (Record & Run)")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
-            print(" [a]: Auto Repeat Loop (Record & Run multiple times)")
+            print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [q]: Quit")
             print("="*40)
             
@@ -164,8 +166,10 @@ class DataCaptureNode(Node):
                 self._run_init_sequence()
             elif line == 's':
                 self._execute_trial()
-            elif line == 'a':
+            elif line == 'ap':
                 self._execute_auto_loop()
+            elif line == 'as':
+                self._execute_push_slide_loop()
             elif line == 'q':
                 self._stop_event.set()
                 break
@@ -240,7 +244,7 @@ class DataCaptureNode(Node):
 
         # 基準位置に到達してから、URScript で相対移動（補正スライド）を行う
         self.get_logger().info("Sliding to object center...")
-        script = self._calculate_target_pose(0.0, 0.0) # 補正量0でのスライド
+        script = self._calculate_target_pose(True, 0.0, 0.0) # 補正量0でのスライド
         self._urscript_pub.publish(String(data=script))
         
         threading.Event().wait(5.0) # スライド完了まで待機
@@ -251,6 +255,94 @@ class DataCaptureNode(Node):
             self.get_logger().info(f"Corrected base joints saved.{self._current_joints}")
         
         return True
+
+    def _execute_push_slide_loop(self) -> None:
+        """10回ごとにBagを切り替えながら、補正済み角度へリセットして連続試行を行う"""
+        print("Enter total number of trials: ", end="", flush=True)
+        try:
+            line = sys.stdin.readline().strip()
+            if not line: return
+            total_count = int(line)
+            if total_count <= 0: return
+        except ValueError:
+            return
+        # 押し込み幅の計算
+        target_m = (self.config.target_diameter - 
+                    (self.config.push_depth * 2) + 
+                    self.config.calibration_offset)
+        
+        for i in range(total_count):
+            trial_idx = i + 1
+            self.get_logger().info(f"--- Push & Slide (45deg) Trial {trial_idx}/{total_count} ---")
+            
+            # マーカー送信
+            self._marker_pub.publish(String(data=f"START,trial:{trial_idx},mode:slide"))
+            
+            # 1. グリッパを閉じる (C++側の run コマンドを再利用)
+            self._sequence_finished_event.clear()
+            self._cmd_pub.publish(String(data=f"run {target_m} 0.1")) 
+            if not self._sequence_finished_event.wait(timeout=10.0):
+                break
+
+            # 2. なぞり動作 (URScript)
+            # 押し込みは終わっているので、移動だけのスクリプトを送る
+            script = self._calculate_target_pose(False, 0.03, 0.0) # 45度スライドロジックを適用した関数
+            self._urscript_pub.publish(String(data=script))
+            
+            # 3. 物理的な移動を待つ
+            threading.Event().wait(3.0) 
+
+            # 4. 手動再起動の案内
+            #print("RESTART External Control, then press Enter...")
+            #sys.stdin.readline()
+
+            # 5. グリッパを開いて init 位置に戻る (C++側の init コマンドを再利用)
+            # これが一番確実です
+            script = self._calculate_target_pose(False, -0.03, 0.0) # 45度スライドロジックを適用した関数
+            self._urscript_pub.publish(String(data=script))
+            threading.Event().wait(3.0) 
+            
+            self._marker_pub.publish(String(data=f"END,trial:{trial_idx}"))
+            
+        self.get_logger().info("All Push & Slide trials completed.")
+    
+    def _calculate_push_and_slide_script(self, target_m, slide_dist=0.05):
+        """
+        押し込み -> 45度方向へスライド -> 解放 -> 元の位置へ復帰
+        """
+        # ターゲット幅をRobotiqの0-255値に変換 (0.14m=0, 0.0m=255)
+        g_pos = int((0.14 - target_m) * (255 / 0.14))
+        g_pos = max(0, min(255, g_pos))
+        
+        # 45度方向の計算 (angle_perpendicular = 45度)
+        angle_slide = math.radians(45)
+        dx = slide_dist * math.cos(angle_slide)
+        dy = slide_dist * math.sin(angle_slide)
+        dz = 0.0 # 水平なぞりのため0
+
+        script = "def push_and_slide_recovery():\n"
+        # 1. 開始位置（init位置）を保存
+        script += "  p_start = get_actual_tcp_pose()\n"
+        
+        # 2. 押し込み (速度固定)
+        script += f"  rq_move_and_wait({g_pos})\n"
+        script += "  sleep(1.0)\n"
+        
+        # 3. 45度方向へスライド (相対移動)
+        script += f"  p_slid = pose_add(p_start, p[{dx}, {dy}, {dz}, 0, 0, 0])\n"
+        script += "  movel(p_slid, a=0.2, v=0.05)\n"
+        script += "  sleep(0.5)\n"
+        
+        # 4. グリッパを開放して待機
+        script += "  rq_move_and_wait(0)\n"
+        script += "  sleep(0.5)\n"
+        
+        # 5. 保存しておいた開始位置 p_start に直接戻る (変位の打ち消し)
+        # これにより累積誤差を防ぎ、initを呼び直す手間を省きます
+        script += "  movel(p_start, a=0.2, v=0.1)\n"
+        script += "end\n"
+        
+        return script
 
     def _execute_trial(self) -> None:
         """1回の施行（録画・動作・スコアリング）を実行."""
