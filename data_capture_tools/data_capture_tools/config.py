@@ -27,6 +27,15 @@ class BagRecorderConfig:
     compression_mode: Optional[str] = None
     compression_format: Optional[str] = None
 
+@dataclass
+class PoseConfig:
+    """TCPの座標と姿勢を保持するクラス"""
+    x: float
+    y: float
+    z: float
+    rx: float
+    ry: float
+    rz: float
 
 @dataclass
 class CaptureConfig:
@@ -36,9 +45,12 @@ class CaptureConfig:
     task_name: str
     prompt: str
     label: str
-    target_diameter: float  # in meters
-    gripper_offset: float  # in meters
-    initial_arm_pose: list[float]  # in radians
+    target_diameter: float
+    push_depth: float
+    calibration_offset: float
+    initial_arm_pose: List[float]
+    # --- 追加: base_tcp_pose を定義 ---
+    base_tcp_pose: PoseConfig
     viewer_topics: list[str]
     image_throttle_hz: float
     other_throttle_hz: float
@@ -105,13 +117,25 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     label = str(data.get("label", ""))
     viewer_topics = [str(item) for item in data.get("viewer_topics", [])]
     target_diameter = float(data.get("target_diameter", 0.05))
-    gripper_offset = float(data.get("gripper_offset", 0.0))
-    initial_arm_pose = data.get("initial_arm_pose", [1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0])
+    push_depth = float(data.get("push_depth", 0.002)) # 追加
+    calibration_offset = float(data.get("calibration_offset", 0.006)) # 追加
+    initial_arm_pose = data.get("initial_arm_pose", [1.7317156838287737, -1.40045219180025, 1.1475539831862718, -1.3247049022636963, -1.5844098949604524, 0.9487609813841176])
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
     enable_image_compression = bool(data.get("enable_image_compression", True))
     stop_key = str(data.get("stop_key", "q"))
     discard_key = str(data.get("discard_key", "x"))
+    
+    # base_tcp_pose の読み出しと構造体化
+    base_pose_data = data.get("base_tcp_pose", {})
+    base_tcp_pose = PoseConfig(
+        x=float(base_pose_data.get("x", 0.0)),
+        y=float(base_pose_data.get("y", 0.0)),
+        z=float(base_pose_data.get("z", 0.0)),
+        rx=float(base_pose_data.get("rx", 0.0)),
+        ry=float(base_pose_data.get("ry", 0.0)),
+        rz=float(base_pose_data.get("rz", 0.0)),
+    )
 
     return CaptureConfig(
         output_root=output_root,
@@ -119,8 +143,10 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         prompt=prompt,
         label=label,
         target_diameter=target_diameter,
-        gripper_offset=gripper_offset,
+        push_depth=push_depth,               # 追加
+        calibration_offset=calibration_offset, # 追加
         initial_arm_pose=initial_arm_pose,
+        base_tcp_pose=base_tcp_pose,         # 追加
         viewer_topics=viewer_topics,
         image_throttle_hz=image_throttle_hz,
         other_throttle_hz=other_throttle_hz,

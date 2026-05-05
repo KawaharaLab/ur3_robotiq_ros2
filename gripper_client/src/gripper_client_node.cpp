@@ -6,6 +6,9 @@
 #include <utility>
 #include <vector>
 
+// 必要なヘッダーを追加
+#include <geometry_msgs/msg/pose_stamped.hpp>
+
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -69,7 +72,20 @@ FollowJointTrajectory::Goal create_follow_joint_goal(
 {
     FollowJointTrajectory::Goal goal;
     goal.trajectory.joint_names = joint_names;
-    goal.trajectory.header.stamp = rclcpp::Clock().now(); // タイムスタンプ拒否対策
+    // タイムスタンプを現在時刻に設定
+    goal.trajectory.header.stamp = rclcpp::Clock().now();
+
+    // --- 修正ポイント: 許容誤差 (Tolerance) の設定 ---
+    // 目標位置に対して 0.002 rad (約0.11度) の誤差を許容する
+    // これにより、微小な振動や収束待ちによる Phase 93 でのフリーズを防止します
+    for (const auto & name : joint_names) {
+        control_msgs::msg::JointTolerance tol;
+        tol.name = name;
+        tol.position = 0.002;  // 許容する位置誤差
+        tol.velocity = 0.01;   // 許容する速度誤差 (停止判定の緩和)
+        goal.goal_tolerance.push_back(tol);
+    }
+    // ----------------------------------------------
 
     for (const auto &raw_point : points) {
         trajectory_msgs::msg::JointTrajectoryPoint point;
@@ -108,35 +124,45 @@ private:
 
         std::string cmd = msg->data;
         if (cmd.find("init") == 0) {
-            std::vector<double> joints_pos = {1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}; // デフォルト
+            // "init " の後の文字列を取り出す
+            std::stringstream ss(cmd.substr(5)); 
+            double gripper_width = 0.0;
+            std::vector<double> joints_pos(6);
             
-            if (cmd.length() > 5) {
-                std::stringstream ss(cmd.substr(5));
-                std::vector<double> parsed_pos;
-                double val;
-                while (ss >> val) parsed_pos.push_back(val);
-                
-                if (parsed_pos.size() == 6) {
-                    joints_pos = parsed_pos;
-                } else {
-                    RCLCPP_WARN(this->get_logger(), "関節数が正しくありません(6つ必要)。デフォルトを使用。");
+            // 1. まずグリッパ幅を読み込む
+            if (!(ss >> gripper_width)) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to parse gripper width from: %s", cmd.c_str());
+                return;
+            }
+            
+            // 2. 次に6つの関節角度を順番に読み込む
+            for(int i = 0; i < 6; ++i) {
+                if (!(ss >> joints_pos[i])) {
+                    RCLCPP_ERROR(this->get_logger(), "Failed to parse joint %d from: %s", i + 1, cmd.c_str());
+                    return;
                 }
             }
-            prepare_init_sequence(joints_pos);
+            
+            prepare_init_sequence_direct(joints_pos, gripper_width);
         }
-        else if (cmd.find("run") == 0) { // "run" で始まる場合
-            double target_pos = 0.05; // デフォルト値
+        else if (cmd.find("run") == 0) {
+            double target_pos = 0.05; 
+            double target_speed = 0.1; 
+
+            // substr(3) にして "run" の直後（スペース含む）から読み込ませるか、
+            // 明示的にスペースをスキップさせます
+            std::string params = cmd.substr(3); 
+            std::stringstream ss(params);
             
-            // "run 0.045" のように数値が含まれていれば抽出
-            if (cmd.length() > 4) {
-                try {
-                    target_pos = std::stod(cmd.substr(4));
-                } catch (...) {
-                    RCLCPP_ERROR(this->get_logger(), "数値のパースに失敗しました。デフォルト値を使用します。");
-                }
+            if (ss >> target_pos >> target_speed) {
+                RCLCPP_INFO(this->get_logger(), "Parsed command: pos=%.3f, speed=%.3f", target_pos, target_speed);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Parse failed for: %s. Using default speed 0.1", cmd.c_str());
             }
-            prepare_run_sequence(target_pos);
-        } else {
+            
+            prepare_run_sequence(target_pos, target_speed);
+        }
+        else {
             return;
         }
 
@@ -144,49 +170,64 @@ private:
         send_next_step();
     }
 
-    void prepare_init_sequence(const std::vector<double>& joints_pos) {
-        steps_.clear();
-        const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
+    // 現在のデカルト座標を保持する構造体
+    struct Pose6D {
+        double x, y, z, rx, ry, rz;
+    } current_pose_;
+
+    void prepare_init_sequence_direct(const std::vector<double>& joints_pos, double g_width) {
+        steps_.clear(); //
+        const std::vector<std::string> joints = {
+            "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", 
+            "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
+        }; //
         
-        // 1. グリッパを開く
-        MoveGripper::Goal open_goal;
-        open_goal.target_position = 0.1f; open_goal.target_speed = 0.1f; open_goal.target_force = 0.1f;
-        steps_.push_back(make_gripper_step(open_goal, std::chrono::seconds(1), 9));
-        
-        // 受け取った角度をセット
+        // --- デバッグ用：開始の合図（一度全閉にする） ---
+        MoveGripper::Goal debug_start;
+        debug_start.target_position = 0.0f; // 全閉
+        debug_start.target_speed = 0.5f;
+        steps_.push_back(make_gripper_step(debug_start, std::chrono::seconds(1), 91)); // Phase 91
+
+        // 1. 本来のグリッパ動作（指定幅へ開く）
+        MoveGripper::Goal g_goal;
+        g_goal.target_position = static_cast<float>(g_width);
+        steps_.push_back(make_gripper_step(g_goal, std::chrono::seconds(1), 92)); // Phase 92
+
+        // 2. アームの移動
         RawTrajectoryPoint p;
         std::copy(joints_pos.begin(), joints_pos.end(), p.positions.begin());
-        p.velocities = {0,0,0,0,0,0};
-        p.time_from_start = std::chrono::seconds(5);
-
-        // 2. アームを初期位置へ移動
-        // const std::vector<RawTrajectoryPoint> point = {{{1.03128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
-        // const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
-        // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, point), std::chrono::seconds(2), 0));
-        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, {p}), std::chrono::seconds(2), 9));
-        RCLCPP_INFO(this->get_logger(), "初期化シーケンスを準備しました。");
+        p.time_from_start = std::chrono::seconds(4);
+        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, {p}), std::chrono::seconds(1), 93)); // Phase 93
     }
 
-    void prepare_run_sequence(double target_pos) {
-        steps_.clear();
-        // const std::vector<std::string> joints = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"};
-        
-        auto make_g = [](float pos) {
-            MoveGripper::Goal g; g.target_position = pos; g.target_speed = 0.1f; g.target_force = 0.1f; return g;
-        };
-        // 開(1) -> 閉(2) -> 開(3) のサイクル
-        steps_.push_back(make_gripper_step(make_g(0.1f), std::chrono::seconds(1), 1));
-        // const std::vector<RawTrajectoryPoint> points = {{{1.23128, -0.982256, 0.955627, -1.57, -1.57, 0.0}, {0,0,0,0,0,0}, std::chrono::seconds(5)}};
-        // steps_.push_back(make_arm_step(create_follow_joint_goal(joints, points), std::chrono::seconds(2), 0));
-        steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos)), std::chrono::seconds(3), 2));
-        steps_.push_back(make_gripper_step(make_g(0.1f), std::chrono::seconds(1), 3));
-        RCLCPP_INFO(this->get_logger(), "データ収集シーケンス準備完了 (Target: %f m)", target_pos);    }
 
+    void prepare_run_sequence(double target_pos, double target_speed) {
+        steps_.clear();
+        // 引数で受け取った target_speed を適用する
+        auto make_g = [target_speed](float pos, float force) {
+            MoveGripper::Goal g; 
+            g.target_position = pos; 
+            g.target_speed = static_cast<float>(target_speed); 
+            g.target_force = force; 
+            return g;
+        };
+
+        // Phase 1: 開く (ここは素早く 0.5 固定でもOK)
+        steps_.push_back(make_gripper_step(make_g(0.140f, 0.1f), std::chrono::seconds(1), 1));
+        
+        // Phase 2: 把持 (ここを指定されたランダム速度にする)
+        steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos), 0.5f), std::chrono::seconds(3), 2));
+        
+        // Phase 3: 開く
+        steps_.push_back(make_gripper_step(make_g(0.140f, 0.1f), std::chrono::seconds(1), 3));
+    }
     void send_next_step() {
         if (current_step_index_ >= steps_.size()) {
             RCLCPP_INFO(this->get_logger(), "シーケンス完了。待機します。");
             action_in_progress_ = false;
-            auto p = std_msgs::msg::Int32(); p.data = 0; phase_pub_->publish(p); // 待機フェーズ
+            auto p = std_msgs::msg::Int32();
+            p.data = 0; 
+            phase_pub_->publish(p);
             return;
         }
 
@@ -195,15 +236,39 @@ private:
         
         auto phase_msg = std_msgs::msg::Int32();
         phase_msg.data = step.phase_id;
-        phase_pub_->publish(phase_msg); // 現在のフェーズを通知
+        phase_pub_->publish(phase_msg); 
 
         if (step.type == StepType::ArmTrajectory) {
             auto opts = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
-            opts.result_callback = [this](const auto &) { this->on_step_completed(); };
+            // --- ここに挿入 ---
+            opts.result_callback = [this](const auto & result) {
+                if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+                    this->on_step_completed();
+                } else {
+                    RCLCPP_ERROR(this->get_logger(), "Arm Action failed with code: %d", static_cast<int>(result.code));
+                    this->action_in_progress_ = false;
+                    auto p = std_msgs::msg::Int32();
+                    p.data = 0;
+                    this->phase_pub_->publish(p);
+                }
+            };
+            // ----------------
             arm_client_->async_send_goal(step.arm_goal, opts);
         } else {
             auto opts = rclcpp_action::Client<MoveGripper>::SendGoalOptions();
-            opts.result_callback = [this](const auto &) { this->on_step_completed(); };
+            // --- グリッパ側も同様に挿入 ---
+            opts.result_callback = [this](const auto & result) {
+                if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+                    this->on_step_completed();
+                } else {
+                    RCLCPP_ERROR(this->get_logger(), "Gripper Action failed with code: %d", static_cast<int>(result.code));
+                    this->action_in_progress_ = false;
+                    auto p = std_msgs::msg::Int32();
+                    p.data = 0;
+                    this->phase_pub_->publish(p);
+                }
+            };
+            // ----------------
             gripper_client_->async_send_goal(step.gripper_goal, opts);
         }
     }

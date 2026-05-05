@@ -46,8 +46,8 @@ def plot_for_slide(csv_dir):
     ax1.tick_params(axis='y', labelcolor=color_gripper, labelsize=14)
     
     # 【軸の固定】 データの範囲に合わせて調整してください
-    ax1.set_xlim(0, 5.0)    # X軸: 0秒〜5秒
-    ax1.set_ylim(40, 110)   # Y1軸: 40mm〜110mm
+    #ax1.set_xlim(0, 5.0)    # X軸: 0秒〜5秒
+    #ax1.set_ylim(40, 110)   # Y1軸: 40mm〜110mm
 
     # --- 右軸: 6軸センサ ---
     ax2 = ax1.twinx()
@@ -62,7 +62,7 @@ def plot_for_slide(csv_dir):
     ax2.tick_params(axis='y', labelsize=14)
     
     # 【軸の固定】 データの範囲に合わせて調整してください
-    ax2.set_ylim(-15, 5)    # Y2軸: -15N〜5N
+    #ax2.set_ylim(-15, 5)    # Y2軸: -15N〜5N
 
     # デザイン仕上げ
     ax1.grid(True, which='major', linestyle='-', alpha=0.3)

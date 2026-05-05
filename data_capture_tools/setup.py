@@ -33,6 +33,8 @@ setup(
         'console_scripts': [
             'data_capture_manager = data_capture_tools.data_capture_node:main',
             'bag_to_dataset = data_capture_tools.bag_converter:cli_main',
+            'data_capture_manager_10 = data_capture_tools.data_capture_node_10times:main',
+            'extract_batch_bag = data_capture_tools.extract_batch_bag:main',
         ],
     },
 )
