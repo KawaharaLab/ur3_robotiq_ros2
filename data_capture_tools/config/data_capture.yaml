@@ -1,8 +1,8 @@
 # Example configuration for data_capture_tools
 output_root: /mnt/nvme1/tsumura/dicomo_data
-task_name: 10times_test
+task_name: object8_push
 prompt: ""
-label: "ぷにぷに, puni-puni" # データセットのラベル（例: "ぷにぷに, puni-puni"）
+label: "かちかち, kachi-kachi" #"かちかち, kachi-kachi"
 # 基本姿勢
 initial_arm_pose: [99.22, -80.24, 65.75, -75.90, -90.78, 54.36]
 # 基準座標（メートル単位）
@@ -14,8 +14,8 @@ base_tcp_pose:
   ry: 2.919
   rz: -0.030
 # 実験パラメータ
-target_diameter: 0.060  # 物体幅 (60mm)
-calibration_offset: 0.006 # デバイス誤差 (6mm)
+target_diameter: 0.002 # 物体幅 (60mm)
+calibration_offset: 0.0028 # デバイス誤差 (6mm)
 push_depth: 0.002 # 押し込み量 (2mm)
 viewer_topics:
   - /camera_fixed/realsense2_camera/color/image_raw
