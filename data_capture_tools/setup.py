@@ -35,6 +35,7 @@ setup(
             'bag_to_dataset = data_capture_tools.bag_converter:cli_main',
             'data_capture_manager_10 = data_capture_tools.data_capture_node_10times:main',
             'extract_batch_bag = data_capture_tools.extract_batch_bag:main',
+            'extract_all = data_capture_tools.extract_all:run_as_node', # ここを追加
         ],
     },
 )
