@@ -204,9 +204,19 @@ class GelSightMini:
         def try_open(device_value):
             cam = Camera(device=device_value)
             cam.open()
+            
+            # ⬇️ 映像が送られてくる前に、まずMJPEGを強制してカメラのモードを確定させる
+            cam.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            
             # Set the camera resolution to target width and height.
             cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            
+            # ⬇️ もしカメラがへそを曲げて解像度変更を無視した時のための、ダメ押しの再設定
+            if cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH) != self.target_width:
+                cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+                cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+                
             current_width = cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
             current_height = cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             log_message(
