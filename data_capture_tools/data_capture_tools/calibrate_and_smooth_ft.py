@@ -58,7 +58,7 @@ def process_ft_csv(csv_path: Path, offset_count: int = 10, window_size: int = 5)
         return False
 
 def main():
-    ROOT_DIR = Path("/mnt/nvme1/tsumura/dicomo_data")
+    ROOT_DIR = Path("/mnt/nvme1/tsumura/dicomo/dicomo_data_new")
     target_files = ["force_torque_left.csv", "force_torque_right.csv"]
     
     # 探索
