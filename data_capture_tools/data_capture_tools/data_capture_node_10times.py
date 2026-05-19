@@ -113,7 +113,7 @@ class DataCaptureNode(Node):
             
     def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0, speed = 0.3):
         w_obj = self.config.target_diameter
-        dist = w_obj / 2.0 - 0.00
+        dist = w_obj / 2.0 + self.config.arm_offset
         if not init:
             dist = 0
         
@@ -188,7 +188,7 @@ class DataCaptureNode(Node):
         batch_size = 10 
         target_m = (self.config.target_diameter - 
                 (self.config.push_depth * 2) + 
-                self.config.calibration_offset)
+                self.config.gripper_offset)
         
         for i in range(total_count):
             # --- [元のロジック：10回ごとのBag分割] ---
@@ -201,7 +201,7 @@ class DataCaptureNode(Node):
 
             # 速度をランダムに決定 (0.01 = 最遅, 0.1 = 標準, 1.0 = 最速)
             # 0.05 から 0.2 くらいが現実的な変化量です
-            random_speed = random.uniform(0.01, 0.5)
+            random_speed = random.uniform(0.05, 0.2)
             trial_idx = i + 1
             self.get_logger().info(f"--- Executing Trial {trial_idx} ---")
 
@@ -211,7 +211,7 @@ class DataCaptureNode(Node):
             
             self._is_active_session = True
             self._sequence_finished_event.clear()
-            self._cmd_pub.publish(String(data=f"run {target_m:.4f} {random_speed:.3f}"))
+            self._cmd_pub.publish(String(data=f"run {target_m:.5f} {random_speed:.3f}"))
             self._sequence_finished_event.wait() #
             self._is_active_session = False
             
@@ -235,7 +235,7 @@ class DataCaptureNode(Node):
         batch_size = 10 
         target_m = (self.config.target_diameter - 
                     (self.config.push_depth * 2) + 
-                    self.config.calibration_offset)
+                    self.config.gripper_offset)
         
         for i in range(total_count):
             # --- [元のロジック：10回ごとのBag分割] ---
@@ -256,7 +256,7 @@ class DataCaptureNode(Node):
             
             # 1. グリッパを閉じる (C++側の run コマンドを再利用)
             self._sequence_finished_event.clear()
-            self._cmd_pub.publish(String(data=f"gripper {target_m:.4f} 0.100")) 
+            self._cmd_pub.publish(String(data=f"gripper {target_m:.5f} 0.100")) 
             if not self._sequence_finished_event.wait(timeout=10.0):
                 break
 

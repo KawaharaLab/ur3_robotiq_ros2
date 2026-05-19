@@ -1,22 +1,24 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/dicomo_data
-task_name: object8_push
+output_root: /mnt/nvme1/tsumura/dicomo/dicomo_data_new
+task_name: object17_push
 prompt: ""
-label: "かちかち, kachi-kachi" #"かちかち, kachi-kachi"
+label: "かちかち, kachi-kachi" #"ふかふか, huka-huka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
+# "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, husa-husa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
 # 基本姿勢
-initial_arm_pose: [99.22, -80.24, 65.75, -75.90, -90.78, 54.36]
+initial_arm_pose: [99.42, -80.95, 73.53, -82.98, -90.77, 54.60]
 # 基準座標（メートル単位）
 base_tcp_pose:
-  x: 0.16687
-  y: -0.31115
-  z: -0.03632
-  rx: 1.199
+  x: 0.16823
+  y: -0.31254
+  z: -0.06175
+  rx: 1.200
   ry: 2.919
   rz: -0.030
 # 実験パラメータ
-target_diameter: 0.002 # 物体幅 (60mm)
-calibration_offset: 0.0028 # デバイス誤差 (6mm)
-push_depth: 0.002 # 押し込み量 (2mm)
+target_diameter: 0.015 # 物体幅 (mm) #クランプの幅を参照
+gripper_offset: 0.004 # デバイス誤差 (mm)
+arm_offset: 0.0025 # アームの位置誤差 (mm)
+push_depth: 0.002 # 押し込み量 (mm)
 viewer_topics:
   - /camera_fixed/realsense2_camera/color/image_raw
   - /camera_wrist/realsense2_camera/color/image_raw

@@ -47,7 +47,8 @@ class CaptureConfig:
     label: str
     target_diameter: float
     push_depth: float
-    calibration_offset: float
+    gripper_offset: float
+    arm_offset: float
     initial_arm_pose: List[float]
     # --- 追加: base_tcp_pose を定義 ---
     base_tcp_pose: PoseConfig
@@ -118,7 +119,8 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     viewer_topics = [str(item) for item in data.get("viewer_topics", [])]
     target_diameter = float(data.get("target_diameter", 0.05))
     push_depth = float(data.get("push_depth", 0.002)) # 追加
-    calibration_offset = float(data.get("calibration_offset", 0.006)) # 追加
+    gripper_offset = float(data.get("gripper_offset", 0.006)) # 追加
+    arm_offset = float(data.get("arm_offset", 0.0)) # 追加
     initial_arm_pose = data.get("initial_arm_pose", [1.7317156838287737, -1.40045219180025, 1.1475539831862718, -1.3247049022636963, -1.5844098949604524, 0.9487609813841176])
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
@@ -144,7 +146,8 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         label=label,
         target_diameter=target_diameter,
         push_depth=push_depth,               # 追加
-        calibration_offset=calibration_offset, # 追加
+        gripper_offset=gripper_offset, # 追加
+        arm_offset=arm_offset,             # 追加
         initial_arm_pose=initial_arm_pose,
         base_tcp_pose=base_tcp_pose,         # 追加
         viewer_topics=viewer_topics,
