@@ -107,4 +107,4 @@ def analyze_push_reproducibility(base_dir):
         print(f"==================================================\n")
 
 if __name__ == "__main__":
-    analyze_push_reproducibility("/mnt/nvme1/tsumura/dicomo_data/")
+    analyze_push_reproducibility("/mnt/nvme1/tsumura/dicomo/dicomo_data/")
