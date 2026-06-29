@@ -2,9 +2,9 @@ import cv2
 import platform
 import glob
 import time
-try:  # OpenCV < 4.7 doesn't ship cv2.typing
-    from cv2.typing import MatLike  # type: ignore
-except Exception:  # pragma: no cover - compatibility shim
+try:
+    from cv2.typing import MatLike
+except Exception:
     from typing import Any as MatLike
 import os
 import re
@@ -16,23 +16,10 @@ from .image_processing import crop_and_resize
 
 class Camera:
     def __init__(self, device):
-        """
-        Initialize the Camera instance.
-
-        Args:
-            device: A numeric index (for Windows/macOS) or device path (for Linux).
-        """
         self.device = device
         self.cap = None
 
     def open(self) -> None:
-        """
-        Open the camera device using OpenCV.
-
-        Raises:
-            RuntimeError: If the camera cannot be opened.
-        """
-        # Prefer V4L2 backend on Linux to avoid GStreamer pipeline issues.
         backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
         last_err = None
         for backend in backends:
@@ -49,15 +36,6 @@ class Camera:
         raise RuntimeError(f"Could not open camera device: {self.device} (backends tried: {backends}, last={last_err})")
 
     def read_frame(self) -> MatLike:
-        """
-        Read a frame from the camera.
-
-        Returns:
-            MatLike: The captured frame.
-
-        Raises:
-            RuntimeError: If the camera is not opened or frame capture fails.
-        """
         if self.cap is None:
             raise RuntimeError("Camera is not opened.")
         ret, frame = self.cap.read()
@@ -66,24 +44,12 @@ class Camera:
         return frame
 
     def release(self) -> None:
-        """
-        Release the camera resource.
-        """
         if self.cap:
             self.cap.release()
             self.cap = None
 
     @staticmethod
     def list_devices() -> dict:
-        """
-        Enumerate available camera devices.
-
-        On Linux, returns unique device paths from /dev/v4l/by-id/.
-        On Windows/macOS, tests numeric indices 0..5.
-
-        Returns:
-            dict: A mapping from index to device identifier.
-        """
         devices = {}
         os_name = platform.system()
         if os_name == "Linux":
@@ -101,9 +67,7 @@ class Camera:
     def find_cameras_windows(camera_name):
         from pygrabber.dshow_graph import FilterGraph
         graph = FilterGraph()
-
-        # get the device name
-        allcams = graph.get_input_devices() # list of camera device
+        allcams = graph.get_input_devices()
         description = ""
         for cam in allcams:
             if camera_name in cam:
@@ -127,14 +91,6 @@ class GelSightMini:
         target_height: int = 240,
         border_fraction: float = 0.15,
     ):
-        """
-        Initialize the CameraStream.
-
-        Args:
-            target_width (int, optional): Desired width of the camera feed. Defaults to 320.
-            target_height (int, optional): Desired height of the camera feed. Defaults to 240.
-            border_fraction: (float, optional): Desired border size for the image crop Defaults to 15%.
-        """
         self.camera: Camera = None
         self.recording: bool = False
         self.record_filepath: str = None
@@ -149,37 +105,17 @@ class GelSightMini:
         self.video_writer = None
         self.serial_number = None
 
-
     def get_device_list(self) -> dict:
-        """
-        Get a dictionary of available camera devices.
-
-        Returns:
-            dict: Mapping of device indices to device identifiers.
-        """
         return Camera.list_devices()
 
-
     def select_device(self, device_idx=None, device_path: Optional[str] = None) -> None:
-        """
-        Select and open a camera device with the desired resolution.
-
-        Args:
-            device_idx (int): The index of the device to select (enumerated from list_devices).
-            device_path (str): Explicit device path (e.g., /dev/v4l/by-id/...). Takes priority on Linux.
-        """
-
-        #print("platform: ", platform.system())
-
         if device_idx==None and platform.system() == "Windows":
                 (dev, desc) = Camera.find_cameras_windows("GelSight Mini")
                 print("Found: ", desc, ", dev: ", dev)
                 device_idx = dev
-                # Parse serial number from description
                 match = re.search("[A-Z0-9]{4}-[A-Z0-9]{4}", desc)
                 if match:
                     self.serial_number = match.group()
-
 
         if platform.system() == "Linux":
             if device_path:
@@ -192,7 +128,6 @@ class GelSightMini:
                     device_id = devices[device_idx]
                 else:
                     device_id = device_idx
-            # Resolve symlink to the underlying /dev/video* node.
             if isinstance(device_id, str):
                 device_id = os.path.realpath(device_id)
         else:
@@ -205,14 +140,16 @@ class GelSightMini:
             cam = Camera(device=device_value)
             cam.open()
             
-            # ⬇️ 映像が送られてくる前に、まずMJPEGを強制してカメラのモードを確定させる
-            cam.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            # 【重要追加】OpenCVのバッファサイズを最小(1)に制限し、常に最新フレームを取得する
+            cam.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-            # Set the camera resolution to target width and height.
+            cam.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
             cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+
+            # ⬇️ 【ここを追加】カメラに対してネイティブ30fpsでの動作を要求する
+            cam.cap.set(cv2.CAP_PROP_FPS, 30)
             
-            # ⬇️ もしカメラがへそを曲げて解像度変更を無視した時のための、ダメ押しの再設定
             if cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH) != self.target_width:
                 cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
                 cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
@@ -227,7 +164,6 @@ class GelSightMini:
         try:
             self.camera = try_open(device_id)
         except Exception as e:
-            # If a by-id path points to video-index1 (control interface), retry with index0 sibling.
             if isinstance(device_id, str) and device_id.endswith("-video-index1"):
                 alt = device_id.replace("-video-index1", "-video-index0")
                 log_message(f"Retrying with device {alt} after failure: {e}")
@@ -239,9 +175,6 @@ class GelSightMini:
                 log_message(f"Could not open selected device: {e}")
 
     def start(self) -> None:
-        """
-        Start the camera stream.
-        """
         if not self.camera:
             log_message("Please select a device first!")
             return
@@ -249,13 +182,6 @@ class GelSightMini:
         self.frame_count = 0
 
     def start_recording(self, filepath: str = None) -> None:
-        """
-        Start recording the camera feed to a video file.
-
-        Args:
-            filepath (str, optional): Directory path to save the recording. If not provided or invalid,
-                a default folder is created.
-        """
         if not self.camera:
             log_message("Please select a device first!")
             return
@@ -277,15 +203,11 @@ class GelSightMini:
             filepath, fourcc, fps, (self.target_width, self.target_height)
         )
         self.record_filepath = filepath
-
         self.recording = True
         self.frame_count = 0
         log_message(f"Started recording to {filepath}")
 
     def stop_recording(self) -> None:
-        """
-        Stop recording the camera feed.
-        """
         self.recording = False
         if self.video_writer is not None:
             self.video_writer.release()
@@ -294,15 +216,6 @@ class GelSightMini:
             self.record_filepath = None
 
     def update(self, dt: float) -> Optional[MatLike]:
-        """
-        Capture and return a frame from the camera feed, update FPS, overlay FPS text, and record if enabled.
-
-        Args:
-            dt (float): Unused parameter; frame timing is computed internally.
-
-        Returns:
-            Optional[MatLike]: The current RGB frame with FPS overlay, or None on error.
-        """
         if not self.camera:
             return None
 
@@ -313,32 +226,26 @@ class GelSightMini:
             return None
 
         time_now = time.time()
-        dt = time_now - self.time_prev
-        self.fps = 1.0 / dt if dt > 0 else 0
+        actual_dt = time_now - self.time_prev
+        self.fps = 1.0 / actual_dt if actual_dt > 0 else 0
         self.time_prev = time_now
 
         self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
         self.frame_count += 1
+        
+        # 【重要変更】target_size を強制的に ML用の (224, 224) に固定
         self.current_frame = crop_and_resize(
             image=self.current_frame,
-            target_size=(self.target_width, self.target_height),
+            target_size=(224, 224), 
             border_fraction=self.border_fraction,
         )
 
         if self.recording and self.video_writer is not None:
-            # Convert color back to BGR
             self.video_writer.write(cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR))
 
         return self.current_frame
 
     def create_folder(self) -> str:
-        """
-        Create a folder on the Desktop named with the current date.
-
-        Returns:
-            str: The created folder path.
-        """
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         folder_name = datetime.datetime.now().strftime("%Y-%m-%d")
         folder_path = os.path.join(desktop, folder_name)
@@ -346,15 +253,6 @@ class GelSightMini:
         return folder_path
 
     def save_screenshot(self, filepath: str = None) -> bool:
-        """
-        Save a screenshot of the current frame.
-
-        Args:
-            filepath (str, optional): Directory path to save the screenshot.
-
-        Returns:
-            bool: True if saving succeeded, False otherwise.
-        """
         saved = False
         if filepath is None:
             return saved
@@ -364,7 +262,6 @@ class GelSightMini:
             filename = os.path.join(
                 filepath, f"screenshot_{now.strftime('%Y%m%d_%H%M%S')}.png"
             )
-
             try:
                 cv2.imwrite(
                     filename,

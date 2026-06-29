@@ -1,6 +1,6 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/dicomo/dicomo_data_new
-task_name: object17_push
+output_root: /mnt/nvme1/tsumura/dicomo/after_dicomo_data_test
+task_name: test
 prompt: ""
 label: "かちかち, kachi-kachi" #"ふかふか, huka-huka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, husa-husa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
@@ -15,8 +15,8 @@ base_tcp_pose:
   ry: 2.919
   rz: -0.030
 # 実験パラメータ
-target_diameter: 0.015 # 物体幅 (mm) #クランプの幅を参照
-gripper_offset: 0.004 # デバイス誤差 (mm)
+target_diameter: 0.038 # 物体幅 (mm) #クランプの幅を参照
+gripper_offset: 0.000 # デバイス誤差 (mm)
 arm_offset: 0.0025 # アームの位置誤差 (mm)
 push_depth: 0.002 # 押し込み量 (mm)
 viewer_topics:

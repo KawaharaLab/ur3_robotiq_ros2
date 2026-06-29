@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import time
+import threading
 from typing import Optional
 
 import cv2
@@ -55,48 +57,62 @@ class GelSightMiniPublisher(Node):
             self._compressed_publisher = self.create_publisher(
                 CompressedImage, f"{topic_name}/compressed", 10
             )
-        timer_period = 1.0 / self._publish_rate_hz
-        self._timer = self.create_timer(timer_period, self._publish_frame)
+            
+        # タイマーを廃止し、専用の読み取りスレッドを開始
+        self._running = True
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
 
-    def _publish_frame(self) -> None:
-        frame = self._cam_stream.update(0.0)
-        if frame is None:
-            self.get_logger().warn(
-                "No frame received from GelSight Mini camera",
-                throttle_duration_sec=2.0,
-            )
-            return
+    def _capture_loop(self) -> None:
+        period = 1.0 / self._publish_rate_hz
+        last_publish_time = 0.0
 
-        msg = self._bridge.cv2_to_imgmsg(frame, encoding="rgb8")
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self._frame_id
-        self._publisher.publish(msg)
+        while rclpy.ok() and self._running:
+            # OpenCV側でフレームが届くまでブロックする（バッファを空に保つ）
+            frame = self._cam_stream.update(0.0)
+            if frame is None:
+                continue
 
-        if self._compressed_publisher:
-            try:
-                # Encode to JPEG with configured quality.
-                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self._compressed_quality]
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                ok, buffer = cv2.imencode('.jpg', bgr, encode_params)
-                if not ok:
+            current_time = time.time()
+            
+            # 指定された publish_rate_hz の間隔に達していなければ、画像を読み捨てる
+            if (current_time - last_publish_time) < period:
+                continue
+
+            # 画像が届いた直後の時間をROSタイムスタンプにする
+            msg = self._bridge.cv2_to_imgmsg(frame, encoding="rgb8")
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self._frame_id
+            self._publisher.publish(msg)
+
+            if self._compressed_publisher:
+                try:
+                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self._compressed_quality]
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    ok, buffer = cv2.imencode('.jpg', bgr, encode_params)
+                    if not ok:
+                        self.get_logger().warn(
+                            "Failed to JPEG-encode GelSight frame", throttle_duration_sec=2.0
+                        )
+                        continue
+                    cmsg = CompressedImage()
+                    cmsg.header = msg.header
+                    cmsg.format = 'jpeg'
+                    cmsg.data = buffer.tobytes()
+                    self._compressed_publisher.publish(cmsg)
+                except Exception as exc:  # noqa: BLE001
                     self.get_logger().warn(
-                        "Failed to JPEG-encode GelSight frame", throttle_duration_sec=2.0
+                        f"Compressed publish failed: {exc}", throttle_duration_sec=2.0
                     )
-                    return
-                cmsg = CompressedImage()
-                cmsg.header = msg.header
-                cmsg.format = 'jpeg'
-                cmsg.data = buffer.tobytes()
-                self._compressed_publisher.publish(cmsg)
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warn(
-                    f"Compressed publish failed: {exc}", throttle_duration_sec=2.0
-                )
+            
+            last_publish_time = current_time
 
     def destroy_node(self) -> None:
         self.get_logger().info("Shutting down GelSight Mini publisher")
-        if hasattr(self, "_timer") and self._timer is not None:
-            self._timer.cancel()
+        self._running = False
+        if hasattr(self, "_capture_thread") and self._capture_thread is not None:
+            self._capture_thread.join(timeout=1.0)
+            
         if self._cam_stream and self._cam_stream.camera:
             self._cam_stream.camera.release()
         super().destroy_node()
@@ -164,7 +180,6 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, ros_args = parse_arguments()
-
     gs_config = GSConfig(args.gs_config)
 
     rclpy.init(args=ros_args)
