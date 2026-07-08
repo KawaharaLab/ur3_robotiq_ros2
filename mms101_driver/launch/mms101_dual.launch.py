@@ -7,10 +7,10 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     port1_arg = DeclareLaunchArgument(
-        'port1', default_value='/dev/ttyUSB1', description='Serial port for MMS101 #1'
+        'port1', default_value='/dev/mms101_left', description='Serial port for MMS101 #1'
     )
     port2_arg = DeclareLaunchArgument(
-        'port2', default_value='/dev/ttyUSB2', description='Serial port for MMS101 #2'
+        'port2', default_value='/dev/mms101_right', description='Serial port for MMS101 #2'
     )
     frame1_arg = DeclareLaunchArgument(
         'frame1', default_value='ft_sensor_left', description='frame_id for MMS101 #1'
