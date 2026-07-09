@@ -5,32 +5,37 @@ prompt: ""
 label: "かちかち, kachi-kachi" #"ふかふか, huka-huka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, husa-husa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, huwa-huwa"
 # 基本姿勢
-# initial_arm_pose: [99.42, -80.95, 73.53, -82.98, -90.77, 54.60]　#低い方
-initial_arm_pose: [99.22, -80.24, 65.75, -75.90, -90.78, 54.36]
-# 基準座標（メートル単位）
+# 低い方
+initial_arm_pose: [99.42, -80.95, 73.53, -82.98, -90.77, 54.60]
 base_tcp_pose:
-  # x: 0.16823　＃低い方
-  # y: -0.31254
-  # z: -0.06175
-  # rx: 1.200
-  x: 0.16687
-  y: -0.31115
-  z: -0.03632
-  rx: 1.199
+  x: 0.16823
+  y: -0.31254
+  z: -0.06175
+  rx: 1.200
   ry: 2.919
   rz: -0.030
+# 高い方
+# initial_arm_pose: [99.22, -80.24, 65.75, -75.90, -90.78, 54.36] 
+# base_tcp_pose:
+#   x: 0.16687
+#   y: -0.31115
+#   z: -0.03632
+#   rx: 1.199
+#   ry: 2.919
+#   rz: -0.030
+
 # 実験パラメータ
-target_diameter: 0.038 # 物体幅 (mm) #クランプの幅を参照
+target_diameter: 0.070 # 物体幅 (mm) #クランプの幅を参照
 gripper_offset: 0.000 # デバイス誤差 (mm)
-arm_offset: -0.003 # アームの位置誤差 (mm)
+arm_offset: -0.008 # アームの位置誤差 (mm)
 push_depth: 0.000 # 押し込み量 (mm)
 
 # センタリング・接触検知パラメータ
-contact_threshold: 0.07      # 接触判定の閾値 (N)
+contact_threshold: 0.03      # 接触判定の閾値 (N)
 centering_step_grip: 0.001   # 探査時のグリッパ閉じ幅 (m)
 centering_step_arm: 0.001    # 探査時のアーム移動幅 (m)
 centering_min_step: 0.0001   # 減衰ループの終了判定幅 (m)
-safe_margin: 0.010           # 接触前の事前アプローチ用余白 (m)  <-- ★追加
+safe_margin: 0.015           # 接触前の事前アプローチ用余白 (m)  <-- ★追加
 
 viewer_topics:
   - /camera_fixed/realsense2_camera/color/image_raw

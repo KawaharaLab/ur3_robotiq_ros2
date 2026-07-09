@@ -48,6 +48,10 @@ class ForceSensorMonitor:
         self._offset_left = 0.0
         self._offset_right = 0.0
         
+        # ★追加: 最後にメッセージを受信した時刻を記録
+        self._last_msg_time_left = 0.0
+        self._last_msg_time_right = 0.0
+        
         # 最新のデータを逃さず、かつバッファ詰まりを防ぐためのSensorData QoS
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -89,6 +93,22 @@ class ForceSensorMonitor:
         """ゼロ点補正済みの純粋な力（絶対値）を取得"""
         raw_avg = self._get_raw_average(self._history_right)
         return abs(raw_avg - self._offset_right)
+    
+    # ★追加: センサが生きているか判定するメソッド
+    def get_health_status(self) -> tuple[bool, str]:
+        """過去1.5秒以内に両方のセンサからデータを受信しているか確認し、詳細を返す"""
+        now = time.time()
+        left_ok = (now - self._last_msg_time_left) < 1.5
+        right_ok = (now - self._last_msg_time_right) < 1.5
+        
+        if left_ok and right_ok:
+            return True, "🟢 OK"
+        elif not left_ok and not right_ok:
+            return False, "🔴 ERROR (両方の通信が途絶)"
+        elif not left_ok:
+            return False, "🔴 ERROR (Left のみ通信が途絶)"
+        else:
+            return False, "🔴 ERROR (Right のみ通信が途絶)"
 
 
 class DataCaptureNode(Node):
@@ -232,16 +252,26 @@ class DataCaptureNode(Node):
             self._finalize_all()
 
     def _watch_user_input(self) -> None:
+        # ★追加: 起動直後はセンサデータが流れ始めるのを少し待つ
+        self.get_logger().info("センサの接続を確認中...")
+        time.sleep(1.5)
         while not self._stop_event.is_set():
+            f_l = self._force_monitor.get_calibrated_left()
+            f_r = self._force_monitor.get_calibrated_right()
+            is_healthy, health_str = self._force_monitor.get_health_status()
+
             print("\n" + "="*40)
+            # ★追加: メニュー上部にステータスを表示
+            print(f" [Sensor Status]  Left: {f_l:.3f} N | Right: {f_r:.3f} N")
+            print("-" * 40)
             print(" [i]: Init Arm (Move to start pose manually)")
             print(" [s]: Start Single Trial (Record & Run)")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
-            print(" [t]: Test Force Sensor (Visual Debug)  <-- ★追加")
+            print(" [t]: Test Force Sensor (Visual Debug)")
             print(" [q]: Quit")
             print("="*40)
-            
+                        
             line = sys.stdin.readline().strip().lower()
             if not line: continue
 
@@ -596,15 +626,39 @@ class DataCaptureNode(Node):
     def _execute_active_centering(self) -> float:
         """
         対象物の中心と有効幅を自動探査する本番仕様のセンタリングロジック。
-        ※ 事前にマクロな位置合わせとTareが完了している前提で呼び出される。
+        ※ グリッパの閉じ幅は固定ステップで探査し、アームの移動幅のみを減衰させて中心を探る。
         """
-        self.get_logger().info("--- アクティブ・センタリング（本番仕様：ステップ制御）を開始します ---")
+        self.get_logger().info("--- アクティブ・センタリング（アーム移動減衰・偏り防止版）を開始します ---")
 
-        step_grip = self.config.centering_step_grip
-        step_arm = self.config.centering_step_arm
-        min_step = self.config.centering_min_step
+        # config からパラメータを読み出し
+        step_grip = self.config.centering_step_grip # 減衰させず、常にこの幅(例: 1mm)で閉じる
+        step_arm = self.config.centering_step_arm   # 初期のアーム移動幅
+        min_step = self.config.centering_min_step   # アーム移動の終了判定幅
         threshold = self.config.contact_threshold
         safe_minimum_width = self.config.target_diameter - 0.010 
+
+        # =========================================================
+        # イレギュラー対応のパラメータ
+        # =========================================================
+        force_tolerance = 0.15 # 左右の力の差がこれ以下なら「均等(both)」とみなす
+        force_limit = 0.5     # この値を超えたら「食い込みすぎ」と判定して緊急退避する
+
+        def get_contact_state():
+            """現在の力から状態を判定するヘルパー関数"""
+            l = self._force_monitor.get_calibrated_left()
+            r = self._force_monitor.get_calibrated_right()
+            
+            if l > threshold and r > threshold:
+                # 両方が閾値を超えていても、力の差が大きければ「偏っている」と判定
+                if abs(l - r) <= force_tolerance:
+                    return "both", l, r
+                else:
+                    return ("left" if l > r else "right"), l, r
+            elif l > threshold:
+                return "left", l, r
+            elif r > threshold:
+                return "right", l, r
+            return "none", l, r
 
         # =========================================================
         # フェーズ1: 段階的な初期接触探査
@@ -613,6 +667,23 @@ class DataCaptureNode(Node):
         last_touched = None
 
         while rclpy.ok():
+            state, f_l, f_r = get_contact_state()
+
+            # --- 過負荷保護 ---
+            if f_l > force_limit or f_r > force_limit:
+                self.get_logger().warning(f"初期探査で過剰な力(L={f_l:.3f}, R={f_r:.3f})。少し開きます。")
+                target_w = self._current_gripper_width_m + (step_grip * 2)
+                self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.050 1.0"))
+                self._sequence_finished_event.wait(timeout=5.0)
+                continue # 開いた状態でもう一度評価する
+
+            if state != "none":
+                # bothの場合はとりあえず力が強い方から逃げる扱いにする
+                last_touched = state if state != "both" else ("left" if f_l > f_r else "right")
+                self.get_logger().info(f"初期接触を検知: {last_touched} (L={f_l:.3f}N, R={f_r:.3f}N)")
+                break
+
+            # 届いていないので閉じる
             current_w = self._current_gripper_width_m
             if current_w <= safe_minimum_width:
                 self.get_logger().error("異常事態: 安全限界幅に達しました。探査を強制停止します。")
@@ -620,23 +691,14 @@ class DataCaptureNode(Node):
 
             target_w = current_w - step_grip
             self._sequence_finished_event.clear()
-            self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
+            self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.6"))
             self._sequence_finished_event.wait(timeout=5.0)
-
-            f_left = self._force_monitor.get_calibrated_left()
-            f_right = self._force_monitor.get_calibrated_right()
-
-            if f_left > threshold or f_right > threshold:
-                # より力が強い方を接触指とする
-                last_touched = "left" if f_left > f_right else "right"
-                self.get_logger().info(f"初期接触を検知: {last_touched} (L={f_left:.3f}N, R={f_right:.3f}N)")
-                break
 
         if last_touched is None:
             return self._current_gripper_width_m
 
         # =========================================================
-        # フェーズ2: フリップ＆ハーフ（135度平行移動による減衰ループ）
+        # フェーズ2: フリップ＆ハーフ（アーム移動幅のみ減衰）
         # =========================================================
         self.get_logger().info(f"フェーズ2: 減衰ループを開始します (初期={last_touched})")
 
@@ -664,31 +726,39 @@ class DataCaptureNode(Node):
             self._urscript_pub.publish(String(data=script))
             time.sleep(0.5)
 
-            # --- (B) ★修正部分: どちらかが接触するまで段階的に閉じる ---
+            # --- (B) 接触状態の確認と段階的閉じ ---
             current_touched = None
             
             while rclpy.ok():
+                # ★ 閉じる前に必ず力を確認する（無駄な食い込みを防止）
+                state, f_l, f_r = get_contact_state()
+                
+                # --- 過負荷保護 ---
+                if f_l > force_limit or f_r > force_limit:
+                    self.get_logger().warning(f"過剰な力(L={f_l:.3f}, R={f_r:.3f})を検知。圧を逃がします。")
+                    target_w = self._current_gripper_width_m + (step_grip * 2)
+                    self._sequence_finished_event.clear()
+                    self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.050 1.0"))
+                    self._sequence_finished_event.wait(timeout=5.0)
+                    
+                    # 圧を逃がしたら、アームのステップ幅だけを半減してやり直す
+                    step_arm /= 2.0
+                    continue # 再評価へ
+
+                if state != "none":
+                    current_touched = state
+                    self.get_logger().info(f"探査中: {state} | L={f_l:.3f}N, R={f_r:.3f}N")
+                    break
+                
+                # state が "none" の場合のみ、閉じる（★ step_grip は減衰せず常に一定）
                 current_w = self._current_gripper_width_m
                 if current_w <= safe_minimum_width:
                     break
 
                 target_w = current_w - step_grip
                 self._sequence_finished_event.clear()
-                self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 2.2"))
+                self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 1.2"))
                 self._sequence_finished_event.wait(timeout=5.0)
-
-                f_left = self._force_monitor.get_calibrated_left()
-                f_right = self._force_monitor.get_calibrated_right()
-                
-                self.get_logger().info(f"探査中幅: {target_w*1000:.1f}mm | L={f_left:.3f}N, R={f_right:.3f}N")
-
-                # どちらかが閾値を超えたら、再探査ループを抜ける
-                if f_left > threshold or f_right > threshold:
-                    if f_left > threshold and f_right > threshold:
-                        current_touched = "both"
-                    else:
-                        current_touched = "left" if f_left > f_right else "right"
-                    break
             
             if current_touched is None:
                 self.get_logger().error("接触を見失いました。安全限界に達した可能性があります。")
@@ -699,15 +769,129 @@ class DataCaptureNode(Node):
                 self.get_logger().info("両指の均等な接触を確認。センタリング完了！")
                 break
 
-            self.get_logger().info(f"接触再検知: {current_touched} | last={last_touched}")
-
             if current_touched != last_touched:
-                self.get_logger().info(f"行き過ぎ検知({last_touched}->{current_touched})。ステップ幅を半減します。")
+                self.get_logger().info(f"行き過ぎ検知({last_touched}->{current_touched})。アーム移動幅を半減します。")
+                # ★ 超重要: アームの移動幅だけを半減する（step_grip /= 2.0 を削除）
                 step_arm /= 2.0
-                step_grip /= 2.0
                 last_touched = current_touched
 
         return self._current_gripper_width_m
+    
+    # def _execute_active_centering(self) -> float:
+    #     """
+    #     対象物の中心と有効幅を自動探査する本番仕様のセンタリングロジック。
+    #     ※ 事前にマクロな位置合わせとTareが完了している前提で呼び出される。
+    #     """
+    #     self.get_logger().info("--- アクティブ・センタリング（本番仕様：ステップ制御）を開始します ---")
+
+    #     step_grip = self.config.centering_step_grip
+    #     step_arm = self.config.centering_step_arm
+    #     min_step = self.config.centering_min_step
+    #     threshold = self.config.contact_threshold
+    #     safe_minimum_width = self.config.target_diameter - 0.010 
+
+    #     # =========================================================
+    #     # フェーズ1: 段階的な初期接触探査
+    #     # =========================================================
+    #     self.get_logger().info("フェーズ1: 段階的な初期接触を探ります...")
+    #     last_touched = None
+
+    #     while rclpy.ok():
+    #         current_w = self._current_gripper_width_m
+    #         if current_w <= safe_minimum_width:
+    #             self.get_logger().error("異常事態: 安全限界幅に達しました。探査を強制停止します。")
+    #             return current_w
+
+    #         target_w = current_w - step_grip
+    #         self._sequence_finished_event.clear()
+    #         self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
+    #         self._sequence_finished_event.wait(timeout=5.0)
+
+    #         f_left = self._force_monitor.get_calibrated_left()
+    #         f_right = self._force_monitor.get_calibrated_right()
+
+    #         if f_left > threshold or f_right > threshold:
+    #             # より力が強い方を接触指とする
+    #             last_touched = "left" if f_left > f_right else "right"
+    #             self.get_logger().info(f"初期接触を検知: {last_touched} (L={f_left:.3f}N, R={f_right:.3f}N)")
+    #             break
+
+    #     if last_touched is None:
+    #         return self._current_gripper_width_m
+
+    #     # =========================================================
+    #     # フェーズ2: フリップ＆ハーフ（135度平行移動による減衰ループ）
+    #     # =========================================================
+    #     self.get_logger().info(f"フェーズ2: 減衰ループを開始します (初期={last_touched})")
+
+    #     while step_arm > min_step and rclpy.ok():
+    #         current_w = self._current_gripper_width_m
+    #         if current_w <= safe_minimum_width:
+    #             self.get_logger().error("異常事態: 減衰ループ中に安全限界に達しました。")
+    #             break
+
+    #         # --- (A) アームの平行移動 (135度方向) ---
+    #         direction = 1.0 if last_touched == "right" else -1.0
+    #         move_dist = direction * step_arm
+            
+    #         angle_approach = math.radians(135)
+    #         dx = move_dist * math.cos(angle_approach)
+    #         dy = move_dist * math.sin(angle_approach)
+    #         dz = 0.0
+
+    #         script = f"def centering_slide():\n" \
+    #                  f"  p_curr = get_actual_tcp_pose()\n" \
+    #                  f"  target = pose_add(p_curr, p[{dx:.6f}, {dy:.6f}, {dz:.6f}, 0, 0, 0])\n" \
+    #                  f"  movel(target, a=0.1, v=0.01)\n" \
+    #                  f"end\n"
+            
+    #         self._urscript_pub.publish(String(data=script))
+    #         time.sleep(0.5)
+
+    #         # --- (B) ★修正部分: どちらかが接触するまで段階的に閉じる ---
+    #         current_touched = None
+            
+    #         while rclpy.ok():
+    #             current_w = self._current_gripper_width_m
+    #             if current_w <= safe_minimum_width:
+    #                 break
+
+    #             target_w = current_w - step_grip
+    #             self._sequence_finished_event.clear()
+    #             self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 2.2"))
+    #             self._sequence_finished_event.wait(timeout=5.0)
+
+    #             f_left = self._force_monitor.get_calibrated_left()
+    #             f_right = self._force_monitor.get_calibrated_right()
+                
+    #             self.get_logger().info(f"探査中幅: {target_w*1000:.1f}mm | L={f_left:.3f}N, R={f_right:.3f}N")
+
+    #             # どちらかが閾値を超えたら、再探査ループを抜ける
+    #             if f_left > threshold or f_right > threshold:
+    #                 if f_left > threshold and f_right > threshold:
+    #                     current_touched = "both"
+    #                 else:
+    #                     current_touched = "left" if f_left > f_right else "right"
+    #                 break
+            
+    #         if current_touched is None:
+    #             self.get_logger().error("接触を見失いました。安全限界に達した可能性があります。")
+    #             break
+
+    #         # --- (C) 接触判定と減衰ロジック ---
+    #         if current_touched == "both":
+    #             self.get_logger().info("両指の均等な接触を確認。センタリング完了！")
+    #             break
+
+    #         self.get_logger().info(f"接触再検知: {current_touched} | last={last_touched}")
+
+    #         if current_touched != last_touched:
+    #             self.get_logger().info(f"行き過ぎ検知({last_touched}->{current_touched})。ステップ幅を半減します。")
+    #             step_arm /= 2.0
+    #             step_grip /= 2.0
+    #             last_touched = current_touched
+
+    #     return self._current_gripper_width_m
     
     # def _execute_active_centering(self) -> float:
     #     """両指が均等に触れる位置を探り、その時のグリッパの有効幅(m)を返す"""
