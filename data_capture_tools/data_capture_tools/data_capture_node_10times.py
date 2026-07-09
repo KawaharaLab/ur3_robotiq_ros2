@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import math
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,67 @@ from .bag_converter import convert_bag_to_dataset
 from .config import CaptureConfig, load_capture_config
 
 from sensor_msgs.msg import JointState # 追加
+
+from geometry_msgs.msg import WrenchStamped
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+import collections
+
+from std_msgs.msg import Float32 # 上部のインポートに追加
+
+class ForceSensorMonitor:
+    """力覚センサ(MMS101)の高速受信、ノイズ除去(移動平均)、ゼロ点補正を行うクラス"""
+    def __init__(self, node: Node, topic_left='/force_torque/left', topic_right='/force_torque/right'):
+        self.node = node
+        
+        # 1000Hzで受信するため、直近20サンプル（約0.02秒分）の移動平均を取る
+        self.window_size = 20
+        self._history_left = collections.deque(maxlen=self.window_size)
+        self._history_right = collections.deque(maxlen=self.window_size)
+        
+        self._offset_left = 0.0
+        self._offset_right = 0.0
+        
+        # 最新のデータを逃さず、かつバッファ詰まりを防ぐためのSensorData QoS
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        
+        self.sub_left = self.node.create_subscription(
+            WrenchStamped, topic_left, self._left_callback, qos_profile)
+        self.sub_right = self.node.create_subscription(
+            WrenchStamped, topic_right, self._right_callback, qos_profile)
+
+    def _left_callback(self, msg: WrenchStamped) -> None:
+        # ★ もし挟み込む力がZ軸やX軸の場合は、ここを force.z や force.x に変更してください
+        self._history_left.append(msg.wrench.force.y)
+
+    def _right_callback(self, msg: WrenchStamped) -> None:
+        self._history_right.append(msg.wrench.force.y)
+
+    def _get_raw_average(self, history: collections.deque) -> float:
+        if len(history) == 0:
+            return 0.0
+        return sum(history) / len(history)
+
+    def tare(self) -> None:
+        """現在の移動平均値をゼロ点として記憶する"""
+        self._offset_left = self._get_raw_average(self._history_left)
+        self._offset_right = self._get_raw_average(self._history_right)
+        self.node.get_logger().info(
+            f"[Tare] 力覚センサのゼロ点をセットしました: Left={self._offset_left:.3f}N, Right={self._offset_right:.3f}N"
+        )
+
+    def get_calibrated_left(self) -> float:
+        """ゼロ点補正済みの純粋な力（絶対値）を取得"""
+        raw_avg = self._get_raw_average(self._history_left)
+        return abs(raw_avg - self._offset_left)
+
+    def get_calibrated_right(self) -> float:
+        """ゼロ点補正済みの純粋な力（絶対値）を取得"""
+        raw_avg = self._get_raw_average(self._history_right)
+        return abs(raw_avg - self._offset_right)
 
 
 class DataCaptureNode(Node):
@@ -91,6 +153,22 @@ class DataCaptureNode(Node):
         self.get_logger().info("Marker publisher initialized on /trial_marker")
         
         self._urscript_pub = self.create_publisher(String, "/urscript_interface/script_command", 10)
+        
+        # --- 追加: 力覚センサモニターの初期化 ---
+        self._force_monitor = ForceSensorMonitor(self)
+        self._is_testing_force = False
+        
+        # __init__ メソッド内の適当な場所に追加
+        self._current_gripper_width_m = 0.140 # 初期値(140mm = 0.14m)
+        self._width_sub = self.create_subscription(
+            Float32, 
+            "/robotiq_2f_gripper/finger_distance_mm", 
+            self._width_cb, 
+            10
+        )
+        
+        # __init__ メソッド内の適当な場所に追加
+        self._calibrated_target_m = None  # ★キャリブレーション済みの目標押し込み幅
 
     def _phase_cb(self, msg: Int32) -> None:
         """C++側からのフェーズ情報を受信."""
@@ -110,6 +188,11 @@ class DataCaptureNode(Node):
             self._current_joints = [msg.position[msg.name.index(name)] for name in joint_names]
         except (ValueError, IndexError):
             pass
+        
+    # クラスのメソッドとして以下を追加
+    def _width_cb(self, msg: Float32) -> None:
+        # トピックが mm 単位なので、m 単位に変換して保持
+        self._current_gripper_width_m = msg.data / 1000.0
             
     def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0, speed = 0.3):
         w_obj = self.config.target_diameter
@@ -155,6 +238,7 @@ class DataCaptureNode(Node):
             print(" [s]: Start Single Trial (Record & Run)")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
+            print(" [t]: Test Force Sensor (Visual Debug)  <-- ★追加")
             print(" [q]: Quit")
             print("="*40)
             
@@ -170,12 +254,22 @@ class DataCaptureNode(Node):
                 self._execute_auto_loop()
             elif line == 'as':
                 self._execute_push_slide_loop()
+            elif line == 't':
+                self._test_force_sensor()  # ★追加
+            elif line == 'tc':
+                self._test_continuous_interrupt()  # ★追加
             elif line == 'q':
                 self._stop_event.set()
                 break
 
     def _execute_auto_loop(self) -> None:
         """10回ごとにBagを切り替えながら、補正済み角度へリセットして連続試行を行う"""
+        
+        # ★ 安全装置：Initが実行されていない場合は警告して弾く
+        if self._calibrated_target_m is None:
+            self.get_logger().error("エラー: 目標押し込み幅が未設定です。先に [i] (Init) を実行してセンタリングを行ってください。")
+            return
+
         print("Enter total number of trials: ", end="", flush=True)
         try:
             line = sys.stdin.readline().strip()
@@ -186,9 +280,9 @@ class DataCaptureNode(Node):
             return
 
         batch_size = 10 
-        target_m = (self.config.target_diameter - 
-                (self.config.push_depth * 2) + 
-                self.config.gripper_offset)
+        
+        # ★ ここで、Initで計算・記憶した完璧な幅を使用する
+        target_m = self._calibrated_target_m
         
         for i in range(total_count):
             # --- [元のロジック：10回ごとのBag分割] ---
@@ -229,13 +323,17 @@ class DataCaptureNode(Node):
         self.get_logger().info("Auto push loop completed.")
 
     def _execute_push_slide_loop(self) -> None:
-        """10回ごとにBagを切り替えながら、補正済み角度へリセットして連続試行を行う"""
+        """9回のなぞり動作ループ（キャリブレーション済みの幅を使用）"""
+        # ★ 安全装置：Initが実行されていない場合は警告して弾く
+        if self._calibrated_target_m is None:
+            self.get_logger().error("エラー: 目標押し込み幅が未設定です。先に [i] (Init) を実行してセンタリングを行ってください。")
+            return
+
         total_count = 9
-        
         batch_size = 10 
-        target_m = (self.config.target_diameter - 
-                    (self.config.push_depth * 2) + 
-                    self.config.gripper_offset)
+        
+        # ★ ここで、Initで計算した完璧な幅を使用する
+        target_m = self._calibrated_target_m
         
         for i in range(total_count):
             # --- [元のロジック：10回ごとのBag分割] ---
@@ -292,34 +390,464 @@ class DataCaptureNode(Node):
         self.get_logger().info("Auto slide loop completed.")
 
     def _run_init_sequence(self) -> bool:
-        """初期化：基準姿勢への復帰と補正後の角度保存"""
+        """初期化：基準姿勢への復帰と、大まかな位置合わせ＋本番センタリング"""
+        self.get_logger().info("--- 初期化シーケンスを開始します ---")
         self._sequence_finished_event.clear()
+        
+        # 1. 初期姿勢へマクロ移動
         init_gripper_w = min(0.135, self.config.target_diameter + 0.050)
-        # YAMLから読み込んだ角度へまず移動
         joints_rad = [math.radians(d) for d in self.config.initial_arm_pose]
         joints_str = " ".join(map(str, joints_rad))
-        
-        self.get_logger().info("Moving to initial arm pose...")
         self._cmd_pub.publish(String(data=f"init {init_gripper_w} {joints_str}"))
-        
-        if not self._sequence_finished_event.wait(timeout=20.0):
-            return False
+        self._sequence_finished_event.wait(timeout=20.0)
 
-        # 基準位置に到達してから、URScript で相対移動（補正スライド）を行う
-        self.get_logger().info("Sliding to object center...")
-        script = self._calculate_target_pose(True, 0.0, 0.0, 0.5) # 補正量0でのスライド
+        # 2. 大まかな位置合わせ (Macro Approach)
+        script = self._calculate_target_pose(init=True, lateral_offset=0.0, vertical_offset=0.0, speed=0.2)
         self._urscript_pub.publish(String(data=script))
-        
-        threading.Event().wait(5.0) # スライド完了まで待機
+        time.sleep(3.0)
 
-        # 【重要】スライド完了直後の、補正された関節角度を保存
+        pre_approach_width = self.config.target_diameter + self.config.safe_margin
+        self._sequence_finished_event.clear()
+        self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.5f} 0.100"))
+        self._sequence_finished_event.wait(timeout=5.0)
+
+        # 3. センサのゼロ点補正(Tare)
+        time.sleep(0.5)
+        self._force_monitor.tare()
+
+        # 4. 本番仕様のアクティブ・センタリング実行
+        effective_width_m = self._execute_active_centering()
+        
+        # 5. 結果の保存と待機
+        self._calibrated_target_m = max(0.0, effective_width_m - self.config.push_depth)
+        self.get_logger().info(
+            f"キャリブレーション完了: 有効幅 {effective_width_m*1000:.1f}mm / "
+            f"目標押し込み幅 {self._calibrated_target_m*1000:.1f}mm"
+        )
+        
         if self._current_joints:
             self._saved_base_joints = list(self._current_joints)
-            self.get_logger().info(f"Corrected base joints saved.{self._current_joints}")
-        
+
+        # 次のデータ収集ループに備えて少し開く
+        self._sequence_finished_event.clear()
+        self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.4f} 0.100"))
+        self._sequence_finished_event.wait(timeout=5.0)
+
         return True
 
+    # def _run_init_sequence(self) -> bool:
+    #     """初期化：基準姿勢への復帰と、大まかな位置合わせ＋段階的な接触検知"""
+    #     self.get_logger().info("--- 初期化シーケンス（Coarse-to-Fine 接触テスト）を開始します ---")
+    #     self._sequence_finished_event.clear()
+        
+    #     # --- 1. アームの初期姿勢へのマクロ移動 ---
+    #     init_gripper_w = min(0.135, self.config.target_diameter + 0.050)
+    #     joints_rad = [math.radians(d) for d in self.config.initial_arm_pose]
+    #     joints_str = " ".join(map(str, joints_rad))
+        
+    #     self.get_logger().info("1. 初期姿勢へアームを移動中...")
+    #     self._cmd_pub.publish(String(data=f"init {init_gripper_w} {joints_str}"))
+        
+    #     if not self._sequence_finished_event.wait(timeout=20.0):
+    #         self.get_logger().error("初期姿勢への移動がタイムアウトしました。")
+    #         return False
 
+    #     # --- 2. 大まかな位置合わせ (Macro Approach) ---
+    #     self.get_logger().info("2. 対象物の中心付近へ大まかな位置合わせを行います...")
+        
+    #     # アームを対象物に向けてスライド（元の機能を復活）
+    #     script = self._calculate_target_pose(init=True, lateral_offset=0.0, vertical_offset=0.0, speed=0.2)
+    #     self._urscript_pub.publish(String(data=script))
+    #     time.sleep(3.0) # スライド完了まで待機
+
+    #     # 対象物の幅 ＋ 余裕まで一気に閉じる
+    #     safe_margin = self.config.safe_margin
+    #     pre_approach_width = self.config.target_diameter + safe_margin
+        
+    #     self.get_logger().info(f"グリッパを事前幅({pre_approach_width*1000:.1f}mm)まで一気に閉じます...")
+    #     self._sequence_finished_event.clear()
+    #     self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.5f} 0.100"))
+    #     self._sequence_finished_event.wait(timeout=5.0)
+
+    #     # --- 3. 空中での風袋引き（Tare） ---
+    #     self.get_logger().info("3. センサのゼロ点補正(Tare)を行います...")
+    #     time.sleep(0.5) # アームの揺れが収まるのを待つ
+    #     self._force_monitor.tare()
+
+    #     # --- 4. 段階的な閉じ動作（Micro Step-wise Close） ---
+    #     self.get_logger().info("4. 段階的接触探査を開始します...")
+        
+    #     # ★ config から値を読み出すように変更
+    #     step_grip = self.config.centering_step_grip
+    #     threshold = self.config.contact_threshold
+        
+    #     safe_minimum_width = self.config.target_diameter - 0.010 
+
+    #     while rclpy.ok():
+    #         current_w = self._current_gripper_width_m
+
+    #         if current_w <= safe_minimum_width:
+    #             self.get_logger().error(
+    #                 f"異常事態: 接触を検知しないまま安全限界幅({safe_minimum_width*1000:.1f}mm)に達しました。探査を強制停止します。"
+    #             )
+    #             break
+
+    #         target_w = current_w - step_grip
+
+    #         # 少し速度を上げて設定ステップ幅分閉じる
+    #         self._sequence_finished_event.clear()
+    #         self._cmd_pub.publish(String(data=f"gripper {target_w:.5f} 0.020"))
+    #         self._sequence_finished_event.wait(timeout=5.0)
+
+    #         f_left = self._force_monitor.get_calibrated_left()
+    #         f_right = self._force_monitor.get_calibrated_right()
+
+    #         self.get_logger().info(f"現在幅: {target_w*1000:.1f}mm | 力: L={f_left:.3f}N, R={f_right:.3f}N")
+
+    #         if f_left > threshold or f_right > threshold:
+    #             touched = []
+    #             if f_left > threshold: touched.append("Left")
+    #             if f_right > threshold: touched.append("Right")
+                
+    #             self.get_logger().info(
+    #                 f"★ 接触検知: {', '.join(touched)}。 探査を安全に停止しました。"
+    #             )
+                
+    #             # ★ 次のステップのデバッグ用に、どちらが触れたかを保存しておく
+    #             self._last_touched_finger = "right" if f_right > threshold else "left"
+    #             break
+
+    #     self.get_logger().info("--- 初期接触テスト完了 ---")
+    #     return True
+    
+    # def _test_continuous_interrupt(self) -> None:
+    #     """【実験】連続的に閉じながら、力覚センサの割り込みで急停止するテスト"""
+    #     self.get_logger().info("--- 連続割り込み(Interrupt)テストを開始します ---")
+        
+    #     # --- 1. アームの初期姿勢へのマクロ移動 ---
+    #     init_gripper_w = min(0.135, self.config.target_diameter + 0.050)
+    #     joints_rad = [math.radians(d) for d in self.config.initial_arm_pose]
+    #     joints_str = " ".join(map(str, joints_rad))
+        
+    #     self.get_logger().info("1. 初期姿勢へアームを移動中...")
+    #     self._cmd_pub.publish(String(data=f"init {init_gripper_w} {joints_str}"))
+        
+    #     if not self._sequence_finished_event.wait(timeout=20.0):
+    #         self.get_logger().error("初期姿勢への移動がタイムアウトしました。")
+    #         return False
+        
+    #     # 1. センサのゼロ点補正
+    #     time.sleep(0.5)
+    #     self._force_monitor.tare()
+
+    #     threshold = 0.25  # 停止閾値 (N)
+    #     close_speed = 0.0005 # 閉じる速度: 10mm/s (ここを上げるとオーバーシュートが増えます)
+        
+    #     # 安全限界
+    #     safe_minimum_width = self.config.target_diameter - 0.010 
+
+    #     self.get_logger().info(f"速度 {close_speed*1000}mm/s で連続的に閉じます。")
+        
+    #     # 2. 連続動作の開始（0.0mまで完全に閉じるコマンドを発行）
+    #     self._sequence_finished_event.clear()
+    #     self._cmd_pub.publish(String(data=f"gripper 0.000 {close_speed:.3f}"))
+
+    #     # 3. 超高速監視ループ（Busy Wait）
+    #     touched = False
+    #     while rclpy.ok():
+    #         current_w = self._current_gripper_width_m
+            
+    #         # 安全限界チェック
+    #         if current_w <= safe_minimum_width:
+    #             self.get_logger().error("安全限界到達。強制ブレーキ！")
+    #             self._cmd_pub.publish(String(data=f"gripper {current_w:.5f} 0.100"))
+    #             break
+
+    #         # センサ値の取得
+    #         f_left = self._force_monitor.get_calibrated_left()
+    #         f_right = self._force_monitor.get_calibrated_right()
+
+    #         # 4. 割り込み検知！
+    #         if f_left > threshold or f_right > threshold:
+    #             # ★ 超重要: 検知した瞬間の「現在幅」を目標値として送りつけ、急ブレーキをかける
+    #             brake_width = current_w
+    #             self._cmd_pub.publish(String(data=f"gripper {brake_width:.5f} 0.100"))
+                
+    #             touched_finger = "Right" if f_right > threshold else "Left"
+    #             self.get_logger().info(f"★ 割り込み検知({touched_finger})！ ブレーキ信号送信。")
+    #             touched = True
+    #             break
+                
+    #         # ループの周期を極力短くする（0.001秒 = 1000Hz相当で回す）
+    #         time.sleep(0.001) 
+
+    #     # 5. ブレーキ後のオーバーシュート計測
+    #     if touched:
+    #         time.sleep(0.5) # 完全にモータが止まるのを待つ
+    #         final_left = self._force_monitor.get_calibrated_left()
+    #         final_right = self._force_monitor.get_calibrated_right()
+            
+    #         self.get_logger().info("--- ブレーキ結果 ---")
+    #         self.get_logger().info(f"停止設定閾値: {threshold:.3f}N")
+    #         self.get_logger().info(f"最終的なめり込み力: L={final_left:.3f}N, R={final_right:.3f}N")
+    #         if max(final_left, final_right) > threshold * 2:
+    #             self.get_logger().warning("⚠️ オーバーシュートが大きいです。速度を下げるかステップ制御に戻すことを推奨します。")
+    
+    def _execute_active_centering(self) -> float:
+        """
+        対象物の中心と有効幅を自動探査する本番仕様のセンタリングロジック。
+        ※ 事前にマクロな位置合わせとTareが完了している前提で呼び出される。
+        """
+        self.get_logger().info("--- アクティブ・センタリング（本番仕様：ステップ制御）を開始します ---")
+
+        step_grip = self.config.centering_step_grip
+        step_arm = self.config.centering_step_arm
+        min_step = self.config.centering_min_step
+        threshold = self.config.contact_threshold
+        safe_minimum_width = self.config.target_diameter - 0.010 
+
+        # =========================================================
+        # フェーズ1: 段階的な初期接触探査
+        # =========================================================
+        self.get_logger().info("フェーズ1: 段階的な初期接触を探ります...")
+        last_touched = None
+
+        while rclpy.ok():
+            current_w = self._current_gripper_width_m
+            if current_w <= safe_minimum_width:
+                self.get_logger().error("異常事態: 安全限界幅に達しました。探査を強制停止します。")
+                return current_w
+
+            target_w = current_w - step_grip
+            self._sequence_finished_event.clear()
+            self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
+            self._sequence_finished_event.wait(timeout=5.0)
+
+            f_left = self._force_monitor.get_calibrated_left()
+            f_right = self._force_monitor.get_calibrated_right()
+
+            if f_left > threshold or f_right > threshold:
+                # より力が強い方を接触指とする
+                last_touched = "left" if f_left > f_right else "right"
+                self.get_logger().info(f"初期接触を検知: {last_touched} (L={f_left:.3f}N, R={f_right:.3f}N)")
+                break
+
+        if last_touched is None:
+            return self._current_gripper_width_m
+
+        # =========================================================
+        # フェーズ2: フリップ＆ハーフ（135度平行移動による減衰ループ）
+        # =========================================================
+        self.get_logger().info(f"フェーズ2: 減衰ループを開始します (初期={last_touched})")
+
+        while step_arm > min_step and rclpy.ok():
+            current_w = self._current_gripper_width_m
+            if current_w <= safe_minimum_width:
+                self.get_logger().error("異常事態: 減衰ループ中に安全限界に達しました。")
+                break
+
+            # --- (A) アームの平行移動 (135度方向) ---
+            direction = 1.0 if last_touched == "right" else -1.0
+            move_dist = direction * step_arm
+            
+            angle_approach = math.radians(135)
+            dx = move_dist * math.cos(angle_approach)
+            dy = move_dist * math.sin(angle_approach)
+            dz = 0.0
+
+            script = f"def centering_slide():\n" \
+                     f"  p_curr = get_actual_tcp_pose()\n" \
+                     f"  target = pose_add(p_curr, p[{dx:.6f}, {dy:.6f}, {dz:.6f}, 0, 0, 0])\n" \
+                     f"  movel(target, a=0.1, v=0.01)\n" \
+                     f"end\n"
+            
+            self._urscript_pub.publish(String(data=script))
+            time.sleep(0.5)
+
+            # --- (B) ★修正部分: どちらかが接触するまで段階的に閉じる ---
+            current_touched = None
+            
+            while rclpy.ok():
+                current_w = self._current_gripper_width_m
+                if current_w <= safe_minimum_width:
+                    break
+
+                target_w = current_w - step_grip
+                self._sequence_finished_event.clear()
+                self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 2.2"))
+                self._sequence_finished_event.wait(timeout=5.0)
+
+                f_left = self._force_monitor.get_calibrated_left()
+                f_right = self._force_monitor.get_calibrated_right()
+                
+                self.get_logger().info(f"探査中幅: {target_w*1000:.1f}mm | L={f_left:.3f}N, R={f_right:.3f}N")
+
+                # どちらかが閾値を超えたら、再探査ループを抜ける
+                if f_left > threshold or f_right > threshold:
+                    if f_left > threshold and f_right > threshold:
+                        current_touched = "both"
+                    else:
+                        current_touched = "left" if f_left > f_right else "right"
+                    break
+            
+            if current_touched is None:
+                self.get_logger().error("接触を見失いました。安全限界に達した可能性があります。")
+                break
+
+            # --- (C) 接触判定と減衰ロジック ---
+            if current_touched == "both":
+                self.get_logger().info("両指の均等な接触を確認。センタリング完了！")
+                break
+
+            self.get_logger().info(f"接触再検知: {current_touched} | last={last_touched}")
+
+            if current_touched != last_touched:
+                self.get_logger().info(f"行き過ぎ検知({last_touched}->{current_touched})。ステップ幅を半減します。")
+                step_arm /= 2.0
+                step_grip /= 2.0
+                last_touched = current_touched
+
+        return self._current_gripper_width_m
+    
+    # def _execute_active_centering(self) -> float:
+    #     """両指が均等に触れる位置を探り、その時のグリッパの有効幅(m)を返す"""
+    #     self.get_logger().info("--- アクティブ・センタリングを開始します ---")
+
+    #     # 1. 空中でのTare（ヒステリシスと重力のキャンセル）
+    #     time.sleep(0.5) # アーム移動の揺れが収まるのを待つ
+    #     self._force_monitor.tare()
+
+    #     # 2. 初期接触を探る（ゆっくり閉じる）
+    #     self.get_logger().info("初期接触を探査中...")
+    #     self._sequence_finished_event.clear()
+        
+    #     # 完全に閉じる(0.0m)目標を与え、途中で止める
+    #     self._cmd_pub.publish(String(data="gripper 0.000 0.010"))
+
+    #     target_finger = None
+    #     threshold = 0.25 # ノイズに強く、対象物を壊さない0.25N
+
+    #     while rclpy.ok():
+    #         f_left = self._force_monitor.get_calibrated_left()
+    #         f_right = self._force_monitor.get_calibrated_right()
+
+    #         if f_left > threshold:
+    #             target_finger = "left"
+    #             break
+    #         if f_right > threshold:
+    #             target_finger = "right"
+    #             break
+    #         time.sleep(0.01)
+
+    #     # どちらかが触れたので、一旦その場で停止させる（現在幅を目標値として再送信）
+    #     current_w = self._current_gripper_width_m
+    #     self._cmd_pub.publish(String(data=f"gripper {current_w:.5f} 0.050"))
+    #     time.sleep(0.5)
+
+    #     # 3. フリップ＆ハーフ（適応的減衰）ループ
+    #     step_arm = 0.0010  # アーム移動幅の初期値: 1.0mm
+    #     step_grip = 0.0020 # グリッパ閉じ幅の初期値: 2.0mm
+    #     min_step = 0.0001  # 終了判定: 0.1mm以下になれば収束
+
+    #     last_touched = target_finger
+    #     self.get_logger().info(f"初期接触: {last_touched}. 減衰ループを開始します。")
+
+    #     while step_arm > min_step and rclpy.ok():
+    #         # (A) アームの平行移動 (URScript)
+    #         # Rightが当たれば正の方向(1.0)、Leftなら負の方向(-1.0)
+    #         direction = 1.0 if last_touched == "right" else -1.0
+            
+    #         # 実際の移動距離（Rightならプラス、Leftならマイナス）
+    #         move_dist = direction * step_arm
+            
+    #         # グリッパの開閉軸（クランプの軸）は135度
+    #         angle_approach = math.radians(135)
+            
+    #         # 135度の斜め移動を、ロボット座標系のX軸成分とY軸成分に分解
+    #         dx = move_dist * math.cos(angle_approach)
+    #         dy = move_dist * math.sin(angle_approach)
+    #         dz = 0.0
+
+    #         script = f"def centering_slide():\n" \
+    #                 f"  p_curr = get_actual_tcp_pose()\n" \
+    #                 f"  target = pose_add(p_curr, p[{dx:.6f}, {dy:.6f}, {dz:.6f}, 0, 0, 0])\n" \
+    #                 f"  movel(target, a=0.1, v=0.01)\n" \
+    #                 f"end\n"
+                    
+    #         self._urscript_pub.publish(String(data=script))
+    #         time.sleep(0.3) # アーム移動の完了を待つ
+
+    #         # (B) グリッパを閉じる
+    #         current_w = self._current_gripper_width_m
+    #         target_w = current_w - step_grip
+    #         self._sequence_finished_event.clear()
+    #         self._cmd_pub.publish(String(data=f"gripper {target_w:.5f} 0.010"))
+            
+    #         # C++側が完了するのを待つ (Phase 10 が終わって 0 が返ってくるのを待つ)
+    #         self._sequence_finished_event.wait(timeout=5.0)
+
+    #         # (C) 接触判定と減衰ロジック
+    #         f_left = self._force_monitor.get_calibrated_left()
+    #         f_right = self._force_monitor.get_calibrated_right()
+
+    #         if f_left > threshold and f_right > threshold:
+    #             self.get_logger().info("両指の均等な接触を確認。センタリング完了！")
+    #             break
+
+    #         current_touched = "left" if f_left > threshold else "right"
+
+    #         if current_touched != last_touched:
+    #             self.get_logger().info(f"行き過ぎ検知({last_touched}->{current_touched})。ステップ幅を半減します。")
+    #             step_arm /= 2.0
+    #             step_grip /= 2.0
+    #             last_touched = current_touched
+
+    #     # 最終的な有効幅（ゼロ点）を返す
+    #     return self._current_gripper_width_m
+
+    def _test_force_sensor(self) -> None:
+        """力覚センサの値をターミナルで視覚的にデバッグするモード"""
+        self._is_testing_force = True
+        self.get_logger().info("力覚センサのテストモードに入りました。")
+        self.get_logger().info("空中で静止している状態でTare(ゼロ点補正)を実行します...")
+        
+        # 直前キャリブレーションを実行
+        self._force_monitor.tare()
+        import time
+        
+        print("\n--- Force Sensor Live View ---")
+        print("力を加えてみてください。(Enterキーを押すと終了します)\n")
+        
+        # Enterキーが押されるまでループするスレッド用のフラグ
+        stop_test = [False]
+        
+        def wait_for_enter():
+            sys.stdin.readline()
+            stop_test[0] = True
+            
+        t = threading.Thread(target=wait_for_enter, daemon=True)
+        t.start()
+
+        # バーの最大値（例: 2.0N でメーターが振り切れる設定）
+        max_force = 2.0 
+        bar_length = 30
+        
+        while not stop_test[0] and rclpy.ok():
+            f_left = self._force_monitor.get_calibrated_left()
+            f_right = self._force_monitor.get_calibrated_right()
+            
+            # バーの長さを計算
+            l_bars = int(min(f_left / max_force, 1.0) * bar_length)
+            r_bars = int(min(f_right / max_force, 1.0) * bar_length)
+            
+            # ターミナル上で同じ行を上書き更新 (\r を使用)
+            sys.stdout.write(f"\rLeft  [{'#' * l_bars}{'-' * (bar_length - l_bars)}] {f_left:.3f} N  |  "
+                             f"Right [{'#' * r_bars}{'-' * (bar_length - r_bars)}] {f_right:.3f} N")
+            sys.stdout.flush()
+            time.sleep(0.05) # 20Hzで描画更新
+            
+        print("\n\nテストモードを終了し、メインメニューに戻ります。")
+        self._is_testing_force = False
     
     def _calculate_push_and_slide_script(self, target_m, slide_dist=0.05):
         """

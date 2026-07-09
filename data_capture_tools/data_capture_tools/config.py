@@ -50,6 +50,13 @@ class CaptureConfig:
     gripper_offset: float
     arm_offset: float
     initial_arm_pose: List[float]
+    # --- 追加: センタリングパラメータ ---
+    contact_threshold: float
+    centering_step_grip: float
+    centering_step_arm: float
+    centering_min_step: float
+    safe_margin: float      # ★追加
+    # ----------------------------------
     # --- 追加: base_tcp_pose を定義 ---
     base_tcp_pose: PoseConfig
     viewer_topics: list[str]
@@ -121,6 +128,13 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     push_depth = float(data.get("push_depth", 0.002)) # 追加
     gripper_offset = float(data.get("gripper_offset", 0.006)) # 追加
     arm_offset = float(data.get("arm_offset", 0.0)) # 追加
+    # --- 追加: センタリングパラメータの読み出し ---
+    contact_threshold = float(data.get("contact_threshold", 0.25))
+    centering_step_grip = float(data.get("centering_step_grip", 0.001))
+    centering_step_arm = float(data.get("centering_step_arm", 0.001))
+    centering_min_step = float(data.get("centering_min_step", 0.0001))
+    safe_margin = float(data.get("safe_margin", 0.020))
+    # --------------------------------------------
     initial_arm_pose = data.get("initial_arm_pose", [1.7317156838287737, -1.40045219180025, 1.1475539831862718, -1.3247049022636963, -1.5844098949604524, 0.9487609813841176])
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
     other_throttle_hz = float(data.get("other_throttle_hz", 100.0))
@@ -148,6 +162,13 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         push_depth=push_depth,               # 追加
         gripper_offset=gripper_offset, # 追加
         arm_offset=arm_offset,             # 追加
+        # --- 追加: 戻り値に含める ---
+        contact_threshold=contact_threshold,
+        centering_step_grip=centering_step_grip,
+        centering_step_arm=centering_step_arm,
+        centering_min_step=centering_min_step,
+        safe_margin=safe_margin, # ★追加
+        # ----------------------------
         initial_arm_pose=initial_arm_pose,
         base_tcp_pose=base_tcp_pose,         # 追加
         viewer_topics=viewer_topics,

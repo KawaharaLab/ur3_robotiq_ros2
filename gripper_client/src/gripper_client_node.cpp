@@ -179,6 +179,25 @@ private:
             
             prepare_gripper_sequence(target_pos, target_speed);
         }
+        // --- 既存の "gripper" コマンドの下にこれを追加 ---
+        else if (cmd.find("step_gripper") == 0) {
+            double target_pos = 0.1; 
+            double target_speed = 0.1; 
+            double delay_sec = 0.2; // 微小ステップ用のデフォルト待機時間
+
+            // "step_gripper " の直後（13文字目）から読み込む
+            std::string params = cmd.substr(13); 
+            std::stringstream ss(params);
+            
+            // 3つの引数（幅、速度、待機時間）をパースする
+            if (ss >> target_pos >> target_speed >> delay_sec) {
+                RCLCPP_INFO(this->get_logger(), "Parsed step_gripper: pos=%.3f, speed=%.3f, delay=%.1f", target_pos, target_speed, delay_sec);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Parse failed for: %s. Using default parameters.", cmd.c_str());
+            }
+            
+            prepare_step_gripper_sequence(target_pos, target_speed, delay_sec);
+        }
         else {
             return;
         }
@@ -253,6 +272,28 @@ private:
         // Phase 1: 開閉
         steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos), 0.5f), std::chrono::seconds(3), 10));
         
+    }
+
+    // --- 新規追加: 高速ステップ動作専用のシーケンス ---
+    void prepare_step_gripper_sequence(double target_pos, double target_speed, double delay_sec) {
+        steps_.clear();
+        auto make_g = [target_speed](float pos, float force) {
+            MoveGripper::Goal g; 
+            g.target_position = pos; 
+            g.target_speed = static_cast<float>(target_speed); 
+            g.target_force = force; 
+            return g;
+        };
+
+        // 受け取った待機時間(秒)をミリ秒に変換して適用
+        int delay_ms = static_cast<int>(delay_sec * 1000.0);
+        
+        // Phase 10 (そのまま待機) を使用してステップ実行
+        steps_.push_back(make_gripper_step(
+            make_g(static_cast<float>(target_pos), 0.5f), 
+            std::chrono::milliseconds(delay_ms), 
+            10
+        ));
     }
 
     void send_next_step() {
