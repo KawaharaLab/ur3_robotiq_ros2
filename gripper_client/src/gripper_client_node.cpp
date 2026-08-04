@@ -146,7 +146,7 @@ private:
             prepare_init_sequence_direct(joints_pos, gripper_width);
         }
         else if (cmd.find("run") == 0) {
-            double target_pos = 0.05; 
+            double target_pos = 0.140; 
             double target_speed = 0.1; 
 
             // substr(3) にして "run" の直後（スペース含む）から読み込ませるか、
@@ -240,7 +240,7 @@ private:
     void prepare_run_sequence(double target_pos, double target_speed) {
         steps_.clear();
         // 引数で受け取った target_speed を適用する
-        auto make_g = [target_speed](float pos, float force) {
+        auto make_g = [] (float pos, float target_speed, float force) {
             MoveGripper::Goal g; 
             g.target_position = pos; 
             g.target_speed = static_cast<float>(target_speed); 
@@ -248,14 +248,20 @@ private:
             return g;
         };
 
+        MoveGripper::Goal open_gripper_;
+        MoveGripper::Goal grasp_gripper_;
+
+        open_gripper_ = make_g(std::max<float>(static_cast<float>(target_pos) + 0.03f, 0.140f), 0.3f, 0.1f); // 開く位置を保持
+        grasp_gripper_ = make_g(static_cast<float>(target_pos), static_cast<float>(target_speed), 0.5f); // 把持位置を保持
+
         // Phase 1: 開く (ここは素早く 0.5 固定でもOK)
-        steps_.push_back(make_gripper_step(make_g(0.140f, 0.1f), std::chrono::seconds(1), 1));
+        steps_.push_back(make_gripper_step(open_gripper_, std::chrono::seconds(1), 1));
         
         // Phase 2: 把持 (ここを指定されたランダム速度にする)
-        steps_.push_back(make_gripper_step(make_g(static_cast<float>(target_pos), 0.5f), std::chrono::seconds(3), 2));
+        steps_.push_back(make_gripper_step(grasp_gripper_, std::chrono::seconds(4), 2));
         
         // Phase 3: 開く
-        steps_.push_back(make_gripper_step(make_g(0.140f, 0.1f), std::chrono::seconds(1), 3));
+        steps_.push_back(make_gripper_step(open_gripper_, std::chrono::seconds(1), 3));
     }
 
     void prepare_gripper_sequence(double target_pos, double target_speed) {

@@ -52,9 +52,11 @@ class CaptureConfig:
     initial_arm_pose: List[float]
     # --- 追加: センタリングパラメータ ---
     contact_threshold: float
+    contact_margin: float
     centering_step_grip: float
     centering_step_arm: float
-    centering_min_step: float
+    centering_min_step_arm: float
+    centering_min_step_grip: float
     safe_margin: float      # ★追加
     # ----------------------------------
     # --- 追加: base_tcp_pose を定義 ---
@@ -130,9 +132,11 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     arm_offset = float(data.get("arm_offset", 0.0)) # 追加
     # --- 追加: センタリングパラメータの読み出し ---
     contact_threshold = float(data.get("contact_threshold", 0.25))
+    contact_margin = float(data.get("contact_margin", 0.05))
     centering_step_grip = float(data.get("centering_step_grip", 0.001))
     centering_step_arm = float(data.get("centering_step_arm", 0.001))
-    centering_min_step = float(data.get("centering_min_step", 0.0001))
+    centering_min_step_arm = float(data.get("centering_min_step_arm", 0.0001))
+    centering_min_step_grip = float(data.get("centering_min_step_grip", 0.0005))
     safe_margin = float(data.get("safe_margin", 0.020))
     # --------------------------------------------
     initial_arm_pose = data.get("initial_arm_pose", [1.7317156838287737, -1.40045219180025, 1.1475539831862718, -1.3247049022636963, -1.5844098949604524, 0.9487609813841176])
@@ -164,9 +168,11 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         arm_offset=arm_offset,             # 追加
         # --- 追加: 戻り値に含める ---
         contact_threshold=contact_threshold,
+        contact_margin=contact_margin,
         centering_step_grip=centering_step_grip,
         centering_step_arm=centering_step_arm,
-        centering_min_step=centering_min_step,
+        centering_min_step_arm=centering_min_step_arm,
+        centering_min_step_grip=centering_min_step_grip,
         safe_margin=safe_margin, # ★追加
         # ----------------------------
         initial_arm_pose=initial_arm_pose,
