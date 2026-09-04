@@ -1,0 +1,463 @@
+/**
+ * Robust MMS101 Force Sensor Driver for ROS 2
+ *
+ * Main changes:
+ *  - Separate serial byte-stream reads from 25-byte packet parsing.
+ *  - Search the stream one byte at a time for the 0x00 0x17 header.
+ *  - Use non-blocking-style termios settings during initialization.
+ *  - Switch to VMIN=1 only after continuous measurement starts.
+ *  - Publish with SensorDataQoS/BEST_EFFORT to avoid DDS backpressure.
+ *  - Count bytes, packets, header resyncs and sensor timestamp gaps.
+ */
+
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <termios.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+class MMS101Node : public rclcpp::Node
+{
+public:
+  MMS101Node() : Node("mms101_driver")
+  {
+    declare_parameter("port", "/dev/ttyUSB1");
+    declare_parameter("frame_id", "sensor_link");
+    declare_parameter("force_scale", 0.001);
+    declare_parameter("torque_scale", 0.00001);
+    declare_parameter("expected_period_ms", 1);
+    declare_parameter("max_reasonable_gap_ms", 100);
+
+    port_name_ = get_parameter("port").as_string();
+    frame_id_ = get_parameter("frame_id").as_string();
+    force_scale_ = get_parameter("force_scale").as_double();
+    torque_scale_ = get_parameter("torque_scale").as_double();
+    expected_period_ms_ = get_parameter("expected_period_ms").as_int();
+    max_reasonable_gap_ms_ = get_parameter("max_reasonable_gap_ms").as_int();
+
+    auto qos = rclcpp::SensorDataQoS().keep_last(2048);
+    publisher_ = create_publisher<geometry_msgs::msg::WrenchStamped>(
+      "force_torque", qos);
+
+    diagnostics_timer_ = create_wall_timer(
+      std::chrono::seconds(1),
+      std::bind(&MMS101Node::report_diagnostics, this));
+
+    if (!open_serial_port()) {
+      throw std::runtime_error("Failed to open serial port");
+    }
+    if (!initialize_sensor()) {
+      throw std::runtime_error("Failed to initialize MMS101");
+    }
+    if (!configure_streaming_read()) {
+      throw std::runtime_error("Failed to configure streaming serial mode");
+    }
+
+    tcflush(serial_fd_, TCIFLUSH);
+    reset_timebase();
+
+    running_ = true;
+    read_thread_ = std::thread(&MMS101Node::read_loop, this);
+
+    RCLCPP_INFO(
+      get_logger(),
+      "MMS101 streaming started: port=%s frame=%s",
+      port_name_.c_str(), frame_id_.c_str());
+  }
+
+  ~MMS101Node() override
+  {
+    running_ = false;
+    if (read_thread_.joinable()) {
+      read_thread_.join();
+    }
+
+    if (serial_fd_ >= 0) {
+      stop_measurement();
+      close(serial_fd_);
+      serial_fd_ = -1;
+    }
+  }
+
+private:
+  static constexpr std::size_t PACKET_SIZE = 25;
+  static constexpr uint8_t HEADER0 = 0x00;
+  static constexpr uint8_t HEADER1 = 0x17;
+  static constexpr uint32_t SENSOR_COUNTER_MOD = 0x1000000;  // 24 bit
+
+  int serial_fd_{-1};
+  std::string port_name_;
+  std::string frame_id_;
+  double force_scale_{0.001};
+  double torque_scale_{0.00001};
+  int64_t expected_period_ms_{1};
+  int64_t max_reasonable_gap_ms_{100};
+
+  rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr publisher_;
+  rclcpp::TimerBase::SharedPtr diagnostics_timer_;
+  std::thread read_thread_;
+  std::atomic<bool> running_{false};
+
+  std::vector<uint8_t> rx_buffer_;
+
+  bool timebase_initialized_{false};
+  rclcpp::Time pc_base_time_;
+  uint32_t sensor_base_time_{0};
+  uint32_t last_sensor_time_{0};
+
+  std::atomic<uint64_t> bytes_received_{0};
+  std::atomic<uint64_t> read_calls_{0};
+  std::atomic<uint64_t> valid_packets_{0};
+  std::atomic<uint64_t> discarded_bytes_{0};
+  std::atomic<uint64_t> timestamp_gap_events_{0};
+  std::atomic<uint64_t> read_errors_{0};
+  std::atomic<std::size_t> rx_pending_{0};
+
+  uint64_t previous_bytes_{0};
+  uint64_t previous_packets_{0};
+  uint64_t previous_discarded_{0};
+  uint64_t previous_gaps_{0};
+  uint64_t previous_errors_{0};
+
+  bool open_serial_port()
+  {
+    serial_fd_ = open(port_name_.c_str(), O_RDWR | O_NOCTTY);
+    if (serial_fd_ < 0) {
+      RCLCPP_ERROR(
+        get_logger(), "open(%s) failed: %s",
+        port_name_.c_str(), std::strerror(errno));
+      return false;
+    }
+
+    termios tty{};
+    if (tcgetattr(serial_fd_, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcgetattr failed: %s", std::strerror(errno));
+      return false;
+    }
+
+    cfsetospeed(&tty, B1000000);
+    cfsetispeed(&tty, B1000000);
+
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_cflag |= CLOCAL | CREAD;
+    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
+
+    tty.c_iflag = 0;
+    tty.c_lflag = 0;
+    tty.c_oflag = 0;
+
+    // Initialization command responses may be shorter than 25 bytes.
+    // Return after 100 ms even when no byte arrives.
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 1;
+
+    if (tcsetattr(serial_fd_, TCSANOW, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcsetattr failed: %s", std::strerror(errno));
+      return false;
+    }
+
+    tcflush(serial_fd_, TCIOFLUSH);
+    return true;
+  }
+
+  bool configure_streaming_read()
+  {
+    termios tty{};
+    if (tcgetattr(serial_fd_, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcgetattr failed: %s", std::strerror(errno));
+      return false;
+    }
+
+    // Wake as soon as at least one byte is available. Packet assembly is
+    // handled by rx_buffer_, not by read().
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 1;
+
+    if (tcsetattr(serial_fd_, TCSANOW, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcsetattr(streaming) failed: %s", std::strerror(errno));
+      return false;
+    }
+    return true;
+  }
+
+  bool write_all(const std::vector<uint8_t> & command)
+  {
+    std::size_t sent = 0;
+    while (sent < command.size()) {
+      const ssize_t n = write(
+        serial_fd_, command.data() + sent, command.size() - sent);
+      if (n > 0) {
+        sent += static_cast<std::size_t>(n);
+      } else if (n < 0 && errno == EINTR) {
+        continue;
+      } else {
+        RCLCPP_ERROR(get_logger(), "serial write failed: %s", std::strerror(errno));
+        return false;
+      }
+    }
+    tcdrain(serial_fd_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    return true;
+  }
+
+  void drain_command_response(
+    std::chrono::milliseconds quiet_period = std::chrono::milliseconds(20))
+  {
+    std::array<uint8_t, 256> temp{};
+    auto last_data = std::chrono::steady_clock::now();
+
+    while (std::chrono::steady_clock::now() - last_data < quiet_period) {
+      const ssize_t n = read(serial_fd_, temp.data(), temp.size());
+      if (n > 0) {
+        last_data = std::chrono::steady_clock::now();
+      } else if (n < 0 && errno != EINTR && errno != EAGAIN) {
+        RCLCPP_WARN(get_logger(), "response drain read failed: %s", std::strerror(errno));
+        break;
+      }
+    }
+  }
+
+  bool send_command(const std::vector<uint8_t> & command, bool drain = true)
+  {
+    if (!write_all(command)) {
+      return false;
+    }
+    if (drain) {
+      drain_command_response();
+    }
+    return true;
+  }
+
+  bool initialize_sensor()
+  {
+    RCLCPP_INFO(get_logger(), "Initializing MMS101 on %s", port_name_.c_str());
+
+    if (!send_command({0x54, 0x02, 0x10, 0x00})) return false;
+    if (!send_command({0x54, 0x03, 0x36, 0x00, 0x01})) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!send_command({0x54, 0x03, 0x36, 0x05, 0x01})) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    for (uint8_t axis = 0; axis < 6; ++axis) {
+      if (!send_command({0x54, 0x02, 0x1C, axis})) return false;
+      if (!send_command({0x53, 0x02, 0x57, 0x94})) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+
+    if (!send_command({0x54, 0x01, 0xB0})) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // 1000 us = 1 ms = 1000 Hz.
+    if (!send_command({0x54, 0x04, 0x43, 0x00, 0x03, 0xE8})) return false;
+
+    // Start continuous measurement. Do not drain afterwards because the
+    // subsequent bytes are the measurement stream itself.
+    if (!send_command({0x54, 0x02, 0x23, 0x00}, false)) return false;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return true;
+  }
+
+  void stop_measurement()
+  {
+    const std::vector<uint8_t> command{0x54, 0x01, 0x33};
+    (void)write_all(command);
+  }
+
+  static int32_t parse_24bit_be(const uint8_t * data)
+  {
+    int32_t value =
+      (static_cast<int32_t>(data[0]) << 16) |
+      (static_cast<int32_t>(data[1]) << 8) |
+      static_cast<int32_t>(data[2]);
+
+    if ((value & 0x800000) != 0) {
+      value |= static_cast<int32_t>(0xFF000000);
+    }
+    return value;
+  }
+
+  static uint32_t parse_timestamp(const uint8_t * packet)
+  {
+    return
+      (static_cast<uint32_t>(packet[22]) << 16) |
+      (static_cast<uint32_t>(packet[23]) << 8) |
+      static_cast<uint32_t>(packet[24]);
+  }
+
+  static uint32_t counter_delta(uint32_t newer, uint32_t older)
+  {
+    return (newer + SENSOR_COUNTER_MOD - older) % SENSOR_COUNTER_MOD;
+  }
+
+  void reset_timebase()
+  {
+    timebase_initialized_ = false;
+    sensor_base_time_ = 0;
+    last_sensor_time_ = 0;
+  }
+
+  void process_packet(const uint8_t * packet)
+  {
+    const rclcpp::Time stamp = this->now();
+
+    const double fx = parse_24bit_be(&packet[4]) * force_scale_;
+    const double fy = parse_24bit_be(&packet[7]) * force_scale_;
+    const double fz = parse_24bit_be(&packet[10]) * force_scale_;
+    const double mx = parse_24bit_be(&packet[13]) * torque_scale_;
+    const double my = parse_24bit_be(&packet[16]) * torque_scale_;
+    const double mz = parse_24bit_be(&packet[19]) * torque_scale_;
+
+    geometry_msgs::msg::WrenchStamped message;
+    message.header.stamp = stamp;
+    message.header.frame_id = frame_id_;
+
+    message.wrench.force.x = fx;
+    message.wrench.force.y = fy;
+    message.wrench.force.z = fz;
+    message.wrench.torque.x = mx;
+    message.wrench.torque.y = my;
+    message.wrench.torque.z = mz;
+
+    publisher_->publish(message);
+    valid_packets_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void parse_available_packets()
+  {
+    while (rx_buffer_.size() >= 2) {
+      std::size_t header_pos = rx_buffer_.size();
+      for (std::size_t i = 0; i + 1 < rx_buffer_.size(); ++i) {
+        if (rx_buffer_[i] == HEADER0 && rx_buffer_[i + 1] == HEADER1) {
+          header_pos = i;
+          break;
+        }
+      }
+
+      if (header_pos == rx_buffer_.size()) {
+        // Preserve a possible first header byte at the end.
+        const bool keep_last_zero = rx_buffer_.back() == HEADER0;
+        const std::size_t remove_count =
+          rx_buffer_.size() - (keep_last_zero ? 1U : 0U);
+        discarded_bytes_.fetch_add(remove_count, std::memory_order_relaxed);
+        rx_buffer_.erase(
+          rx_buffer_.begin(),
+          rx_buffer_.begin() + static_cast<std::ptrdiff_t>(remove_count));
+        return;
+      }
+
+      if (header_pos > 0) {
+        discarded_bytes_.fetch_add(header_pos, std::memory_order_relaxed);
+        rx_buffer_.erase(
+          rx_buffer_.begin(),
+          rx_buffer_.begin() + static_cast<std::ptrdiff_t>(header_pos));
+      }
+
+      if (rx_buffer_.size() < PACKET_SIZE) {
+        return;
+      }
+
+      process_packet(rx_buffer_.data());
+      rx_buffer_.erase(
+        rx_buffer_.begin(),
+        rx_buffer_.begin() + static_cast<std::ptrdiff_t>(PACKET_SIZE));
+    }
+  }
+
+  void read_loop()
+  {
+    std::array<uint8_t, 512> temp{};
+    rx_buffer_.reserve(4096);
+
+    while (running_ && rclcpp::ok()) {
+      const ssize_t n = read(serial_fd_, temp.data(), temp.size());
+      read_calls_.fetch_add(1, std::memory_order_relaxed);
+
+      if (n > 0) {
+        bytes_received_.fetch_add(
+          static_cast<uint64_t>(n), std::memory_order_relaxed);
+        rx_buffer_.insert(rx_buffer_.end(), temp.begin(), temp.begin() + n);
+        parse_available_packets();
+        rx_pending_.store(rx_buffer_.size(), std::memory_order_relaxed);
+
+        if (rx_buffer_.size() > 64 * 1024) {
+          RCLCPP_ERROR(
+            get_logger(),
+            "Serial receive buffer grew beyond 64 KiB; clearing it");
+          discarded_bytes_.fetch_add(rx_buffer_.size(), std::memory_order_relaxed);
+          rx_buffer_.clear();
+          rx_pending_.store(0, std::memory_order_relaxed);
+          reset_timebase();
+        }
+      } else if (n == 0) {
+        continue;
+      } else if (errno == EINTR || errno == EAGAIN) {
+        continue;
+      } else {
+        read_errors_.fetch_add(1, std::memory_order_relaxed);
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "serial read failed: %s", std::strerror(errno));
+      }
+    }
+  }
+
+  void report_diagnostics()
+  {
+    const uint64_t bytes = bytes_received_.load();
+    const uint64_t packets = valid_packets_.load();
+    const uint64_t discarded = discarded_bytes_.load();
+    const uint64_t gaps = timestamp_gap_events_.load();
+    const uint64_t errors = read_errors_.load();
+
+    const uint64_t byte_rate = bytes - previous_bytes_;
+    const uint64_t packet_rate = packets - previous_packets_;
+    const uint64_t discarded_delta = discarded - previous_discarded_;
+    const uint64_t gap_delta = gaps - previous_gaps_;
+    const uint64_t error_delta = errors - previous_errors_;
+
+    previous_bytes_ = bytes;
+    previous_packets_ = packets;
+    previous_discarded_ = discarded;
+    previous_gaps_ = gaps;
+    previous_errors_ = errors;
+
+    RCLCPP_INFO(
+      get_logger(),
+      "[MMS101 diag] port=%s packets=%lu/s bytes=%lu/s "
+      "discarded=%lu/s read_errors=%lu/s rx_pending=%zu",
+      port_name_.c_str(),
+      static_cast<unsigned long>(packet_rate),
+      static_cast<unsigned long>(byte_rate),
+      static_cast<unsigned long>(discarded_delta),
+      static_cast<unsigned long>(error_delta),
+      rx_pending_.load(std::memory_order_relaxed)
+    );
+  }
+};
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  try {
+    rclcpp::spin(std::make_shared<MMS101Node>());
+  } catch (const std::exception & error) {
+    RCLCPP_FATAL(
+      rclcpp::get_logger("mms101_driver"),
+      "Fatal error: %s", error.what());
+  }
+  rclcpp::shutdown();
+  return 0;
+}

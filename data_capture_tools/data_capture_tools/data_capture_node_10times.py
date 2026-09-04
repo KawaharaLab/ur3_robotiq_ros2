@@ -193,9 +193,6 @@ class DataCaptureNode(Node):
         # __init__ メソッド内の適当な場所に追加
         self._calibrated_target_m = None  # ★キャリブレーション済みの目標押し込み幅
         
-        # --- 追加: GelSightの監視用変数 ---
-        self._last_gelsight_msg_time = time.time()
-        self._gelsight_timeout_sec = 2.0  # 2秒以上届かなければ停止とみなす
         
         # --- 追加: 左右のGelSight監視用変数 ---
         self._last_gelsight_left_time = time.time()
@@ -327,10 +324,6 @@ class DataCaptureNode(Node):
         if not self._check_sensors_health():
             self.get_logger().error("センサーの停止を検知したため、自動ループを開始できません。")
             return
-
-        if self._calibrated_target_m is None:
-            self.get_logger().error("エラー: 目標押し込み幅が未設定です。先に [i] (Init) を実行してください。")
-            return
         
         # ★ 安全装置：Initが実行されていない場合は警告して弾く
         if self._calibrated_target_m is None:
@@ -353,7 +346,7 @@ class DataCaptureNode(Node):
         
         for i in range(total_count):
             if not self._check_sensors_health():
-                self.get_logger().error("🚨 試行中にセンサーの停止を検知しました。ループを中断します。")
+                self.get_logger().error("試行中にセンサーの停止を検知しました。ループを中断します。")
                 if self._bag_process: 
                     self._stop_rosbag()
                 break
@@ -877,9 +870,16 @@ class DataCaptureNode(Node):
                 self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
                 self._sequence_finished_event.wait(timeout=5.0)
                 
-                # 計算された shift_dist でアームを逃がす
                 shift_dir = -1.0 if f_l > f_r else 1.0
-                move_arm_incremental(shift_dir * shift_dist)
+                move_dist = shift_dir * shift_dist
+
+                move_arm_incremental(move_dist)
+                current_pos += move_dist
+
+                self.get_logger().info(
+                    f"アーム位置更新: 今回={move_dist*1000:.2f}mm, "
+                    f"累積={current_pos*1000:.2f}mm"
+                )
                 
                 time.sleep(0.5)
                 self._force_monitor.tare()
@@ -891,7 +891,16 @@ class DataCaptureNode(Node):
                 self.get_logger().info(f"片方のみ接触({touched_side})。アーム位置を微調整します。")
                 
                 shift_dir = -1.0 if f_l > f_r else 1.0
-                move_arm_incremental(shift_dir * 0.0005)
+                move_dist = shift_dir * 0.0005
+
+                move_arm_incremental(move_dist)
+                current_pos += move_dist
+
+                self.get_logger().info(
+                    f"アーム位置更新: 今回={move_dist*1000:.2f}mm, "
+                    f"累積={current_pos*1000:.2f}mm"
+                )
+
                 time.sleep(0.5)
                 self._force_monitor.tare()
                 continue
@@ -1486,16 +1495,16 @@ class DataCaptureNode(Node):
         right_gs_ok = (now - self._last_gelsight_right_time) < self._gelsight_timeout_sec
         
         if not left_gs_ok:
-            self.get_logger().error(f"🚨 左のGelSight(gelsight1)が停止しています！")
+            self.get_logger().error(f"左のGelSight(gelsight1)が停止しています！")
             all_ok = False
         if not right_gs_ok:
-            self.get_logger().error(f"🚨 右のGelSight(gelsight2)が停止しています！")
+            self.get_logger().error(f"右のGelSight(gelsight2)が停止しています！")
             all_ok = False
             
         # --- 2. 力覚センサのチェック ---
         force_ok, force_err_str = self._force_monitor.get_health_status()
         if not force_ok:
-            self.get_logger().error(f"🚨 力覚センサの異常を検知: {force_err_str}")
+            self.get_logger().error(f"力覚センサの異常を検知: {force_err_str}")
             all_ok = False
             
         return all_ok
