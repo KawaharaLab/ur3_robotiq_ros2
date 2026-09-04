@@ -1,8 +1,8 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/dicomo/after_dicomo_data_test
-task_name: object14_4mm
+output_root: /mnt/nvme1/tsumura/afterdicomo/after_dicomo_data_test
+task_name: object22
 prompt: ""
-label: "ふかふか, fuka-fuka" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
+label: "しょりしょり, syori-syori" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa", "もちもち, mochi-mochi", "しょりしょり, syori-syori"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # 基本姿勢
 # 低い方
@@ -26,10 +26,10 @@ base_tcp_pose:
 #   rz: -0.010
 
 # 実験パラメータ
-target_diameter: 0.070 # 物体幅 (mm) #クランプ:49mm
-gripper_offset: 0.000 # デバイス誤差 (mm)
-arm_offset: -0.012 # アームの位置誤差 (mm)
-push_depth: 0.002 # 押し込み量 (mm)
+target_diameter: 0.050 # 物体幅 (m) #クランプ:60
+gripper_offset: 0.000 # デバイス誤差 (m)
+arm_offset: -0.000 # アームの位置誤差 (m)
+push_depth: 0.002 # 押し込み量 (m)
 
 # センタリング・接触検知パラメータ
 contact_threshold: 0.03      # 接触判定の閾値 (N)
