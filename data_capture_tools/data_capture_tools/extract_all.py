@@ -126,7 +126,7 @@ def run_as_node():
     """
     ros2 run から呼び出されるエントリーポイント
     """
-    DICOMO_DATA_ROOT = "/mnt/nvme1/tsumura/afterdicomo/after_dicomo_data_test"
+    DICOMO_DATA_ROOT = "/mnt/nvme1/tsumura/afterDICOMO/after_dicomo_data_test"
     CONFIG_PATH = "/home/tsumura/my_robotiq_ws/src/ur3_robotiq_ros2/data_capture_tools/config/data_capture_extract.yaml"
     
     # 割り当てるCPUプロセス数を指定したい場合は max_workers を変更してください
