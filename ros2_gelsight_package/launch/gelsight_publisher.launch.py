@@ -23,7 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('topic_2', default_value='gelsight/right/image_raw', description='Topic for camera 2 images'),
         DeclareLaunchArgument('frame_2', default_value='gelsight2', description='Frame id for camera 2'),
 
-        DeclareLaunchArgument('publish_rate', default_value='15.0', description='Publish rate (Hz) for both cameras'),
+        DeclareLaunchArgument('publish_rate', default_value='25.0', description='Publish rate (Hz) for both cameras'),
         DeclareLaunchArgument('enable_compressed', default_value='true', description='If true, also publish compressed topics directly from the GelSight node'),
         DeclareLaunchArgument('compressed_quality', default_value='90', description='JPEG quality (1-100) for compressed output'),
     ]

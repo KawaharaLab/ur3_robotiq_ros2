@@ -141,14 +141,14 @@ class GelSightMini:
             cam.open()
             
             # 【重要追加】OpenCVのバッファサイズを最小(1)に制限し、常に最新フレームを取得する
-            cam.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cam.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
             
             cam.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
             cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             cam.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
 
             # ⬇️ 【ここを追加】カメラに対してネイティブ30fpsでの動作を要求する
-            cam.cap.set(cv2.CAP_PROP_FPS, 30)
+            # cam.cap.set(cv2.CAP_PROP_FPS, 30)
             
             if cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH) != self.target_width:
                 cam.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
