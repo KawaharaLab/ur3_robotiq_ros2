@@ -13,6 +13,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <robotiq_2f_gripper_msgs/action/move_two_finger_gripper.hpp>
+#include <robotiq_2f_gripper_msgs/msg/gripper_status.hpp>
 #include <robotiq_2f_gripper_interfaces/default_driver.hpp>
 #include <robotiq_2f_gripper_interfaces/default_serial.hpp>
 
@@ -36,6 +37,7 @@ namespace robotiq_2f_gripper_hardware
         int action_timeout_;
         int slave_address_;
         bool fake_hardware_;
+        double status_poll_rate_hz_;
         std::unique_ptr<DefaultDriver> driver_;
 
         // Topic names
@@ -43,6 +45,7 @@ namespace robotiq_2f_gripper_hardware
         std::string joint_state_topic = "robotiq_2f_gripper/joint_states";
         std::string object_grasped_topic = "robotiq_2f_gripper/object_grasped";
         std::string finger_distance_mm_topic = "robotiq_2f_gripper/finger_distance_mm";
+        std::string status_topic = "robotiq_2f_gripper/status";
         std::string confidence_command_topic = "robotiq_2f_gripper/confidence_command";
         std::string binary_command_topic = "robotiq_2f_gripper/binary_command";
 
@@ -68,6 +71,7 @@ namespace robotiq_2f_gripper_hardware
         rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
         rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr object_grasped_publisher_;
         rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr finger_distance_mm_publisher_;
+        rclcpp::Publisher<robotiq_2f_gripper_msgs::msg::GripperStatus>::SharedPtr status_publisher_;
         rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_confidence_command_subscriber_;
         rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_binary_command_subscriber_;
 

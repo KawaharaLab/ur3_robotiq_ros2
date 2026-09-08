@@ -4,7 +4,7 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, Command, FindExecutable
+from launch.substitutions import LaunchConfiguration, Command
 
 
 def generate_launch_description():
@@ -43,6 +43,13 @@ def generate_launch_description():
         default_value='False',
         description='Whether to use fake hardware (if real hardware is not available)'
     )
+    status_poll_rate_arg = DeclareLaunchArgument(
+        'status_poll_rate_hz',
+        default_value='20.0',
+        description=(
+            'Status polling rate in Hz; must be greater than 0 and at most 100'
+        )
+    )
     config_file_arg = DeclareLaunchArgument(
         'config_file',
         default_value='',
@@ -67,7 +74,8 @@ def generate_launch_description():
             'timeout': LaunchConfiguration('timeout'),
             'action_timeout': LaunchConfiguration('action_timeout'),
             'slave_address': LaunchConfiguration('slave_address'),
-            'fake_hardware': LaunchConfiguration('fake_hardware')
+            'fake_hardware': LaunchConfiguration('fake_hardware'),
+            'status_poll_rate_hz': LaunchConfiguration('status_poll_rate_hz')
         }]
     )
 
@@ -115,6 +123,7 @@ def generate_launch_description():
         action_timeout_arg,
         slave_address_arg,
         fake_hardware_arg,
+        status_poll_rate_arg,
         config_file_arg,
         rviz2_arg,
         robotiq_2f_gripper_node,

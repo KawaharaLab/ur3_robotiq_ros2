@@ -12,6 +12,7 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(robotiq_2f_gripper_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -33,6 +34,7 @@ target_link_libraries(robotiq_2f_gripper_node
 ament_target_dependencies(robotiq_2f_gripper_node 
   rclcpp
   rclcpp_action
+  rcl_interfaces
   hardware_interface 
   pluginlib 
   serial

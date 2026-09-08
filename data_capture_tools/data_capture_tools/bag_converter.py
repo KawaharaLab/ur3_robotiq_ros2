@@ -83,7 +83,7 @@ def _prepare_message_types(topic_specs: Iterable[TopicSpec]) -> Dict[str, type]:
 
 def _maybe_decompress_file_bag(
     bag_uri: Path,
-    config: CaptureConfig,
+    config: Optional[CaptureConfig] = None,
     logger=None,
     allow_corrupt_zstd: bool = False,
 ) -> tuple[Path, Optional[tempfile.TemporaryDirectory]]:

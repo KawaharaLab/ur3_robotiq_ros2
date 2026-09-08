@@ -69,7 +69,10 @@ constexpr int kWriteResponseSize = 8;
 
 constexpr size_t kResponseHeaderSize = 3;
 constexpr size_t kGripperStatusIndex = 0;
+constexpr size_t kFaultStatusIndex = 2;
+constexpr size_t kRequestedPositionIndex = 3;
 constexpr size_t kPositionIndex = 4;
+constexpr size_t kCurrentIndex = 5;
 
 // If the gripper connection is not stable we may want to try sending the command again.
 constexpr auto kMaxRetries = 5;
@@ -209,6 +212,17 @@ void DefaultDriver::set_force(uint8_t force)
   commanded_gripper_force_ = force;
 }
 
+DefaultDriver::StatusRegisters DefaultDriver::read_status()
+{
+  update_status();
+  return status_registers_;
+}
+
+DefaultDriver::StatusRegisters DefaultDriver::get_last_status() const
+{
+  return status_registers_;
+}
+
 bool DefaultDriver::is_gripper_active()
 {
   update_status();
@@ -266,6 +280,14 @@ void DefaultDriver::update_status()
   // Process the response.
   uint8_t gripper_status_byte = response[kResponseHeaderSize + kGripperStatusIndex];
 
+  // Retain the raw feedback values from this same Modbus response. gOBJ is
+  // encoded in the upper two bits of the status byte; preserve both bits.
+  status_registers_.g_obj = (gripper_status_byte & 0xC0) >> 6;
+  status_registers_.g_flt = response[kResponseHeaderSize + kFaultStatusIndex];
+  status_registers_.g_pr = response[kResponseHeaderSize + kRequestedPositionIndex];
+  status_registers_.g_po = response[kResponseHeaderSize + kPositionIndex];
+  status_registers_.g_cu = response[kResponseHeaderSize + kCurrentIndex];
+
   // Activation status.
   activation_status_ = ((gripper_status_byte & 0x01) == 0x00) ? ActivationStatus::RESET : ActivationStatus::ACTIVE;
 
@@ -287,7 +309,7 @@ void DefaultDriver::update_status()
   }
 
   // Object detection status.
-  switch ((gripper_status_byte & 0xC0) >> 6)
+  switch (status_registers_.g_obj)
   {
     case 0x00:
       object_detection_status_ = ObjectDetectionStatus::MOVING;
@@ -304,6 +326,6 @@ void DefaultDriver::update_status()
   }
 
   // Read the current gripper position.
-  gripper_position_ = response[kResponseHeaderSize + kPositionIndex];
+  gripper_position_ = status_registers_.g_po;
 }
 }  // namespace robotiq_2f_gripper_interfaces

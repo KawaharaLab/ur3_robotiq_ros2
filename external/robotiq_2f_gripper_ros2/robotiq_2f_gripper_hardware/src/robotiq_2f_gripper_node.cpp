@@ -4,8 +4,10 @@
 #include <memory>
 #include <cmath>
 #include <fstream>
+#include <stdexcept>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <std_msgs/msg/bool.hpp>
 
@@ -62,6 +64,17 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
     fake_hardware_ = get_parameter("fake_hardware").as_bool();
     RCLCPP_INFO(get_logger(), "Using fake hardware: %s", fake_hardware_ ? "true" : "false");
 
+    auto poll_rate_descriptor = rcl_interfaces::msg::ParameterDescriptor();
+    poll_rate_descriptor.description = "Startup-only status polling rate in Hz; valid range is (0, 100]";
+    poll_rate_descriptor.read_only = true;
+    declare_parameter<double>("status_poll_rate_hz", 20.0, poll_rate_descriptor);
+    status_poll_rate_hz_ = get_parameter("status_poll_rate_hz").as_double();
+    if (!std::isfinite(status_poll_rate_hz_) || status_poll_rate_hz_ <= 0.0 || status_poll_rate_hz_ > 100.0)
+    {
+        throw std::invalid_argument("status_poll_rate_hz must be finite and in the range (0, 100]");
+    }
+    RCLCPP_INFO(get_logger(), "Using status polling rate: %.3f Hz", status_poll_rate_hz_);
+
     if (!fake_hardware_)
     {
         auto serial = std::make_unique<DefaultSerial>();
@@ -96,8 +109,11 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
 
     joint_state_publisher_ = create_publisher<sensor_msgs::msg::JointState>(joint_state_topic, 1);
     finger_distance_mm_publisher_ = create_publisher<std_msgs::msg::Float32>(finger_distance_mm_topic, 1);
+    status_publisher_ = create_publisher<robotiq_2f_gripper_msgs::msg::GripperStatus>(status_topic, 10);
+    const auto status_poll_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / status_poll_rate_hz_));
     timer_1_ = create_wall_timer(
-        std::chrono::milliseconds(50), std::bind(&GripperNode::update_joint_state_callback, this));
+        status_poll_period, std::bind(&GripperNode::update_joint_state_callback, this));
 
     object_grasped_publisher_ = create_publisher<std_msgs::msg::Bool>(object_grasped_topic, 1);
     timer_2_ = create_wall_timer(
@@ -234,7 +250,22 @@ void GripperNode::update_joint_state_callback()
     double finger_distance_mm;
     if (!fake_hardware_)
     {
-        curr_gripper_position = static_cast<int>(driver_->get_gripper_position());
+        // All fields and the derived width below come from this one Modbus read.
+        const auto read_start = std::chrono::steady_clock::now();
+        const auto status = driver_->read_status();
+        const auto read_end = std::chrono::steady_clock::now();
+        const auto acquisition_stamp = now();
+        curr_gripper_position = static_cast<int>(status.g_po);
+
+        auto status_msg = robotiq_2f_gripper_msgs::msg::GripperStatus();
+        status_msg.header.stamp = acquisition_stamp;
+        status_msg.g_obj = status.g_obj;
+        status_msg.g_flt = status.g_flt;
+        status_msg.g_pr = status.g_pr;
+        status_msg.g_po = status.g_po;
+        status_msg.g_cu = status.g_cu;
+        status_msg.read_duration_ms = std::chrono::duration<float, std::milli>(read_end - read_start).count();
+        status_publisher_->publish(status_msg);
 
         // Calculate the finger distance in millimeters using the existing function
         finger_distance_mm = convertToMeters(curr_gripper_position) * 1000; // Convert from meters to mm
@@ -277,7 +308,10 @@ void GripperNode::update_object_grasped_callback()
     auto message = std_msgs::msg::Bool();
     if (!fake_hardware_)
     {
-        message.data = {static_cast<bool>(driver_->is_object_grasped())};
+        // Reuse the last complete status snapshot; do not issue a second read
+        // whose register values would have no corresponding stamped message.
+        const auto status = driver_->get_last_status();
+        message.data = (status.g_obj == 1 || status.g_obj == 2);
     }
     else
     {

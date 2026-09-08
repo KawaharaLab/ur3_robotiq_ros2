@@ -11,6 +11,7 @@
 
   <depend>launch</depend>
   <depend>launch_ros</depend>
+  <depend>rcl_interfaces</depend>
   <depend>robotiq_2f_gripper_interfaces</depend>
   <depend>robotiq_2f_gripper_msgs</depend>
   <depend>yaml-cpp</depend>

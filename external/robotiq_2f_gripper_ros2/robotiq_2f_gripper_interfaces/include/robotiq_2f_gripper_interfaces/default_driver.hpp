@@ -45,6 +45,15 @@ namespace robotiq_2f_gripper_interfaces
 class DefaultDriver : public Driver
 {
 public:
+  struct StatusRegisters
+  {
+    uint8_t g_obj;
+    uint8_t g_flt;
+    uint8_t g_pr;
+    uint8_t g_po;
+    uint8_t g_cu;
+  };
+
   explicit DefaultDriver(std::unique_ptr<Serial> serial);
 
   bool connect() override;
@@ -93,6 +102,12 @@ public:
    */
   void set_force(uint8_t force) override;
 
+  /** Read and retain all feedback registers used for gripper observability. */
+  StatusRegisters read_status();
+
+  /** Return the most recently retained status without performing an I/O read. */
+  StatusRegisters get_last_status() const;
+
 private:
   /**
    * With this command we send a request and wait for a response of given size.
@@ -125,5 +140,6 @@ private:
   uint8_t gripper_position_;
   uint8_t commanded_gripper_speed_;
   uint8_t commanded_gripper_force_;
+  StatusRegisters status_registers_{};
 };
 }  // namespace robotiq_2f_gripper_interfaces
