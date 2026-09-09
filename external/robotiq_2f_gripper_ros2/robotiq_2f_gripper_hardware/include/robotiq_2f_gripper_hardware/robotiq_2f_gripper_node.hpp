@@ -90,6 +90,10 @@ namespace robotiq_2f_gripper_hardware
         void execute(const std::shared_ptr<rclcpp_action::ServerGoalHandle<SetPosition>> goal_handle);
         void update_joint_state_callback();
         void update_object_grasped_callback();
+        void publish_hardware_status(
+            const DefaultDriver::StatusRegisters &status,
+            const rclcpp::Time &acquisition_stamp,
+            float read_duration_ms);
         void gripper_command_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
         void gripper_binary_command_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
 

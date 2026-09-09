@@ -58,6 +58,10 @@ class CaptureConfig:
     centering_min_step_arm: float
     centering_min_step_grip: float
     safe_margin: float      # ★追加
+    loading_speed_mode: str
+    fixed_loading_speed: float
+    random_loading_speed_min: float
+    random_loading_speed_max: float
     # ----------------------------------
     # --- 追加: base_tcp_pose を定義 ---
     base_tcp_pose: PoseConfig
@@ -138,6 +142,20 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
     centering_min_step_arm = float(data.get("centering_min_step_arm", 0.0001))
     centering_min_step_grip = float(data.get("centering_min_step_grip", 0.0005))
     safe_margin = float(data.get("safe_margin", 0.020))
+    loading_speed_mode = str(data.get("loading_speed_mode", "random")).lower()
+    if loading_speed_mode not in {"fixed", "random"}:
+        raise ValueError("loading_speed_mode must be either 'fixed' or 'random'")
+    fixed_loading_speed = float(data.get("fixed_loading_speed", 0.1))
+    random_loading_speed_min = float(data.get("random_loading_speed_min", 0.05))
+    random_loading_speed_max = float(data.get("random_loading_speed_max", 0.2))
+    if not 0.0 <= fixed_loading_speed <= 1.0:
+        raise ValueError("fixed_loading_speed must be in [0, 1]")
+    if not (
+        0.0 <= random_loading_speed_min <= random_loading_speed_max <= 1.0
+    ):
+        raise ValueError(
+            "random loading speed bounds must satisfy 0 <= min <= max <= 1"
+        )
     # --------------------------------------------
     initial_arm_pose = data.get("initial_arm_pose", [1.7317156838287737, -1.40045219180025, 1.1475539831862718, -1.3247049022636963, -1.5844098949604524, 0.9487609813841176])
     image_throttle_hz = float(data.get("image_throttle_hz", 10.0))
@@ -174,6 +192,10 @@ def load_capture_config(config_path: str | Path) -> CaptureConfig:
         centering_min_step_arm=centering_min_step_arm,
         centering_min_step_grip=centering_min_step_grip,
         safe_margin=safe_margin, # ★追加
+        loading_speed_mode=loading_speed_mode,
+        fixed_loading_speed=fixed_loading_speed,
+        random_loading_speed_min=random_loading_speed_min,
+        random_loading_speed_max=random_loading_speed_max,
         # ----------------------------
         initial_arm_pose=initial_arm_pose,
         base_tcp_pose=base_tcp_pose,         # 追加

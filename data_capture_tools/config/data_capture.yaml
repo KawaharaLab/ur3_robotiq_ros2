@@ -1,6 +1,6 @@
 # Example configuration for data_capture_tools
 output_root: /mnt/nvme1/tsumura/afterDICOMO/after_dicomo_data_test
-task_name: object12_6mm
+task_name: object12_test
 prompt: ""
 label: "ぷにぷに, puni-puni" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
@@ -31,6 +31,13 @@ gripper_offset: 0.000 # デバイス誤差 (m)
 arm_offset: -0.000 # アームの位置誤差 (m)
 push_depth: 0.006 # 押し込み量 (m)
 
+# Loading speed policy. Use "fixed" for repeatability pilots; "random" keeps
+# the existing data-augmentation behavior.
+loading_speed_mode: random
+fixed_loading_speed: 0.100
+random_loading_speed_min: 0.050
+random_loading_speed_max: 0.200
+
 # センタリング・接触検知パラメータ
 contact_threshold: 0.03      # 接触判定の閾値 (N)
 contact_margin: 0.2        # 接触判定の余白 (N)
@@ -60,6 +67,12 @@ topics:
     type: sensor_msgs/msg/Image
     mode: image
     encoding: bgr8
+  - name: /camera_wrist/realsense2_camera/color/metadata
+    type: realsense2_camera_msgs/msg/Metadata
+    mode: csv
+  - name: /camera_fixed/realsense2_camera/color/metadata
+    type: realsense2_camera_msgs/msg/Metadata
+    mode: csv
   - name: /gelsight/left/image_raw
     type: sensor_msgs/msg/Image
     mode: image
@@ -89,6 +102,14 @@ topics:
   - name: /robotiq_2f_gripper/finger_distance_mm
     type: std_msgs/msg/Float32
     mode: csv
+  # Packet-reception stamped raw status. g_po is driver-derived aperture state,
+  # not indentation of the contacted object.
+  - name: /robotiq_2f_gripper/status
+    type: robotiq_2f_gripper_msgs/msg/GripperStatus
+    mode: csv
+  - name: /robotiq_2f_gripper/joint_states
+    type: sensor_msgs/msg/JointState
+    mode: csv
   - name: /robotiq_2f_gripper_action_goal
     type: std_msgs/msg/Float32MultiArray
     mode: csv
@@ -101,6 +122,15 @@ topics:
     # --- 以下の 3 行を追記 ---
   - name: /trial_marker
     type: std_msgs/msg/String
+    mode: csv
+  - name: /trial_event
+    type: robotiq_2f_gripper_msgs/msg/TrialEvent
+    mode: csv
+  - name: /robot_action_event
+    type: robotiq_2f_gripper_msgs/msg/RobotActionEvent
+    mode: csv
+  - name: /current_phase
+    type: std_msgs/msg/Int32
     mode: csv
 
 # 低い方

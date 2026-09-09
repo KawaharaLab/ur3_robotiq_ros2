@@ -221,10 +221,73 @@ void GripperNode::execute(
         {
             driver_->set_force(convertToGripperSystem(goal->target_force));
             driver_->set_speed(convertToGripperSystem(goal->target_speed));
-            driver_->set_gripper_position(convertToGripperSystemPosition(goal->target_position));
-            RCLCPP_INFO(get_logger(), "Gripper command sent (non-blocking).");
+            const auto requested_position = static_cast<uint8_t>(
+                convertToGripperSystemPosition(goal->target_position));
+            driver_->set_gripper_position(requested_position);
+            RCLCPP_INFO(get_logger(), "Gripper command sent; waiting for physical completion.");
+
+            const auto start_time = std::chrono::steady_clock::now();
+            const auto timeout = std::chrono::seconds(action_timeout_);
+            const auto poll_period = std::chrono::duration<double>(1.0 / status_poll_rate_hz_);
+            while (rclcpp::ok() && std::chrono::steady_clock::now() - start_time < timeout)
+            {
+                if (goal_handle->is_canceling())
+                {
+                    running_ = false;
+                    result->success = false;
+                    goal_handle->canceled(result);
+                    RCLCPP_INFO(get_logger(), "Gripper action canceled.");
+                    return;
+                }
+
+                const auto read_start = std::chrono::steady_clock::now();
+                const auto status = driver_->read_status();
+                const auto read_end = std::chrono::steady_clock::now();
+                const auto acquisition_stamp = now();
+                publish_hardware_status(
+                    status, acquisition_stamp,
+                    std::chrono::duration<float, std::milli>(read_end - read_start).count());
+
+                if (status.g_flt != 0)
+                {
+                    running_ = false;
+                    result->success = false;
+                    goal_handle->abort(result);
+                    RCLCPP_ERROR(get_logger(), "Gripper fault while moving: gFLT=%u", status.g_flt);
+                    return;
+                }
+
+                // gOBJ=0 means motion is still in progress. Values 1/2 are
+                // object-detected stops. For gOBJ=3, also require the measured
+                // position to reach the target; this prevents a stale gOBJ=3
+                // response immediately after updating gPR from ending the
+                // action before physical motion has completed.
+                const bool object_detected = status.g_obj == 1 || status.g_obj == 2;
+                const bool reached_position =
+                    status.g_obj == 3 &&
+                    std::abs(static_cast<int>(status.g_po) - static_cast<int>(requested_position)) <= 1;
+                if (status.g_pr == requested_position && (object_detected || reached_position))
+                {
+                    running_ = false;
+                    result->success = true;
+                    goal_handle->succeed(result);
+                    RCLCPP_INFO(
+                        get_logger(),
+                        "Gripper physical completion: gOBJ=%u gPR=%u gPO=%u",
+                        status.g_obj, status.g_pr, status.g_po);
+                    return;
+                }
+                std::this_thread::sleep_for(poll_period);
+            }
+
+            running_ = false;
+            result->success = false;
+            goal_handle->abort(result);
+            RCLCPP_ERROR(get_logger(), "Gripper action timed out before physical completion.");
+            return;
         }
 
+        running_ = false;
         result->success = true;
         goal_handle->succeed(result);
     }
@@ -245,9 +308,6 @@ void GripperNode::update_joint_state_callback()
         return;
     }
 
-    double curr_gripper_position;
-    double curr_gripper_position_rad;
-    double finger_distance_mm;
     if (!fake_hardware_)
     {
         // All fields and the derived width below come from this one Modbus read.
@@ -255,35 +315,16 @@ void GripperNode::update_joint_state_callback()
         const auto status = driver_->read_status();
         const auto read_end = std::chrono::steady_clock::now();
         const auto acquisition_stamp = now();
-        curr_gripper_position = static_cast<int>(status.g_po);
-
-        auto status_msg = robotiq_2f_gripper_msgs::msg::GripperStatus();
-        status_msg.header.stamp = acquisition_stamp;
-        status_msg.g_obj = status.g_obj;
-        status_msg.g_flt = status.g_flt;
-        status_msg.g_pr = status.g_pr;
-        status_msg.g_po = status.g_po;
-        status_msg.g_cu = status.g_cu;
-        status_msg.read_duration_ms = std::chrono::duration<float, std::milli>(read_end - read_start).count();
-        status_publisher_->publish(status_msg);
-
-        // Calculate the finger distance in millimeters using the existing function
-        finger_distance_mm = convertToMeters(curr_gripper_position) * 1000; // Convert from meters to mm
-
-        if (curr_gripper_position > FULLY_CLOSED_THRESHOLD)
-        {
-            curr_gripper_position_rad = MAX_GRIPPER_POSITION_RAD;
-        }
-        else
-        {
-            curr_gripper_position_rad = curr_gripper_position / FULLY_CLOSED_THRESHOLD * MAX_GRIPPER_POSITION_RAD;
-        }
+        publish_hardware_status(
+            status, acquisition_stamp,
+            std::chrono::duration<float, std::milli>(read_end - read_start).count());
+        return;
     }
-    else
-    {
-        curr_gripper_position_rad = ((-1 * gripper_position_) + MAX_GRIPPER_POSITION_METER) / MAX_GRIPPER_POSITION_METER * MAX_GRIPPER_POSITION_RAD;
-        finger_distance_mm = gripper_position_ * 1000; // Convert from meters to mm
-    }
+
+    const double curr_gripper_position_rad =
+        ((-1 * gripper_position_) + MAX_GRIPPER_POSITION_METER) /
+        MAX_GRIPPER_POSITION_METER * MAX_GRIPPER_POSITION_RAD;
+    const double finger_distance_mm = gripper_position_ * 1000;
 
     // Publish joint state
     auto message = sensor_msgs::msg::JointState();
@@ -296,6 +337,38 @@ void GripperNode::update_joint_state_callback()
     auto distance_msg = std_msgs::msg::Float32();
     distance_msg.data = finger_distance_mm;
     finger_distance_mm_publisher_->publish(distance_msg);
+}
+
+void GripperNode::publish_hardware_status(
+    const DefaultDriver::StatusRegisters &status,
+    const rclcpp::Time &acquisition_stamp,
+    float read_duration_ms)
+{
+    auto status_msg = robotiq_2f_gripper_msgs::msg::GripperStatus();
+    status_msg.header.stamp = acquisition_stamp;
+    status_msg.g_obj = status.g_obj;
+    status_msg.g_flt = status.g_flt;
+    status_msg.g_pr = status.g_pr;
+    status_msg.g_po = status.g_po;
+    status_msg.g_cu = status.g_cu;
+    status_msg.read_duration_ms = read_duration_ms;
+    status_publisher_->publish(status_msg);
+
+    const double raw_position = static_cast<double>(status.g_po);
+    const double finger_distance_mm = convertToMeters(status.g_po) * 1000.0;
+    const double position_rad = raw_position > FULLY_CLOSED_THRESHOLD
+        ? MAX_GRIPPER_POSITION_RAD
+        : raw_position / FULLY_CLOSED_THRESHOLD * MAX_GRIPPER_POSITION_RAD;
+
+    auto joint_state = sensor_msgs::msg::JointState();
+    joint_state.header.stamp = acquisition_stamp;
+    joint_state.name = {"finger_joint"};
+    joint_state.position = {position_rad};
+    joint_state_publisher_->publish(joint_state);
+
+    auto distance = std_msgs::msg::Float32();
+    distance.data = static_cast<float>(finger_distance_mm);
+    finger_distance_mm_publisher_->publish(distance);
 }
 
 void GripperNode::update_object_grasped_callback()

@@ -1,7 +1,9 @@
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "trajectory_msgs/msg/joint_trajectory_point.hpp"
 
 #include "robotiq_2f_gripper_msgs/action/move_two_finger_gripper.hpp"
+#include "robotiq_2f_gripper_msgs/msg/robot_action_event.hpp"
 
 using MoveGripper = robotiq_2f_gripper_msgs::action::MoveTwoFingerGripper;
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
@@ -68,12 +71,13 @@ SequenceStep make_gripper_step(MoveGripper::Goal goal, std::chrono::nanoseconds 
 
 FollowJointTrajectory::Goal create_follow_joint_goal(
     const std::vector<std::string> &joint_names,
-    const std::vector<RawTrajectoryPoint> &points)
+    const std::vector<RawTrajectoryPoint> &points,
+    const rclcpp::Time & stamp)
 {
     FollowJointTrajectory::Goal goal;
     goal.trajectory.joint_names = joint_names;
     // タイムスタンプを現在時刻に設定
-    goal.trajectory.header.stamp = rclcpp::Clock().now();
+    goal.trajectory.header.stamp = stamp;
 
     // --- 修正ポイント: 許容誤差 (Tolerance) の設定 ---
     // 目標位置に対して 0.002 rad (約0.11度) の誤差を許容する
@@ -105,7 +109,8 @@ public:
       arm_client_(rclcpp_action::create_client<FollowJointTrajectory>(this, controller_action_name_)),
       gripper_client_(rclcpp_action::create_client<MoveGripper>(this, "/robotiq_2f_gripper_action")),
       current_step_index_(0),
-      action_in_progress_(false)
+      action_in_progress_(false),
+      current_trial_index_(0)
     {
         // 外部（Python）からのコマンド受信
         cmd_sub_ = this->create_subscription<std_msgs::msg::String>(
@@ -113,6 +118,8 @@ public:
 
         // 現在のフェーズIDの通知用
         phase_pub_ = this->create_publisher<std_msgs::msg::Int32>("/current_phase", 10);
+        action_event_pub_ = this->create_publisher<
+            robotiq_2f_gripper_msgs::msg::RobotActionEvent>("/robot_action_event", 20);
 
         RCLCPP_INFO(this->get_logger(), "PickPlaceClient準備完了。'/robot_cmd' を待機中...");
     }
@@ -124,6 +131,8 @@ private:
 
         std::string cmd = msg->data;
         if (cmd.find("init") == 0) {
+            sequence_kind_ = "init";
+            current_trial_index_ = 0;
             // "init " の後の文字列を取り出す
             std::stringstream ss(cmd.substr(5)); 
             double gripper_width = 0.0;
@@ -148,6 +157,7 @@ private:
         else if (cmd.find("run") == 0) {
             double target_pos = 0.140; 
             double target_speed = 0.1; 
+            int trial_index = 0;
 
             // substr(3) にして "run" の直後（スペース含む）から読み込ませるか、
             // 明示的にスペースをスキップさせます
@@ -155,14 +165,22 @@ private:
             std::stringstream ss(params);
             
             if (ss >> target_pos >> target_speed) {
+                // Optional third argument keeps old command publishers compatible.
+                ss >> trial_index;
                 RCLCPP_INFO(this->get_logger(), "Parsed command: pos=%.3f, speed=%.3f", target_pos, target_speed);
             } else {
                 RCLCPP_WARN(this->get_logger(), "Parse failed for: %s. Using default speed 0.1", cmd.c_str());
             }
             
+            sequence_kind_ = "run";
+            current_trial_index_ = trial_index;
+            publish_action_event(
+                "trial_run_received", 0, "sequence", target_pos, target_speed, true);
             prepare_run_sequence(target_pos, target_speed);
         }
         else if (cmd.find("gripper") == 0) {
+            sequence_kind_ = "gripper";
+            current_trial_index_ = 0;
             double target_pos = 0.1; 
             double target_speed = 0.1; 
 
@@ -181,6 +199,8 @@ private:
         }
         // --- 既存の "gripper" コマンドの下にこれを追加 ---
         else if (cmd.find("step_gripper") == 0) {
+            sequence_kind_ = "step_gripper";
+            current_trial_index_ = 0;
             double target_pos = 0.1; 
             double target_speed = 0.1; 
             double delay_sec = 0.2; // 微小ステップ用のデフォルト待機時間
@@ -204,6 +224,49 @@ private:
 
         current_step_index_ = 0;
         send_next_step();
+    }
+
+    void publish_action_event(
+        const std::string & event,
+        int phase_id,
+        const std::string & action_type,
+        double target_position,
+        double target_speed,
+        bool success)
+    {
+        auto message = robotiq_2f_gripper_msgs::msg::RobotActionEvent();
+        message.header.stamp = this->get_clock()->now();
+        message.event = event;
+        message.trial_index = current_trial_index_;
+        message.phase_id = phase_id;
+        message.action_type = action_type;
+        message.target_position = target_position;
+        message.target_speed = target_speed;
+        message.success = success;
+        action_event_pub_->publish(message);
+    }
+
+    std::string event_name(const SequenceStep & step, const std::string & suffix) const
+    {
+        if (sequence_kind_ == "run") {
+            if (step.phase_id == 1) return "phase1_" + suffix;
+            if (step.phase_id == 2) return "phase2_close_" + suffix;
+            if (step.phase_id == 3) return "phase3_open_" + suffix;
+        }
+        return "phase" + std::to_string(step.phase_id) + "_" + suffix;
+    }
+
+    void publish_step_event(
+        const SequenceStep & step, const std::string & suffix, bool success)
+    {
+        const bool gripper = step.type == StepType::GripperMove;
+        publish_action_event(
+            event_name(step, suffix),
+            step.phase_id,
+            gripper ? "gripper" : "arm_trajectory",
+            gripper ? step.gripper_goal.target_position : 0.0,
+            gripper ? step.gripper_goal.target_speed : 0.0,
+            success);
     }
 
     // 現在のデカルト座標を保持する構造体
@@ -233,7 +296,9 @@ private:
         RawTrajectoryPoint p;
         std::copy(joints_pos.begin(), joints_pos.end(), p.positions.begin());
         p.time_from_start = std::chrono::seconds(4);
-        steps_.push_back(make_arm_step(create_follow_joint_goal(joints, {p}), std::chrono::seconds(1), 93)); // Phase 93
+        steps_.push_back(make_arm_step(
+            create_follow_joint_goal(joints, {p}, this->get_clock()->now()),
+            std::chrono::seconds(1), 93)); // Phase 93
     }
 
 
@@ -251,7 +316,7 @@ private:
         MoveGripper::Goal open_gripper_;
         MoveGripper::Goal grasp_gripper_;
 
-        open_gripper_ = make_g(std::max<float>(static_cast<float>(target_pos) + 0.03f, 0.140f), 0.3f, 0.1f); // 開く位置を保持
+        open_gripper_ = make_g(0.140f, 0.3f, 0.1f); // 開く位置を保持
         grasp_gripper_ = make_g(static_cast<float>(target_pos), static_cast<float>(target_speed), 0.5f); // 把持位置を保持
 
         // Phase 1: 開く (ここは素早く 0.5 固定でもOK)
@@ -308,6 +373,7 @@ private:
             action_in_progress_ = false;
             auto p = std_msgs::msg::Int32();
             p.data = 0; 
+            publish_action_event("sequence_finished", 0, "sequence", 0.0, 0.0, true);
             phase_pub_->publish(p);
             return;
         }
@@ -318,6 +384,7 @@ private:
         auto phase_msg = std_msgs::msg::Int32();
         phase_msg.data = step.phase_id;
         phase_pub_->publish(phase_msg); 
+        publish_step_event(step, "goal_sent", false);
 
         if (step.type == StepType::ArmTrajectory) {
             auto opts = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
@@ -326,6 +393,8 @@ private:
                 if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
                     this->on_step_completed();
                 } else {
+                    this->publish_step_event(
+                        this->steps_.at(this->current_step_index_), "action_failed", false);
                     RCLCPP_ERROR(this->get_logger(), "Arm Action failed with code: %d", static_cast<int>(result.code));
                     this->action_in_progress_ = false;
                     auto p = std_msgs::msg::Int32();
@@ -342,6 +411,8 @@ private:
                 if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
                     this->on_step_completed();
                 } else {
+                    this->publish_step_event(
+                        this->steps_.at(this->current_step_index_), "action_failed", false);
                     RCLCPP_ERROR(this->get_logger(), "Gripper Action failed with code: %d", static_cast<int>(result.code));
                     this->action_in_progress_ = false;
                     auto p = std_msgs::msg::Int32();
@@ -355,10 +426,26 @@ private:
     }
 
     void on_step_completed() {
-        auto delay = steps_.at(current_step_index_).post_delay;
+        const auto & completed_step = steps_.at(current_step_index_);
+        publish_step_event(completed_step, "action_succeeded", true);
+        if (sequence_kind_ == "run" && completed_step.phase_id == 2) {
+            publish_action_event(
+                "hold_start", 2, "hold",
+                completed_step.gripper_goal.target_position,
+                completed_step.gripper_goal.target_speed, true);
+        }
+        auto delay = completed_step.post_delay;
+        const int completed_phase = completed_step.phase_id;
         current_step_index_++;
-        timer_ = this->create_wall_timer(delay, [this]() {
+        timer_ = this->create_wall_timer(delay, [this, completed_phase]() {
             this->timer_->cancel();
+            if (this->sequence_kind_ == "run" && completed_phase == 2) {
+                const auto & hold_step = this->steps_.at(1);
+                this->publish_action_event(
+                    "hold_end", 2, "hold",
+                    hold_step.gripper_goal.target_position,
+                    hold_step.gripper_goal.target_speed, true);
+            }
             this->send_next_step();
         });
     }
@@ -369,10 +456,13 @@ private:
     rclcpp_action::Client<MoveGripper>::SharedPtr gripper_client_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr cmd_sub_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr phase_pub_;
+    rclcpp::Publisher<robotiq_2f_gripper_msgs::msg::RobotActionEvent>::SharedPtr action_event_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
     std::vector<SequenceStep> steps_;
     std::size_t current_step_index_;
     bool action_in_progress_;
+    std::string sequence_kind_;
+    int current_trial_index_;
 };
 
 int main(int argc, char **argv) {

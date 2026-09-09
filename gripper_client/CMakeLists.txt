@@ -12,6 +12,7 @@ find_package(rclcpp_action REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(robotiq_2f_gripper_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -35,6 +36,7 @@ ament_target_dependencies(gripper_client_node
   control_msgs
   robotiq_2f_gripper_msgs
   trajectory_msgs
+  std_msgs
 )
 
 install(TARGETS

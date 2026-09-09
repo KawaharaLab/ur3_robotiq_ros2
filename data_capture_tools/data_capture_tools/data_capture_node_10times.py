@@ -36,6 +36,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import collections
 
 from std_msgs.msg import Float32 # 上部のインポートに追加
+from robotiq_2f_gripper_msgs.msg import TrialEvent
 
 class ForceSensorMonitor:
     """力覚センサ(MMS101)の高速受信、ノイズ除去(移動平均)、ゼロ点補正を行うクラス"""
@@ -173,6 +174,7 @@ class DataCaptureNode(Node):
         
         # --- 追加: マーカー通信用のパブリッシャ ---
         self._marker_pub = self.create_publisher(String, "/trial_marker", 10)
+        self._trial_event_pub = self.create_publisher(TrialEvent, "/trial_event", 10)
         self.get_logger().info("Marker publisher initialized on /trial_marker")
         
         self._urscript_pub = self.create_publisher(String, "/urscript_interface/script_command", 10)
@@ -214,6 +216,32 @@ class DataCaptureNode(Node):
             10
         )
         self.get_logger().info("GelSight left & right monitoring initialized.")
+
+    def _select_loading_speed(self) -> float:
+        """Return the exact target speed that will be commanded and recorded."""
+        if self.config.loading_speed_mode == "fixed":
+            return self.config.fixed_loading_speed
+        return random.uniform(
+            self.config.random_loading_speed_min,
+            self.config.random_loading_speed_max,
+        )
+
+    def _publish_trial_event(
+        self,
+        event: str,
+        trial_index: int,
+        mode: str,
+        target_position: float,
+        target_speed: float,
+    ) -> None:
+        msg = TrialEvent()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.event = event
+        msg.trial_index = trial_index
+        msg.mode = mode
+        msg.target_position = target_position
+        msg.target_speed = target_speed
+        self._trial_event_pub.publish(msg)
 
     def _phase_cb(self, msg: Int32) -> None:
         """C++側からのフェーズ情報を受信."""
@@ -360,17 +388,22 @@ class DataCaptureNode(Node):
 
             # 速度をランダムに決定 (0.01 = 最遅, 0.1 = 標準, 1.0 = 最速)
             # 0.05 から 0.2 くらいが現実的な変化量です
-            random_speed = random.uniform(0.05, 0.2)
+            target_speed = self._select_loading_speed()
             trial_idx = i + 1
             self.get_logger().info(f"--- Executing Trial {trial_idx} ---")
 
             # 3. 本番動作（run）
-            start_msg = f"START,trial:{trial_idx},push_speed:{random_speed}, model:push"
+            start_msg = f"START,trial:{trial_idx},push_speed:{target_speed},model:push"
+            self._publish_trial_event(
+                "START", trial_idx, "push", target_m, target_speed
+            )
             self._marker_pub.publish(String(data=start_msg)) #
             
             self._is_active_session = True
             self._sequence_finished_event.clear()
-            self._cmd_pub.publish(String(data=f"run {target_m:.5f} {random_speed:.3f}"))
+            self._cmd_pub.publish(
+                String(data=f"run {target_m:.5f} {target_speed:.6f} {trial_idx}")
+            )
             self._sequence_finished_event.wait() #
             self._is_active_session = False
             
@@ -378,6 +411,9 @@ class DataCaptureNode(Node):
 
             # 4. 終了処理
             end_msg = f"END,trial:{trial_idx}"
+            self._publish_trial_event(
+                "END", trial_idx, "push", target_m, target_speed
+            )
             self._marker_pub.publish(String(data=end_msg)) #
             threading.Event().wait(0.8)
 
@@ -415,6 +451,9 @@ class DataCaptureNode(Node):
             self.get_logger().info(f"--- Push & Slide (45deg) Trial {trial_idx}/{total_count} ---")
             
             # マーカー送信
+            self._publish_trial_event(
+                "START", trial_idx, "slide", target_m, actual_speed
+            )
             self._marker_pub.publish(String(data=f"START,trial:{trial_idx},slide_speed:{actual_speed:.4f},mode:slide"))
             
             # 1. グリッパを閉じる (C++側の run コマンドを再利用)
@@ -445,6 +484,9 @@ class DataCaptureNode(Node):
             
             # 6. 終了処理
             end_msg = f"END,trial:{trial_idx}"
+            self._publish_trial_event(
+                "END", trial_idx, "slide", target_m, actual_speed
+            )
             self._marker_pub.publish(String(data=end_msg)) #
             threading.Event().wait(0.8)
 
@@ -1597,6 +1639,7 @@ class DataCaptureNode(Node):
 
         # 1. YAMLから値を読み取って計算 (configクラスに属性がある前提)
         target_m = max(0.0,self.config.target_diameter - self.config.push_depth) # 負の値にならないようガード
+        target_speed = self._select_loading_speed()
         
         # 1. 準備と録画開始
         self._prepare_session() #
@@ -1607,11 +1650,19 @@ class DataCaptureNode(Node):
         self._is_active_session = True
         self._sequence_finished_event.clear()
         self.get_logger().info(f"Sending run command with target: {target_m}m")
-        self._cmd_pub.publish(String(data=f"run {target_m}"))
+        self._publish_trial_event("START", 1, "push", target_m, target_speed)
+        self._marker_pub.publish(
+            String(data=f"START,trial:1,push_speed:{target_speed},model:push")
+        )
+        self._cmd_pub.publish(
+            String(data=f"run {target_m:.5f} {target_speed:.6f} 1")
+        )
         
         # 3. 動作完了（Phase 0）を待機
         self.get_logger().info("Sequence in progress. Waiting for completion...")
         self._sequence_finished_event.wait()
+        self._publish_trial_event("END", 1, "push", target_m, target_speed)
+        self._marker_pub.publish(String(data="END,trial:1"))
         
         # 4. 録画停止
         self._record_stop_time_if_missing() #

@@ -14,6 +14,8 @@ find_package(unique_identifier_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/MoveTwoFingerGripper.action"
   "msg/GripperStatus.msg"
+  "msg/RobotActionEvent.msg"
+  "msg/TrialEvent.msg"
   DEPENDENCIES std_msgs
 )
 

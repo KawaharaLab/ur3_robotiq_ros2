@@ -60,3 +60,33 @@ topics:
   - name: /force_torque/right
     type: geometry_msgs/msg/WrenchStamped
     mode: csv
+
+  # Robotiq stamped state
+  - name: /robotiq_2f_gripper/status
+    type: robotiq_2f_gripper_msgs/msg/GripperStatus
+    mode: csv
+
+  - name: /robotiq_2f_gripper/joint_states
+    type: sensor_msgs/msg/JointState
+    mode: csv
+
+  # New synchronized trial/action events
+  - name: /trial_event
+    type: robotiq_2f_gripper_msgs/msg/TrialEvent
+    mode: csv
+
+  - name: /robot_action_event
+    type: robotiq_2f_gripper_msgs/msg/RobotActionEvent
+    mode: csv
+
+  - name: /current_phase
+    type: std_msgs/msg/Int32
+    mode: csv
+
+  - name: /camera_wrist/realsense2_camera/color/metadata
+    type: realsense2_camera_msgs/msg/Metadata
+    mode: csv
+
+  - name: /camera_fixed/realsense2_camera/color/metadata
+    type: realsense2_camera_msgs/msg/Metadata
+    mode: csv
