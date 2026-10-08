@@ -1,6 +1,7 @@
 #include <array>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <sstream>
@@ -127,7 +128,13 @@ public:
 private:
     // 2. コマンド受信部分で文字列をパースする
     void on_command_received(const std_msgs::msg::String::SharedPtr msg) {
-        if (action_in_progress_) return;
+        if (action_in_progress_) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Action already in progress; dropping command: %s",
+                msg->data.c_str());
+            return;
+        }
 
         std::string cmd = msg->data;
         if (cmd.find("init") == 0) {
@@ -158,6 +165,8 @@ private:
             double target_pos = 0.140; 
             double target_speed = 0.1; 
             int trial_index = 0;
+            double hold_duration_sec = 4.0;
+            double release_speed = 0.3;
 
             // substr(3) にして "run" の直後（スペース含む）から読み込ませるか、
             // 明示的にスペースをスキップさせます
@@ -165,9 +174,18 @@ private:
             std::stringstream ss(params);
             
             if (ss >> target_pos >> target_speed) {
-                // Optional third argument keeps old command publishers compatible.
+                // All remaining arguments are optional, keeping old publishers compatible.
                 ss >> trial_index;
-                RCLCPP_INFO(this->get_logger(), "Parsed command: pos=%.3f, speed=%.3f", target_pos, target_speed);
+                ss >> hold_duration_sec;
+                ss >> release_speed;
+                if (hold_duration_sec < 0.0 || release_speed < 0.0) {
+                    RCLCPP_WARN(this->get_logger(), "Invalid optional run parameters in: %s", cmd.c_str());
+                    return;
+                }
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "Parsed command: pos=%.3f, loading_speed=%.3f, hold=%.3f, release_speed=%.3f",
+                    target_pos, target_speed, hold_duration_sec, release_speed);
             } else {
                 RCLCPP_WARN(this->get_logger(), "Parse failed for: %s. Using default speed 0.1", cmd.c_str());
             }
@@ -176,7 +194,56 @@ private:
             current_trial_index_ = trial_index;
             publish_action_event(
                 "trial_run_received", 0, "sequence", target_pos, target_speed, true);
-            prepare_run_sequence(target_pos, target_speed);
+            prepare_run_sequence(target_pos, target_speed, hold_duration_sec, release_speed);
+        }
+        else if (cmd.find("knead") == 0) {
+            // Protocol:
+            // knead <shallow_width> <deep_width> <loading_speed>
+            //       <unloading_speed> <cycles> <deep_hold> <shallow_hold> <trial_idx>
+            double shallow_width = 0.0;
+            double deep_width = 0.0;
+            double loading_speed = 0.0;
+            double unloading_speed = 0.0;
+            int cycles = 0;
+            double deep_hold_sec = 0.0;
+            double shallow_hold_sec = 0.0;
+            int trial_index = 0;
+            std::stringstream ss(cmd.substr(5));
+            if (!(ss >> shallow_width >> deep_width >> loading_speed
+                    >> unloading_speed >> cycles >> deep_hold_sec
+                    >> shallow_hold_sec >> trial_index)) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to parse knead command: %s", cmd.c_str());
+                return;
+            }
+            const bool finite =
+                std::isfinite(shallow_width) && std::isfinite(deep_width) &&
+                std::isfinite(loading_speed) && std::isfinite(unloading_speed) &&
+                std::isfinite(deep_hold_sec) && std::isfinite(shallow_hold_sec);
+            if (!finite || deep_width < 0.0 || shallow_width > 0.142 ||
+                !(deep_width < shallow_width) || loading_speed < 0.0 ||
+                loading_speed > 1.0 || unloading_speed < 0.0 ||
+                unloading_speed > 1.0 || cycles < 1 || cycles > 50 ||
+                deep_hold_sec < 0.0 || shallow_hold_sec < 0.0) {
+                RCLCPP_ERROR(this->get_logger(), "Rejected unsafe knead command: %s", cmd.c_str());
+                sequence_kind_ = "knead";
+                current_trial_index_ = trial_index;
+                publish_action_event(
+                    "knead_sequence_failed", 0, "sequence",
+                    deep_width, loading_speed, false);
+                auto phase = std_msgs::msg::Int32();
+                phase.data = -1;
+                phase_pub_->publish(phase);
+                return;
+            }
+
+            sequence_kind_ = "knead";
+            current_trial_index_ = trial_index;
+            publish_action_event(
+                "knead_sequence_received", 0, "sequence",
+                deep_width, loading_speed, true);
+            prepare_knead_sequence(
+                shallow_width, deep_width, loading_speed, unloading_speed,
+                cycles, deep_hold_sec, shallow_hold_sec);
         }
         else if (cmd.find("gripper") == 0) {
             sequence_kind_ = "gripper";
@@ -253,6 +320,18 @@ private:
             if (step.phase_id == 2) return "phase2_close_" + suffix;
             if (step.phase_id == 3) return "phase3_open_" + suffix;
         }
+        if (sequence_kind_ == "knead") {
+            if (step.phase_id == 100) return "knead_preopen_" + suffix;
+            if (step.phase_id == 101) return "knead_preload_" + suffix;
+            if (step.phase_id == 300) return "knead_final_open_" + suffix;
+            if (step.phase_id >= 200 && step.phase_id < 300) {
+                const int cycle = ((step.phase_id - 200) / 2) + 1;
+                const std::string direction =
+                    ((step.phase_id - 200) % 2 == 0) ? "load" : "unload";
+                return "knead_cycle_" + std::to_string(cycle) + "_" +
+                    direction + "_" + suffix;
+            }
+        }
         return "phase" + std::to_string(step.phase_id) + "_" + suffix;
     }
 
@@ -302,7 +381,11 @@ private:
     }
 
 
-    void prepare_run_sequence(double target_pos, double target_speed) {
+    void prepare_run_sequence(
+        double target_pos,
+        double target_speed,
+        double hold_duration_sec = 4.0,
+        double release_speed = 0.3) {
         steps_.clear();
         // 引数で受け取った target_speed を適用する
         auto make_g = [] (float pos, float target_speed, float force) {
@@ -313,20 +396,66 @@ private:
             return g;
         };
 
-        MoveGripper::Goal open_gripper_;
+        MoveGripper::Goal pre_open_gripper_;
+        MoveGripper::Goal release_gripper_;
         MoveGripper::Goal grasp_gripper_;
 
-        open_gripper_ = make_g(0.140f, 0.3f, 0.1f); // 開く位置を保持
+        pre_open_gripper_ = make_g(0.140f, 0.3f, 0.1f);
+        release_gripper_ = make_g(0.140f, static_cast<float>(release_speed), 0.1f);
         grasp_gripper_ = make_g(static_cast<float>(target_pos), static_cast<float>(target_speed), 0.5f); // 把持位置を保持
 
-        // Phase 1: 開く (ここは素早く 0.5 固定でもOK)
-        steps_.push_back(make_gripper_step(open_gripper_, std::chrono::seconds(1), 1));
+        // Phase 1: pre-open remains at the legacy speed; release_speed only affects Phase 3.
+        steps_.push_back(make_gripper_step(pre_open_gripper_, std::chrono::seconds(1), 1));
         
         // Phase 2: 把持 (ここを指定されたランダム速度にする)
-        steps_.push_back(make_gripper_step(grasp_gripper_, std::chrono::seconds(4), 2));
+        const auto hold_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(hold_duration_sec));
+        steps_.push_back(make_gripper_step(grasp_gripper_, hold_duration, 2));
         
         // Phase 3: 開く
-        steps_.push_back(make_gripper_step(open_gripper_, std::chrono::seconds(1), 3));
+        steps_.push_back(make_gripper_step(release_gripper_, std::chrono::seconds(1), 3));
+    }
+
+    void prepare_knead_sequence(
+        double shallow_width,
+        double deep_width,
+        double loading_speed,
+        double unloading_speed,
+        int cycles,
+        double deep_hold_sec,
+        double shallow_hold_sec)
+    {
+        steps_.clear();
+        auto make_g = [] (double pos, double speed, float force) {
+            MoveGripper::Goal goal;
+            goal.target_position = static_cast<float>(pos);
+            goal.target_speed = static_cast<float>(speed);
+            goal.target_force = force;
+            return goal;
+        };
+        auto delay = [] (double seconds) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(seconds));
+        };
+
+        // Pre-open and final-open match run. No full-open step exists inside a cycle.
+        steps_.push_back(make_gripper_step(
+            make_g(0.140, 0.3, 0.1f), std::chrono::seconds(1), 100));
+        steps_.push_back(make_gripper_step(
+            make_g(shallow_width, loading_speed, 0.5f),
+            std::chrono::nanoseconds::zero(), 101));
+        for (int cycle = 0; cycle < cycles; ++cycle) {
+            const int load_phase = 200 + cycle * 2;
+            const int unload_phase = load_phase + 1;
+            steps_.push_back(make_gripper_step(
+                make_g(deep_width, loading_speed, 0.5f),
+                delay(deep_hold_sec), load_phase));
+            steps_.push_back(make_gripper_step(
+                make_g(shallow_width, unloading_speed, 0.5f),
+                delay(shallow_hold_sec), unload_phase));
+        }
+        steps_.push_back(make_gripper_step(
+            make_g(0.140, 0.3, 0.1f), std::chrono::seconds(1), 300));
     }
 
     void prepare_gripper_sequence(double target_pos, double target_speed) {
@@ -373,7 +502,9 @@ private:
             action_in_progress_ = false;
             auto p = std_msgs::msg::Int32();
             p.data = 0; 
-            publish_action_event("sequence_finished", 0, "sequence", 0.0, 0.0, true);
+            publish_action_event(
+                sequence_kind_ == "knead" ? "knead_sequence_finished" : "sequence_finished",
+                0, "sequence", 0.0, 0.0, true);
             phase_pub_->publish(p);
             return;
         }
@@ -395,10 +526,14 @@ private:
                 } else {
                     this->publish_step_event(
                         this->steps_.at(this->current_step_index_), "action_failed", false);
+                    if (this->sequence_kind_ == "knead") {
+                        this->publish_action_event(
+                            "knead_sequence_failed", 0, "sequence", 0.0, 0.0, false);
+                    }
                     RCLCPP_ERROR(this->get_logger(), "Arm Action failed with code: %d", static_cast<int>(result.code));
                     this->action_in_progress_ = false;
                     auto p = std_msgs::msg::Int32();
-                    p.data = 0;
+                    p.data = -1;
                     this->phase_pub_->publish(p);
                 }
             };
@@ -413,10 +548,14 @@ private:
                 } else {
                     this->publish_step_event(
                         this->steps_.at(this->current_step_index_), "action_failed", false);
+                    if (this->sequence_kind_ == "knead") {
+                        this->publish_action_event(
+                            "knead_sequence_failed", 0, "sequence", 0.0, 0.0, false);
+                    }
                     RCLCPP_ERROR(this->get_logger(), "Gripper Action failed with code: %d", static_cast<int>(result.code));
                     this->action_in_progress_ = false;
                     auto p = std_msgs::msg::Int32();
-                    p.data = 0;
+                    p.data = -1;
                     this->phase_pub_->publish(p);
                 }
             };
@@ -437,6 +576,16 @@ private:
         auto delay = completed_step.post_delay;
         const int completed_phase = completed_step.phase_id;
         current_step_index_++;
+        if (delay <= std::chrono::nanoseconds::zero()) {
+            if (sequence_kind_ == "run" && completed_phase == 2) {
+                publish_action_event(
+                    "hold_end", 2, "hold",
+                    completed_step.gripper_goal.target_position,
+                    completed_step.gripper_goal.target_speed, true);
+            }
+            send_next_step();
+            return;
+        }
         timer_ = this->create_wall_timer(delay, [this, completed_phase]() {
             this->timer_->cancel();
             if (this->sequence_kind_ == "run" && completed_phase == 2) {

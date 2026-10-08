@@ -1,8 +1,8 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/afterDICOMO/after_dicomo_data_test
-task_name: object12_test
+output_root: /mnt/nvme1/tsumura/afterDICOMO/controlled_experiment
+task_name: object11_ctrl
 prompt: ""
-label: "ぷにぷに, puni-puni" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
+label: "ぷりぷり, puri-puri" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # 基本姿勢
 # 低い方
@@ -26,14 +26,14 @@ base_tcp_pose:
 #   rz: -0.010
 
 # 実験パラメータ
-target_diameter: 0.060 # 物体幅 (m) #クランプ:42mm
+target_diameter: 0.010 # 物体幅 (m) #クランプ:
 gripper_offset: 0.000 # デバイス誤差 (m)
-arm_offset: -0.000 # アームの位置誤差 (m)
-push_depth: 0.006 # 押し込み量 (m)
+arm_offset: 0.003 # アームの位置誤差 (m)
+push_depth: 0.004 # 押し込み量 (m)
 
 # Loading speed policy. Use "fixed" for repeatability pilots; "random" keeps
 # the existing data-augmentation behavior.
-loading_speed_mode: random
+loading_speed_mode: fixed
 fixed_loading_speed: 0.100
 random_loading_speed_min: 0.050
 random_loading_speed_max: 0.200
@@ -47,9 +47,10 @@ centering_min_step_arm: 0.0001   # 探査時のアーム移動幅の最小値 (m
 centering_min_step_grip: 0.0005   # 探査時のグリッパ閉じ幅の最小値 (m)
 safe_margin: 0.015          # 接触前の事前アプローチ用余白 (m)  <-- ★追加
 
-viewer_topics:
-  - /camera_fixed/realsense2_camera/color/image_raw
-  - /camera_wrist/realsense2_camera/color/image_raw
+# viewer_topics:
+#   - /camera_fixed/realsense2_camera/color/image_raw
+#   - /camera_wrist/realsense2_camera/color/image_raw
+viewer_topics: []
 image_throttle_hz: 0
 other_throttle_hz: 0
 enable_image_compression: true

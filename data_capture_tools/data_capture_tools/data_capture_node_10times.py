@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import signal
 import subprocess
@@ -11,8 +12,9 @@ import threading
 import math
 import time
 from datetime import datetime
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import random
 import cv2
@@ -36,7 +38,109 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import collections
 
 from std_msgs.msg import Float32 # 上部のインポートに追加
-from robotiq_2f_gripper_msgs.msg import TrialEvent
+from robotiq_2f_gripper_msgs.msg import RobotActionEvent, TrialEvent
+
+STANDARD_SUITE = {
+    "ap": {
+        "trials": 10,
+        "loading_speed": 0.10,
+    },
+
+    "av": {
+        "speeds": [0.00, 0.02, 0.05, 0.20],
+        "trials_per_speed": 5,
+        "order": "randomized",
+    },
+
+    "ad": {
+        "depths_mm": [2.0, 6.0],
+        "trials_per_depth": 5,
+        "loading_speed": 0.10,
+        "order": "randomized",
+    },
+
+    "aur": {
+        "loading_speed": 0.10,
+        "hold_s": 4.0,
+        "release_speeds": [0.00, 0.02, 0.05, 0.10, 0.20],
+        "trials_per_speed": 5,
+        "order": "randomized",
+    },
+
+    "ak": {
+        "trials_per_condition": 5,
+        "order": "randomized",
+
+        # 全条件で共通
+        "shallow_depth_mm": 2.0,
+        "cycles": 5,
+        "loading_speed": 0.00,
+        "unloading_speed": 0.00,
+
+        # 変化させる条件
+        "conditions": [
+            {
+                "deep_depth_mm": 4.0,
+                "deep_hold_s": 0.1,
+                "shallow_hold_s": 0.1,
+            },
+            {
+                "deep_depth_mm": 4.0,
+                "deep_hold_s": 0.5,
+                "shallow_hold_s": 0.5,
+            },
+            {
+                "deep_depth_mm": 6.0,
+                "deep_hold_s": 0.1,
+                "shallow_hold_s": 0.1,
+            },
+            {
+                "deep_depth_mm": 6.0,
+                "deep_hold_s": 0.5,
+                "shallow_hold_s": 0.5,
+            },
+        ],
+    },
+}
+
+
+@dataclass(frozen=True)
+class TrialCondition:
+    """Complete command and experiment context for one recorded trial."""
+
+    condition_name: str
+    target_width_m: float
+    nominal_depth_m: float
+    loading_speed: float
+    hold_duration_s: float = 4.0
+    release_speed: float = 0.3
+    series_index: int = -1
+    cycle_index: int = -1
+
+
+@dataclass(frozen=True)
+class KneadCondition:
+    """Parameters for one intended maintained-contact kneading trial."""
+
+    effective_object_width_m: float
+    shallow_depth_m: float
+    deep_depth_m: float
+    shallow_width_m: float
+    deep_width_m: float
+    cycles: int
+    loading_speed: float
+    unloading_speed: float
+    deep_hold_s: float
+    shallow_hold_s: float
+
+    @property
+    def condition_name(self) -> str:
+        return "knead"
+
+    @property
+    def target_width_m(self) -> float:
+        return self.deep_width_m
+
 
 class ForceSensorMonitor:
     """力覚センサ(MMS101)の高速受信、ノイズ除去(移動平均)、ゼロ点補正を行うクラス"""
@@ -175,6 +279,13 @@ class DataCaptureNode(Node):
         # --- 追加: マーカー通信用のパブリッシャ ---
         self._marker_pub = self.create_publisher(String, "/trial_marker", 10)
         self._trial_event_pub = self.create_publisher(TrialEvent, "/trial_event", 10)
+        self._sequence_failed_event = threading.Event()
+        self._robot_action_sub = self.create_subscription(
+            RobotActionEvent,
+            "/robot_action_event",
+            self._robot_action_event_cb,
+            20,
+        )
         self.get_logger().info("Marker publisher initialized on /trial_marker")
         
         self._urscript_pub = self.create_publisher(String, "/urscript_interface/script_command", 10)
@@ -194,6 +305,7 @@ class DataCaptureNode(Node):
         
         # __init__ メソッド内の適当な場所に追加
         self._calibrated_target_m = None  # ★キャリブレーション済みの目標押し込み幅
+        self._effective_object_width_m = None
         
         
         # --- 追加: 左右のGelSight監視用変数 ---
@@ -246,9 +358,31 @@ class DataCaptureNode(Node):
     def _phase_cb(self, msg: Int32) -> None:
         """C++側からのフェーズ情報を受信."""
         self._current_phase = msg.data
+        if msg.data == -1:
+            self.get_logger().error("Sequence failure detected from gripper_client.")
+            self._sequence_failed_event.set()
+            self._sequence_finished_event.set()
         if msg.data == 0:
             self.get_logger().info("Phase 0 detected, setting event.")
             self._sequence_finished_event.set()
+
+    def _robot_action_event_cb(self, msg: RobotActionEvent) -> None:
+        """Track knead failures without changing legacy sequence completion behavior."""
+        if msg.event == "knead_sequence_failed" or (
+            msg.event.startswith("knead_") and msg.event.endswith("_action_failed")
+        ):
+            self._sequence_failed_event.set()
+
+    def _wait_for_sequence(self, timeout: float, description: str) -> bool:
+        """Wait for a robot/gripper sequence and reject timeout or action failure."""
+        completed = self._sequence_finished_event.wait(timeout=timeout)
+        if not completed:
+            self.get_logger().error(f"{description} timed out after {timeout:.1f}s.")
+            return False
+        if self._sequence_failed_event.is_set():
+            self.get_logger().error(f"{description} failed; aborting sequence.")
+            return False
+        return True
             
     def _joint_cb(self, msg: JointState) -> None:
         """最新の関節角度を常に保持しておく"""
@@ -319,8 +453,15 @@ class DataCaptureNode(Node):
             print("-" * 40)
             print(" [i]: Init Arm (Move to start pose manually)")
             print(" [s]: Start Single Trial (Record & Run)")
+            print(" [ae]: Execute Standard Suite")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
+            print(" [av]: Loading-speed sweep")
+            print(" [arp]: Repeated press")
+            print(" [ah]: Hold-duration sweep")
+            print(" [aur]: Release-speed sweep")
+            print(" [ad]: Interleaved depth sweep")
+            print(" [ak]: Cyclic kneading / maintained-contact repeated press")
             print(" [t]: Test Force Sensor (Visual Debug)")
             print(" [q]: Quit")
             print("="*40)
@@ -337,6 +478,20 @@ class DataCaptureNode(Node):
                 self._execute_auto_loop()
             elif line == 'as':
                 self._execute_push_slide_loop()
+            elif line == 'av':
+                self._execute_loading_speed_sweep()
+            elif line == 'arp':
+                self._execute_repeated_press()
+            elif line == 'ah':
+                self._execute_hold_duration_sweep()
+            elif line == 'aur':
+                self._execute_release_speed_sweep()
+            elif line == 'ad':
+                self._execute_depth_sweep()
+            elif line == 'ak':
+                self._execute_kneading_loop()
+            elif line == 'ae':
+                self._execute_standard_suite()
             elif line == 't':
                 self._test_force_sensor()  # ★追加
             elif line == 'tc':
@@ -347,17 +502,13 @@ class DataCaptureNode(Node):
 
     def _execute_auto_loop(self) -> None:
         """10回ごとにBagを切り替えながら、補正済み角度へリセットして連続試行を行う"""
-        
-        # ★ 開始前にGelSightと力センサの両方が生きているかチェック
+        # Keep the legacy ap validation order: health/init are checked before prompting.
         if not self._check_sensors_health():
             self.get_logger().error("センサーの停止を検知したため、自動ループを開始できません。")
             return
-        
-        # ★ 安全装置：Initが実行されていない場合は警告して弾く
         if self._calibrated_target_m is None:
-            self.get_logger().error("エラー: 目標押し込み幅が未設定です。先に [i] (Init) を実行してセンタリングを行ってください。")
+            self.get_logger().error("エラー: 目標押し込み幅が未設定です。先に [i] (Init) を実行してください。")
             return
-
         print("Enter total number of trials: ", end="", flush=True)
         try:
             line = sys.stdin.readline().strip()
@@ -366,62 +517,777 @@ class DataCaptureNode(Node):
             if total_count <= 0: return
         except ValueError:
             return
-
-        batch_size = 10 
-        
-        # ★ ここで、Initで計算・記憶した完璧な幅を使用する
-        target_m = self._calibrated_target_m
-        
-        for i in range(total_count):
-            if not self._check_sensors_health():
-                self.get_logger().error("試行中にセンサーの停止を検知しました。ループを中断します。")
-                if self._bag_process: 
-                    self._stop_rosbag()
-                break
-            # --- [元のロジック：10回ごとのBag分割] ---
-            if i % batch_size == 0:
-                if self._bag_process:
-                    self._stop_rosbag() #
-                self._prepare_session() #
-                self._start_rosbag() #
-                threading.Event().wait(3.5)
-
-            # 速度をランダムに決定 (0.01 = 最遅, 0.1 = 標準, 1.0 = 最速)
-            # 0.05 から 0.2 くらいが現実的な変化量です
-            target_speed = self._select_loading_speed()
-            trial_idx = i + 1
-            self.get_logger().info(f"--- Executing Trial {trial_idx} ---")
-
-            # 3. 本番動作（run）
-            start_msg = f"START,trial:{trial_idx},push_speed:{target_speed},model:push"
-            self._publish_trial_event(
-                "START", trial_idx, "push", target_m, target_speed
+        conditions = [
+            TrialCondition(
+                condition_name="ap",
+                target_width_m=self._calibrated_target_m,
+                nominal_depth_m=self._calibrated_nominal_depth(),
+                loading_speed=self._select_loading_speed(),
             )
-            self._marker_pub.publish(String(data=start_msg)) #
-            
-            self._is_active_session = True
-            self._sequence_finished_event.clear()
-            self._cmd_pub.publish(
-                String(data=f"run {target_m:.5f} {target_speed:.6f} {trial_idx}")
-            )
-            self._sequence_finished_event.wait() #
+            for _ in range(total_count)
+        ]
+        self._execute_condition_loop(
+            conditions, "ap", legacy_markers=True, event_mode="push"
+        )
+
+    @staticmethod
+    def _read_number_list(prompt: str) -> Optional[list[float]]:
+        print(prompt, end="", flush=True)
+        line = sys.stdin.readline().strip().replace(",", " ")
+        if not line:
+            return None
+        try:
+            values = [float(value) for value in line.split()]
+        except ValueError:
+            return None
+        return values if values and all(math.isfinite(value) for value in values) else None
+
+    @staticmethod
+    def _read_positive_int(prompt: str) -> Optional[int]:
+        print(prompt, end="", flush=True)
+        try:
+            value = int(sys.stdin.readline().strip())
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _read_nonnegative_float(prompt: str) -> Optional[float]:
+        print(prompt, end="", flush=True)
+        try:
+            value = float(sys.stdin.readline().strip())
+        except ValueError:
+            return None
+        return value if math.isfinite(value) and value >= 0.0 else None
+
+    @staticmethod
+    def _arrange_conditions(
+        base: list,
+        trials_per_condition: int,
+        order_mode: str,
+    ) -> list:
+        if order_mode == "block":
+            return [
+                condition
+                for condition in base
+                for _ in range(trials_per_condition)
+            ]
+
+        conditions = base * trials_per_condition
+
+        if order_mode == "randomized":
+            random.shuffle(conditions)
+
+        return conditions
+
+    @staticmethod
+    def _arrange_condition_counts(
+        base: list[TrialCondition], trial_counts: list[int], order_mode: str
+    ) -> list[TrialCondition]:
+        conditions = [
+            condition
+            for condition, count in zip(base, trial_counts)
+            for _ in range(count)
+        ]
+        if order_mode == "randomized":
+            random.shuffle(conditions)
+        return conditions
+
+    def _calibrated_nominal_depth(self) -> float:
+        if self._effective_object_width_m is None or self._calibrated_target_m is None:
+            return 0.0
+        return max(0.0, (self._effective_object_width_m - self._calibrated_target_m) / 2.0)
+
+    def _write_experiment_metadata(
+        self,
+        experiment_name: str,
+        conditions: list,
+        batch_start: int,
+        batch_end: int,
+        completed_count: int,
+    ) -> None:
+        if self._session_dir is None:
+            return
+        order = []
+        for index, condition in enumerate(conditions, start=1):
+            entry = asdict(condition)
+            entry["condition_name"] = condition.condition_name
+            entry["trial_index"] = index
+            entry["condition_order"] = index
+            order.append(entry)
+        metadata = {
+            "schema_version": 1,
+            "experiment": experiment_name,
+            "effective_object_width_m": self._effective_object_width_m,
+            "actual_condition_order": order,
+            "bag_trial_range": [batch_start + 1, batch_end],
+            "completed_trial_count": completed_count,
+        }
+        (self._session_dir / "experiment_metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _execute_condition_loop(
+        self,
+        conditions: list,
+        experiment_name: str,
+        *,
+        inter_trial_rest_s: float = 0.8,
+        completion_settle_s: float = 1.5,
+        legacy_markers: bool = False,
+        event_mode: Optional[str] = None,
+        batch_size: int = 10,
+        command_builder: Optional[Callable[[object, int], str]] = None,
+        marker_builder: Optional[Callable[[object, int], str]] = None,
+        completion_timeout_s: Optional[float] = None,
+        detect_sequence_failure: bool = False,
+    ) -> None:
+        """Shared fixed-condition runner for init checks, bags, events and commands."""
+        if not self._check_sensors_health():
+            self.get_logger().error("センサーの停止を検知したため、ループを開始できません。")
+            return
+        if self._calibrated_target_m is None or self._effective_object_width_m is None:
+            self.get_logger().error("Initが未完了です。先に [i] を実行してください。")
+            return
+        if not conditions:
+            return
+
+        batch_start = 0
+        batch_end = min(batch_size, len(conditions))
+        completed_count = 0
+        try:
+            for offset, condition in enumerate(conditions):
+                if not self._check_sensors_health():
+                    self.get_logger().error("試行中にセンサー停止を検知したため中断します。")
+                    break
+                if offset % batch_size == 0:
+                    if self._bag_process:
+                        self._stop_rosbag()
+                    batch_start = offset
+                    batch_end = min(offset + batch_size, len(conditions))
+                    self._prepare_session()
+                    self._write_experiment_metadata(
+                        experiment_name, conditions, batch_start, batch_end, completed_count
+                    )
+                    self._start_rosbag()
+                    threading.Event().wait(3.5)
+
+                trial_idx = offset + 1
+                if legacy_markers:
+                    self.get_logger().info(f"--- Executing Trial {trial_idx} ---")
+                else:
+                    self.get_logger().info(
+                        f"--- {experiment_name} Trial {trial_idx}/{len(conditions)}: "
+                        f"{condition.condition_name} ---"
+                    )
+                self._publish_trial_event(
+                    "START", trial_idx, event_mode or experiment_name,
+                    condition.target_width_m, condition.loading_speed,
+                )
+                if marker_builder is not None:
+                    marker = marker_builder(condition, trial_idx)
+                elif legacy_markers:
+                    marker = (
+                        f"START,trial:{trial_idx},push_speed:{condition.loading_speed},"
+                        "model:push"
+                    )
+                else:
+                    marker = (
+                        f"START,trial:{trial_idx},condition:{condition.condition_name},"
+                        f"target_width_m:{condition.target_width_m:.6f},"
+                        f"nominal_depth_m:{condition.nominal_depth_m:.6f},"
+                        f"loading_speed:{condition.loading_speed:.6f},"
+                        f"hold_duration_s:{condition.hold_duration_s:.6f},"
+                        f"release_speed:{condition.release_speed:.6f},"
+                        f"series_index:{condition.series_index},cycle_index:{condition.cycle_index}"
+                    )
+                self._marker_pub.publish(String(data=marker))
+
+                self._is_active_session = True
+                self._sequence_finished_event.clear()
+                if detect_sequence_failure:
+                    self._sequence_failed_event.clear()
+                if command_builder is not None:
+                    command = command_builder(condition, trial_idx)
+                elif legacy_markers:
+                    command = (
+                        f"run {condition.target_width_m:.5f} "
+                        f"{condition.loading_speed:.6f} {trial_idx}"
+                    )
+                else:
+                    command = (
+                        f"run {condition.target_width_m:.6f} {condition.loading_speed:.6f} "
+                        f"{trial_idx} {condition.hold_duration_s:.6f} "
+                        f"{condition.release_speed:.6f}"
+                    )
+                self._cmd_pub.publish(String(data=command))
+                sequence_completed = self._sequence_finished_event.wait(
+                    timeout=completion_timeout_s
+                )
+                self._is_active_session = False
+                if not sequence_completed or (
+                    detect_sequence_failure and self._sequence_failed_event.is_set()
+                ):
+                    reason = "timeout" if not sequence_completed else "action failure"
+                    self.get_logger().error(
+                        f"{experiment_name} trial {trial_idx} aborted: {reason}."
+                    )
+                    self._publish_trial_event(
+                        "ABORT", trial_idx, event_mode or experiment_name,
+                        condition.target_width_m, condition.loading_speed,
+                    )
+                    self._marker_pub.publish(String(
+                        data=f"ABORT,trial:{trial_idx},reason:{reason.replace(' ', '_')}"
+                    ))
+                    break
+                if completion_settle_s > 0.0:
+                    threading.Event().wait(completion_settle_s)
+
+                self._publish_trial_event(
+                    "END", trial_idx, event_mode or experiment_name,
+                    condition.target_width_m, condition.loading_speed,
+                )
+                self._marker_pub.publish(String(data=f"END,trial:{trial_idx}"))
+                completed_count = trial_idx
+                self._write_experiment_metadata(
+                    experiment_name, conditions, batch_start, batch_end, completed_count
+                )
+                if inter_trial_rest_s > 0.0:
+                    threading.Event().wait(inter_trial_rest_s)
+                if self._stop_event.is_set():
+                    break
+        finally:
             self._is_active_session = False
-            
-            threading.Event().wait(1.5)
+            if self._bag_process:
+                self._stop_rosbag()
+        if legacy_markers:
+            self.get_logger().info("Auto push loop completed.")
+        else:
+            self.get_logger().info(f"{experiment_name} loop completed ({completed_count} trials).")
 
-            # 4. 終了処理
-            end_msg = f"END,trial:{trial_idx}"
-            self._publish_trial_event(
-                "END", trial_idx, "push", target_m, target_speed
+    def _execute_loading_speed_sweep(self) -> None:
+        speeds = self._read_number_list("Loading speeds (normalized [0,1], comma/space separated): ")
+        trial_values = self._read_number_list(
+            "Trials per speed (one value or one per speed): "
+        )
+        print("Order [block/randomized]: ", end="", flush=True)
+        order_mode = sys.stdin.readline().strip().lower()
+        if (not speeds or not trial_values or any(speed < 0.0 for speed in speeds) or
+                any(not value.is_integer() or value <= 0 for value in trial_values)):
+            self.get_logger().error("Invalid speed list or trial count.")
+            return
+        if len(trial_values) == 1:
+            trial_counts = [int(trial_values[0])] * len(speeds)
+        elif len(trial_values) == len(speeds):
+            trial_counts = [int(value) for value in trial_values]
+        else:
+            self.get_logger().error("Trial counts must contain one value or match the speed list.")
+            return
+        if order_mode not in {"block", "randomized"}:
+            self.get_logger().error("Order must be block or randomized.")
+            return
+        if self._calibrated_target_m is None:
+            self.get_logger().error("Initが未完了です。")
+            return
+        base = [TrialCondition(
+            f"loading_speed_{speed:g}", self._calibrated_target_m,
+            self._calibrated_nominal_depth(), speed,
+        ) for speed in speeds]
+        self._execute_condition_loop(
+            self._arrange_condition_counts(base, trial_counts, order_mode), "av"
+        )
+
+    def _execute_repeated_press(self) -> None:
+        series = self._read_positive_int("Number of series: ")
+        cycles = self._read_positive_int("Cycles per series: ")
+        speed = self._read_nonnegative_float("Loading speed (normalized [0,1]): ")
+        rest = self._read_nonnegative_float("Inter-cycle rest time (s): ")
+        if None in {series, cycles, speed, rest} or speed == 0.0:
+            self.get_logger().error("Invalid repeated-press parameters.")
+            return
+        if self._calibrated_target_m is None:
+            self.get_logger().error("Initが未完了です。")
+            return
+        conditions = [TrialCondition(
+            "repeated_press", self._calibrated_target_m,
+            self._calibrated_nominal_depth(), speed,
+            series_index=series_idx, cycle_index=cycle_idx,
+        ) for series_idx in range(1, series + 1) for cycle_idx in range(1, cycles + 1)]
+        self._execute_condition_loop(
+            conditions, "arp", inter_trial_rest_s=rest, completion_settle_s=0.0
+        )
+
+    def _execute_hold_duration_sweep(self) -> None:
+        speed = self._read_nonnegative_float("Fixed loading speed (normalized [0,1]): ")
+        durations = self._read_number_list("Hold durations (s, comma/space separated): ")
+        trials = self._read_positive_int("Trials per duration: ")
+        if speed is None or speed == 0.0 or not durations or trials is None or any(
+            duration < 0.0 for duration in durations
+        ):
+            self.get_logger().error("Invalid hold-duration parameters.")
+            return
+        if self._calibrated_target_m is None:
+            self.get_logger().error("Initが未完了です。")
+            return
+        base = [TrialCondition(
+            f"hold_{duration:g}s", self._calibrated_target_m,
+            self._calibrated_nominal_depth(), speed, hold_duration_s=duration,
+        ) for duration in durations]
+        self._execute_condition_loop(self._arrange_conditions(base, trials, "block"), "ah")
+
+    def _execute_release_speed_sweep(self) -> None:
+        loading_speed = self._read_nonnegative_float("Fixed loading speed (normalized [0,1]): ")
+        hold = self._read_nonnegative_float("Fixed hold duration (s): ")
+        release_speeds = self._read_number_list("Release speeds (normalized [0,1], comma/space separated): ")
+        trials = self._read_positive_int("Trials per release speed: ")
+        if (loading_speed is None or loading_speed == 0.0 or hold is None or
+                not release_speeds or trials is None or
+                any(speed < 0.0 for speed in release_speeds)):
+            self.get_logger().error("Invalid release-speed parameters.")
+            return
+        if self._calibrated_target_m is None:
+            self.get_logger().error("Initが未完了です。")
+            return
+        base = [TrialCondition(
+            f"release_speed_{release_speed:g}", self._calibrated_target_m,
+            self._calibrated_nominal_depth(), loading_speed,
+            hold_duration_s=hold, release_speed=release_speed,
+        ) for release_speed in release_speeds]
+        self._execute_condition_loop(self._arrange_conditions(base, trials, "block"), "aur")
+
+    def _execute_depth_sweep(self) -> None:
+        depths_mm = self._read_number_list("Nominal depths (mm, comma/space separated): ")
+        trials = self._read_positive_int("Trials per depth: ")
+        speed = self._read_nonnegative_float("Fixed loading speed (normalized [0,1]): ")
+        print("Order [interleaved/randomized]: ", end="", flush=True)
+        order_mode = sys.stdin.readline().strip().lower()
+        if (not depths_mm or trials is None or speed is None or speed == 0.0 or
+                any(depth < 0.0 for depth in depths_mm) or
+                order_mode not in {"interleaved", "randomized"}):
+            self.get_logger().error("Invalid depth-sweep parameters.")
+            return
+        if self._effective_object_width_m is None:
+            self.get_logger().error("Initが未完了です。")
+            return
+        base = []
+        for depth_mm in depths_mm:
+            depth_m = depth_mm / 1000.0
+            # push_depth is per finger, matching Init's effective_width - 2 * push_depth.
+            target_width_m = self._effective_object_width_m - 2.0 * depth_m
+            if target_width_m < 0.0:
+                self.get_logger().error(f"Depth {depth_mm:g} mm produces a negative target width.")
+                return
+            base.append(TrialCondition(
+                f"depth_{depth_mm:g}mm", target_width_m, depth_m, speed,
+            ))
+        mode = "randomized" if order_mode == "randomized" else "interleaved"
+        conditions = self._arrange_conditions(base, trials, mode)
+        self._execute_condition_loop(
+            conditions, "ad", batch_size=len(conditions)
+        )
+
+    @staticmethod
+    def _build_knead_command(condition: object, trial_idx: int) -> str:
+        knead = condition
+        return (
+            f"knead {knead.shallow_width_m:.9f} {knead.deep_width_m:.9f} "
+            f"{knead.loading_speed:.9f} {knead.unloading_speed:.9f} "
+            f"{knead.cycles} {knead.deep_hold_s:.9f} "
+            f"{knead.shallow_hold_s:.9f} {trial_idx}"
+        )
+
+    @staticmethod
+    def _build_knead_marker(condition: object, trial_idx: int) -> str:
+        knead = condition
+        return (
+            f"START,experiment:ak,command:knead,trial:{trial_idx},"
+            f"effective_object_width_m:{knead.effective_object_width_m:.6f},"
+            f"shallow_depth_m:{knead.shallow_depth_m:.6f},"
+            f"deep_depth_m:{knead.deep_depth_m:.6f},"
+            f"shallow_width_m:{knead.shallow_width_m:.6f},"
+            f"deep_width_m:{knead.deep_width_m:.6f},cycles:{knead.cycles},"
+            f"loading_speed:{knead.loading_speed:.6f},"
+            f"unloading_speed:{knead.unloading_speed:.6f},"
+            f"deep_hold_s:{knead.deep_hold_s:.6f},"
+            f"shallow_hold_s:{knead.shallow_hold_s:.6f}"
+        )
+
+    def _execute_kneading_loop(self) -> None:
+        """Collect intended maintained-contact shallow/deep cyclic presses."""
+        trials = self._read_positive_int("Number of trials: ")
+        shallow_depth_mm = self._read_nonnegative_float("Shallow depth (mm): ")
+        deep_depth_mm = self._read_nonnegative_float("Deep depth (mm): ")
+        cycles = self._read_positive_int("Cycles per trial: ")
+        loading_speed = self._read_nonnegative_float("Loading speed: ")
+        unloading_speed = self._read_nonnegative_float("Unloading speed: ")
+        deep_hold_s = self._read_nonnegative_float("Deep hold time (s): ")
+        shallow_hold_s = self._read_nonnegative_float("Shallow hold time (s): ")
+
+        values = {
+            trials, shallow_depth_mm, deep_depth_mm, cycles,
+            loading_speed, unloading_speed, deep_hold_s, shallow_hold_s,
+        }
+        if None in values:
+            self.get_logger().error("All kneading parameters must be finite and valid numbers.")
+            return
+        if cycles > 50:
+            self.get_logger().error("Cycles per trial must be between 1 and 50.")
+            return
+        if not (0.0 < shallow_depth_mm < deep_depth_mm):
+            self.get_logger().error("Depths must satisfy 0 < shallow depth < deep depth.")
+            return
+        if not (0.0 <= loading_speed <= 1.0 and 0.0 <= unloading_speed <= 1.0):
+            self.get_logger().error("Loading and unloading speeds must be in [0, 1].")
+            return
+        if self._effective_object_width_m is None:
+            self.get_logger().error("Initが未完了です。先に [i] を実行してください。")
+            return
+
+        shallow_depth_m = shallow_depth_mm / 1000.0
+        deep_depth_m = deep_depth_mm / 1000.0
+        shallow_width_m = self._effective_object_width_m - 2.0 * shallow_depth_m
+        deep_width_m = self._effective_object_width_m - 2.0 * deep_depth_m
+        max_width_m = 0.142
+        if not (
+            0.0 <= deep_width_m < shallow_width_m <= max_width_m
+        ):
+            self.get_logger().error(
+                "Kneading widths must satisfy 0 <= deep < shallow <= 0.142 m; "
+                "input was rejected without clamping."
             )
-            self._marker_pub.publish(String(data=end_msg)) #
-            threading.Event().wait(0.8)
+            return
 
-            if self._stop_event.is_set():
-                break
+        condition = KneadCondition(
+            effective_object_width_m=self._effective_object_width_m,
+            shallow_depth_m=shallow_depth_m,
+            deep_depth_m=deep_depth_m,
+            shallow_width_m=shallow_width_m,
+            deep_width_m=deep_width_m,
+            cycles=cycles,
+            loading_speed=loading_speed,
+            unloading_speed=unloading_speed,
+            deep_hold_s=deep_hold_s,
+            shallow_hold_s=shallow_hold_s,
+        )
+        # Allow up to 15 seconds per action step plus all requested dwell time.
+        completion_timeout_s = (
+            (2 * cycles + 3) * 15.0
+            + cycles * (deep_hold_s + shallow_hold_s)
+            + 10.0
+        )
+        self._execute_condition_loop(
+            [condition] * trials,
+            "ak",
+            command_builder=self._build_knead_command,
+            marker_builder=self._build_knead_marker,
+            completion_timeout_s=completion_timeout_s,
+            detect_sequence_failure=True,
+        )
+        
+    def _confirm_next_stage(self, next_stage: str) -> bool:
+        print(
+            f"\nCheck object / sensors / robot motion.\n"
+            f"Press Enter to continue to {next_stage}, or q to abort: ",
+            end="",
+            flush=True,
+        )
+        return sys.stdin.readline().strip().lower() != "q"
 
-        if self._bag_process: self._stop_rosbag() #
-        self.get_logger().info("Auto push loop completed.")
+    def _execute_standard_suite(self) -> None:
+        if self._calibrated_target_m is None or self._effective_object_width_m is None:
+            self.get_logger().error(
+                "Initが未完了です。先に [i] を実行してください。"
+            )
+            return
+
+        cfg = STANDARD_SUITE
+
+        # =========================================================
+        # AP
+        # =========================================================
+        ap_cfg = cfg["ap"]
+
+        ap_conditions = [
+            TrialCondition(
+                condition_name="ap",
+                target_width_m=self._calibrated_target_m,
+                nominal_depth_m=self._calibrated_nominal_depth(),
+                loading_speed=ap_cfg["loading_speed"],
+            )
+            for _ in range(ap_cfg["trials"])
+        ]
+
+        self._execute_condition_loop(
+            ap_conditions,
+            "ap",
+            legacy_markers=True,
+            event_mode="push",
+            detect_sequence_failure=True,
+        )
+
+        if not self._confirm_next_stage("AV"):
+            return
+
+        # =========================================================
+        # AV
+        # =========================================================
+        av_cfg = cfg["av"]
+
+        av_base = [
+            TrialCondition(
+                condition_name=f"loading_speed_{speed:g}",
+                target_width_m=self._calibrated_target_m,
+                nominal_depth_m=self._calibrated_nominal_depth(),
+                loading_speed=speed,
+            )
+            for speed in av_cfg["speeds"]
+        ]
+
+        av_conditions = self._arrange_conditions(
+            av_base,
+            av_cfg["trials_per_speed"],
+            av_cfg["order"],
+        )
+
+        self._execute_condition_loop(
+            av_conditions,
+            "av",
+            detect_sequence_failure=True,
+        )
+
+        if not self._confirm_next_stage("AD"):
+            return
+
+        # =========================================================
+        # AD
+        # =========================================================
+        ad_cfg = cfg["ad"]
+
+        ad_base = []
+
+        for depth_mm in ad_cfg["depths_mm"]:
+            depth_m = depth_mm / 1000.0
+            target_width_m = (
+                self._effective_object_width_m - 2.0 * depth_m
+            )
+
+            if target_width_m < 0.0:
+                self.get_logger().error(
+                    f"AD depth {depth_mm:g} mm gives negative target width."
+                )
+                return
+
+            ad_base.append(
+                TrialCondition(
+                    condition_name=f"depth_{depth_mm:g}mm",
+                    target_width_m=target_width_m,
+                    nominal_depth_m=depth_m,
+                    loading_speed=ad_cfg["loading_speed"],
+                )
+            )
+
+        ad_conditions = self._arrange_conditions(
+            ad_base,
+            ad_cfg["trials_per_depth"],
+            ad_cfg["order"],
+        )
+
+        self._execute_condition_loop(
+            ad_conditions,
+            "ad",
+            detect_sequence_failure=True,
+        )
+
+        if not self._confirm_next_stage("AUR"):
+            return
+
+        # =========================================================
+        # AUR
+        # =========================================================
+        aur_cfg = cfg["aur"]
+
+        aur_base = [
+            TrialCondition(
+                condition_name=f"release_speed_{speed:g}",
+                target_width_m=self._calibrated_target_m,
+                nominal_depth_m=self._calibrated_nominal_depth(),
+                loading_speed=aur_cfg["loading_speed"],
+                hold_duration_s=aur_cfg["hold_s"],
+                release_speed=speed,
+            )
+            for speed in aur_cfg["release_speeds"]
+        ]
+
+        aur_conditions = self._arrange_conditions(
+            aur_base,
+            aur_cfg["trials_per_speed"],
+            aur_cfg["order"],
+        )
+
+        self._execute_condition_loop(
+            aur_conditions,
+            "aur",
+            detect_sequence_failure=True,
+        )
+
+        if not self._confirm_next_stage("AK"):
+            return
+
+        # =========================================================
+        # AK
+        # =========================================================
+        ak_cfg = cfg["ak"]
+
+        trials_per_condition = ak_cfg["trials_per_condition"]
+        order_mode = ak_cfg["order"]
+
+        shallow_depth_mm = ak_cfg["shallow_depth_mm"]
+        shallow_depth_m = shallow_depth_mm / 1000.0
+
+        cycles = ak_cfg["cycles"]
+        loading_speed = ak_cfg["loading_speed"]
+        unloading_speed = ak_cfg["unloading_speed"]
+
+        # ---------- common validation ----------
+        if trials_per_condition <= 0:
+            self.get_logger().error(
+                "AK trials_per_condition must be > 0."
+            )
+            return
+
+        if order_mode not in {"block", "randomized"}:
+            self.get_logger().error(
+                "AK order must be 'block' or 'randomized'."
+            )
+            return
+
+        if cycles < 1 or cycles > 50:
+            self.get_logger().error(
+                "AK cycles must be between 1 and 50."
+            )
+            return
+
+        if not (0.0 <= loading_speed <= 1.0):
+            self.get_logger().error(
+                "AK loading_speed must be in [0, 1]."
+            )
+            return
+
+        if not (0.0 <= unloading_speed <= 1.0):
+            self.get_logger().error(
+                "AK unloading_speed must be in [0, 1]."
+            )
+            return
+
+        if shallow_depth_mm <= 0.0:
+            self.get_logger().error(
+                "AK shallow_depth_mm must be > 0."
+            )
+            return
+
+        # ---------- build all AK conditions ----------
+        ak_base = []
+
+        for condition_cfg in ak_cfg["conditions"]:
+            deep_depth_mm = condition_cfg["deep_depth_mm"]
+            deep_hold_s = condition_cfg["deep_hold_s"]
+            shallow_hold_s = condition_cfg["shallow_hold_s"]
+
+            if not (shallow_depth_mm < deep_depth_mm):
+                self.get_logger().error(
+                    "AK depths must satisfy "
+                    f"0 < shallow < deep; "
+                    f"got shallow={shallow_depth_mm:g} mm, "
+                    f"deep={deep_depth_mm:g} mm."
+                )
+                return
+
+            if deep_hold_s < 0.0 or shallow_hold_s < 0.0:
+                self.get_logger().error(
+                    "AK hold times must be >= 0."
+                )
+                return
+
+            deep_depth_m = deep_depth_mm / 1000.0
+
+            shallow_width_m = (
+                self._effective_object_width_m
+                - 2.0 * shallow_depth_m
+            )
+            deep_width_m = (
+                self._effective_object_width_m
+                - 2.0 * deep_depth_m
+            )
+
+            if not (
+                0.0 <= deep_width_m
+                < shallow_width_m
+                <= 0.142
+            ):
+                self.get_logger().error(
+                    "AK widths are invalid for condition: "
+                    f"shallow={shallow_depth_mm:g} mm, "
+                    f"deep={deep_depth_mm:g} mm. "
+                    f"Computed widths: "
+                    f"shallow={shallow_width_m:.6f} m, "
+                    f"deep={deep_width_m:.6f} m."
+                )
+                return
+
+            ak_base.append(
+                KneadCondition(
+                    effective_object_width_m=self._effective_object_width_m,
+                    shallow_depth_m=shallow_depth_m,
+                    deep_depth_m=deep_depth_m,
+                    shallow_width_m=shallow_width_m,
+                    deep_width_m=deep_width_m,
+                    cycles=cycles,
+                    loading_speed=loading_speed,
+                    unloading_speed=unloading_speed,
+                    deep_hold_s=deep_hold_s,
+                    shallow_hold_s=shallow_hold_s,
+                )
+            )
+
+        if not ak_base:
+            self.get_logger().error(
+                "AK condition list is empty."
+            )
+            return
+
+        # ---------- repeat / randomize ----------
+        ak_conditions = self._arrange_conditions(
+            ak_base,
+            trials_per_condition,
+            order_mode,
+        )
+
+        # _execute_condition_loop accepts one timeout value,
+        # so use the maximum required timeout across all AK conditions.
+        completion_timeout_s = max(
+            (2 * condition.cycles + 3) * 15.0
+            + condition.cycles
+            * (
+                condition.deep_hold_s
+                + condition.shallow_hold_s
+            )
+            + 10.0
+            for condition in ak_base
+        )
+
+        self._execute_condition_loop(
+            ak_conditions,
+            "ak",
+            command_builder=self._build_knead_command,
+            marker_builder=self._build_knead_marker,
+            completion_timeout_s=completion_timeout_s,
+            detect_sequence_failure=True,
+        )
+
+        self.get_logger().info(
+            "Standard experiment suite completed."
+        )
 
     def _execute_push_slide_loop(self) -> None:
         """9回のなぞり動作ループ（キャリブレーション済みの幅を使用）"""
@@ -505,13 +1371,15 @@ class DataCaptureNode(Node):
         """初期化：基準姿勢への復帰と、大まかな位置合わせ＋本番センタリング"""
         self.get_logger().info("--- 初期化シーケンスを開始します ---")
         self._sequence_finished_event.clear()
+        self._sequence_failed_event.clear()
         
         # 1. 初期姿勢へマクロ移動
         init_gripper_w = 0.135
         joints_rad = [math.radians(d) for d in self.config.initial_arm_pose]
         joints_str = " ".join(map(str, joints_rad))
         self._cmd_pub.publish(String(data=f"init {init_gripper_w} {joints_str}"))
-        self._sequence_finished_event.wait(timeout=20.0)
+        if not self._wait_for_sequence(20.0, "Initial arm/gripper move"):
+            return False
 
         # 2. 大まかな位置合わせ (Macro Approach)
         script = self._calculate_target_pose(init=True, lateral_offset=0.0, vertical_offset=0.0, speed=0.2)
@@ -520,8 +1388,10 @@ class DataCaptureNode(Node):
 
         pre_approach_width = self.config.target_diameter + self.config.safe_margin
         self._sequence_finished_event.clear()
+        self._sequence_failed_event.clear()
         self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.5f} 0.100"))
-        self._sequence_finished_event.wait(timeout=5.0)
+        if not self._wait_for_sequence(10.0, "Pre-approach gripper move"):
+            return False
 
         # 3. センサのゼロ点補正(Tare)
         time.sleep(0.5)
@@ -529,21 +1399,26 @@ class DataCaptureNode(Node):
 
         # 4. 本番仕様のアクティブ・センタリング実行
         effective_width_m = self._execute_active_centering()
-        
+        if effective_width_m is None:
+            return False
+
+        # 次のデータ収集ループに備えて少し開く
+        self._sequence_finished_event.clear()
+        self._sequence_failed_event.clear()
+        self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.4f} 0.100"))
+        if not self._wait_for_sequence(10.0, "Post-centering gripper move"):
+            return False
+
         # 5. 結果の保存と待機
+        self._effective_object_width_m = effective_width_m
         self._calibrated_target_m = max(0.0, effective_width_m - self.config.push_depth * 2)
         self.get_logger().info(
             f"キャリブレーション完了: 有効幅 {effective_width_m*1000:.1f}mm / "
             f"目標押し込み幅 {self._calibrated_target_m*1000:.1f}mm"
         )
-        
+
         if self._current_joints:
             self._saved_base_joints = list(self._current_joints)
-
-        # 次のデータ収集ループに備えて少し開く
-        self._sequence_finished_event.clear()
-        self._cmd_pub.publish(String(data=f"gripper {pre_approach_width:.4f} 0.100"))
-        self._sequence_finished_event.wait(timeout=5.0)
 
         return True
 
@@ -705,7 +1580,7 @@ class DataCaptureNode(Node):
     #         if max(final_left, final_right) > threshold * 2:
     #             self.get_logger().warning("⚠️ オーバーシュートが大きいです。速度を下げるかステップ制御に戻すことを推奨します。")
     
-    def _execute_active_centering(self) -> float:
+    def _execute_active_centering(self) -> Optional[float]:
         """
         対象物の中心と有効幅を自動探査する本番仕様のセンタリングロジック。
         ※ グリッパを固定して左右のエッジをステップ探査し、上限・下限を満たす均等な接触をエッジとする。
@@ -796,8 +1671,10 @@ class DataCaptureNode(Node):
         
         self.get_logger().info(f"1. グリッパを探査幅({probe_w*1000:.1f}mm)に固定し、ゼロ点をセットします。")
         self._sequence_finished_event.clear()
+        self._sequence_failed_event.clear()
         self._cmd_pub.publish(String(data=f"step_gripper {probe_w:.5f} 0.100 1.0"))
-        self._sequence_finished_event.wait(timeout=5.0)
+        if not self._wait_for_sequence(5.0, "Centering probe-width gripper move"):
+            return None
         
         time.sleep(1.0)
         self._force_monitor.tare()
@@ -853,8 +1730,10 @@ class DataCaptureNode(Node):
                 f"安全幅({safe_stop_width*1000:.1f}mm)まで一気に閉じます..."
             )
             self._sequence_finished_event.clear()
+            self._sequence_failed_event.clear()
             self._cmd_pub.publish(String(data=f"step_gripper {safe_stop_width:.5f} 0.100 1.0"))
-            self._sequence_finished_event.wait(timeout=5.0)
+            if not self._wait_for_sequence(5.0, "Centering safe-approach gripper move"):
+                return None
 
         time.sleep(1.0)
         self._force_monitor.tare()
@@ -909,8 +1788,10 @@ class DataCaptureNode(Node):
                 # 対象物を引きずらないよう、圧を抜くために必ず開く
                 target_w = current_w + step_g
                 self._sequence_finished_event.clear()
+                self._sequence_failed_event.clear()
                 self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
-                self._sequence_finished_event.wait(timeout=5.0)
+                if not self._wait_for_sequence(5.0, "Centering pressure-release gripper move"):
+                    return None
                 
                 shift_dir = -1.0 if f_l > f_r else 1.0
                 move_dist = shift_dir * shift_dist
@@ -954,8 +1835,10 @@ class DataCaptureNode(Node):
                 
             target_w = current_w - step_g
             self._sequence_finished_event.clear()
+            self._sequence_failed_event.clear()
             self._cmd_pub.publish(String(data=f"step_gripper {target_w:.5f} 0.020 0.5"))
-            self._sequence_finished_event.wait(timeout=5.0)
+            if not self._wait_for_sequence(5.0, "Centering incremental gripper close"):
+                return None
             time.sleep(0.8) 
             
         # --- 確定復帰処理 ---
@@ -967,8 +1850,10 @@ class DataCaptureNode(Node):
         
         # 2. 次にグリッパ幅を正しい値へ移動
         self._sequence_finished_event.clear()
+        self._sequence_failed_event.clear()
         self._cmd_pub.publish(String(data=f"step_gripper {best_state['w']:.5f} 0.020 0.5"))
-        self._sequence_finished_event.wait(timeout=5.0)
+        if not self._wait_for_sequence(5.0, "Centering final gripper restore"):
+            return None
                     
         # 最終状態を再度取得してログに出す
         time.sleep(0.5)
