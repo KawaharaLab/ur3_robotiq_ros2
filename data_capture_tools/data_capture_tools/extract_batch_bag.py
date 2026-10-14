@@ -18,6 +18,7 @@ import yaml
 
 # 既存の構成要素をインポート
 from .config import CaptureConfig, load_capture_config
+from .export_timing import ExportTimingIndex, export_provenance
 from .bag_converter import (
     _sanitize_topic, _flatten, _format_csv_value, 
     _load_csv_field_map, _prepare_message_types, 
@@ -74,72 +75,85 @@ def convert_trial_range(
     config: CaptureConfig,
     start_ns: int,
     end_ns: int,
-    logger=None
+    logger=None,
+    source_bag_uri: Optional[Path] = None,
 ) -> None:
     """指定された時間範囲のみをデータセットとして書き出す[cite: 2]"""
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    reader = SequentialReader()
-    reader.open(
-        StorageOptions(uri=str(bag_uri), storage_id=config.bag.storage),
-        ConverterOptions(input_serialization_format="cdr", output_serialization_format="cdr")
+    provenance = export_provenance(
+        source_bag_uri if source_bag_uri is not None else bag_uri,
+        config, (start_ns, end_ns),
     )
+    with ExportTimingIndex(output_dir, provenance) as timing:
+        reader = SequentialReader()
+        reader.open(
+            StorageOptions(uri=str(bag_uri), storage_id=config.bag.storage),
+            ConverterOptions(input_serialization_format="cdr", output_serialization_format="cdr")
+        )
 
-    topic_specs = {spec.name: spec for spec in config.topics}
-    message_types = _prepare_message_types(topic_specs.values())
-    bridge = CvBridge()
-    image_dirs: Dict[str, Path] = {}
-    csv_rows_by_topic = defaultdict(list)
+        topic_specs = {spec.name: spec for spec in config.topics}
+        message_types = _prepare_message_types(topic_specs.values())
+        bridge = CvBridge()
+        image_dirs: Dict[str, Path] = {}
+        csv_rows_by_topic = defaultdict(list)
     
-    # CSVフィールドマップのロード[cite: 2]
-    csv_config_path = output_dir.parent / "csv_fields.yaml"
-    csv_field_map = _load_csv_field_map(csv_config_path if csv_config_path.exists() else None, logger)
+        # CSVフィールドマップのロード[cite: 2]
+        csv_config_path = output_dir.parent / "csv_fields.yaml"
+        csv_field_map = _load_csv_field_map(csv_config_path if csv_config_path.exists() else None, logger)
 
-    while reader.has_next():
-        topic, data, stamp = reader.read_next()
+        while reader.has_next():
+            topic, data, stamp = reader.read_next()
         
-        if not (start_ns <= stamp <= end_ns):
-            continue
+            if not (start_ns <= stamp <= end_ns):
+                continue
             
-        spec = topic_specs.get(topic)
-        if spec is None:
-            continue
+            spec = topic_specs.get(topic)
+            if spec is None:
+                continue
 
-        msg_cls = message_types[topic]
-        message = deserialize_message(data, msg_cls)
+            msg_cls = message_types[topic]
+            message = deserialize_message(data, msg_cls)
 
-        if spec.mode == "image" or spec.type.endswith("CompressedImage"):
-            folder = image_dirs.get(topic)
-            if folder is None:
-                folder = output_dir / "images" / _sanitize_topic(topic)
-                folder.mkdir(parents=True, exist_ok=True)
-                image_dirs[topic] = folder
+            if spec.mode == "image" or spec.type.endswith("CompressedImage"):
+                folder = image_dirs.get(topic)
+                if folder is None:
+                    folder = output_dir / "images" / _sanitize_topic(topic)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    image_dirs[topic] = folder
 
-            image = bridge.compressed_imgmsg_to_cv2(message) if isinstance(message, CompressedImage) \
-                    else bridge.imgmsg_to_cv2(message, desired_encoding=spec.encoding or "bgr8")
-            cv2.imwrite(str(folder / f"{stamp}.png"), image)
-        else:
-            row = {"stamp_ns": stamp}
-            flattened = _flatten(message_to_ordereddict(message))
-            prefix = _sanitize_topic(topic)
-            for key, value in flattened.items():
-                column = f"{prefix}.{key}" if key else prefix
-                row[column] = _format_csv_value(value)
+                image = bridge.compressed_imgmsg_to_cv2(message) if isinstance(message, CompressedImage) \
+                        else bridge.imgmsg_to_cv2(message, desired_encoding=spec.encoding or "bgr8")
+                filename = folder / f"{stamp}.png"
+                timing.claim_image_path(filename)
+                if not cv2.imwrite(str(filename), image):
+                    timing.record(topic, stamp, message, filename, status="write_failed")
+                    raise OSError(f"Failed to write image for topic {topic} at stamp {stamp}")
+                timing.record(topic, stamp, message, filename)
+            else:
+                row = {"stamp_ns": stamp}
+                flattened = _flatten(message_to_ordereddict(message))
+                prefix = _sanitize_topic(topic)
+                for key, value in flattened.items():
+                    column = f"{prefix}.{key}" if key else prefix
+                    row[column] = _format_csv_value(value)
             
-            field_map = csv_field_map.get(topic)
-            if field_map:
-                row = {dst: (stamp if src == "stamp_ns" else row.get(src)) for src, dst in field_map.items()}
-            csv_rows_by_topic[prefix].append(row)
+                field_map = csv_field_map.get(topic)
+                if field_map:
+                    row = {dst: (stamp if src == "stamp_ns" else row.get(src)) for src, dst in field_map.items()}
+                csv_rows_by_topic[prefix].append(row)
+                timing.record(topic, stamp, message, output_dir / "csv" / f"{prefix}.csv",
+                              artifact_row=len(csv_rows_by_topic[prefix]))
 
-    csv_dir = output_dir / "csv"
-    csv_dir.mkdir(parents=True, exist_ok=True)
-    for prefix, rows in csv_rows_by_topic.items():
-        if not rows: continue
-        fieldnames = ["stamp_ns"] + sorted({k for r in rows for k in r.keys() if k != "stamp_ns"})
-        with (csv_dir / f"{prefix}.csv").open("w", newline="", encoding="utf-8") as h:
-            writer = csv.DictWriter(h, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        csv_dir = output_dir / "csv"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        for prefix, rows in csv_rows_by_topic.items():
+            if not rows: continue
+            fieldnames = ["stamp_ns"] + sorted({k for r in rows for k in r.keys() if k != "stamp_ns"})
+            with (csv_dir / f"{prefix}.csv").open("w", newline="", encoding="utf-8") as h:
+                writer = csv.DictWriter(h, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
 
 def main():
     import argparse
@@ -168,7 +182,7 @@ def main():
             logger.info(f">>> Extracting Trial {trial_id} to {trial_output_dir.name}")
             convert_trial_range(
                 bag_to_read, trial_output_dir, config,
-                trial["start_ns"], trial["end_ns"], logger
+                trial["start_ns"], trial["end_ns"], logger, source_bag_uri=bag_path
             )
             
             with (trial_output_dir / "params.json").open("w", encoding="utf-8") as f:

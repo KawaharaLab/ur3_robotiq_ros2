@@ -17,6 +17,7 @@ from rosidl_runtime_py import message_to_ordereddict
 
 # 同一パッケージ内のモジュールから絶対インポート
 from data_capture_tools.config import CaptureConfig, load_capture_config
+from data_capture_tools.export_timing import export_is_complete, export_provenance
 from data_capture_tools.bag_converter import (
     _sanitize_topic, _flatten, _format_csv_value, 
     _load_csv_field_map, _prepare_message_types, 
@@ -40,12 +41,6 @@ def process_single_bag(bag_path: Path, config_path: str):
     
     parent_dir = bag_path.parent.parent
     
-    # 未処理チェック: すでに 'trial_' で始まるディレクトリがあるか確認
-    existing_trials = list(parent_dir.glob("trial_*"))
-    if existing_trials:
-        proc_logger.info(f"Skipping already processed: {parent_dir.name} (Found {len(existing_trials)} trials)")
-        return
-
     proc_logger.info(f"--- Starting Process: {parent_dir.name} ---")
     
     # 構造体(config)のシリアライズエラーを防ぐため、プロセス内部でロードする
@@ -67,10 +62,22 @@ def process_single_bag(bag_path: Path, config_path: str):
             trial_id = trial["trial_id"]
             trial_output_dir = parent_dir / f"trial_{trial_id}"
             
+            provenance = export_provenance(
+                bag_path, config, (trial["start_ns"], trial["end_ns"])
+            )
+            if (export_is_complete(trial_output_dir, provenance)
+                    and (trial_output_dir / "params.json").is_file()):
+                proc_logger.info(f"Skipping verified export: {trial_output_dir}")
+                continue
+            if trial_output_dir.exists():
+                raise RuntimeError(
+                    f"Refusing to overwrite an unverified or legacy trial directory: {trial_output_dir}. "
+                    "Preserve it and extract into a separate copy/location first."
+                )
             proc_logger.info(f"  >>> [{parent_dir.name}] Extracting Trial {trial_id} to {trial_output_dir}")
             convert_trial_range(
                 bag_to_read, trial_output_dir, config,
-                trial["start_ns"], trial["end_ns"], proc_logger
+                trial["start_ns"], trial["end_ns"], proc_logger, source_bag_uri=bag_path
             )
             
             # パラメータを保存
@@ -81,6 +88,7 @@ def process_single_bag(bag_path: Path, config_path: str):
             
     except Exception as e:
         proc_logger.error(f"Failed to process {bag_path}: {str(e)}", exc_info=True)
+        raise
     finally:
         if temp_handle:
             temp_handle.cleanup()

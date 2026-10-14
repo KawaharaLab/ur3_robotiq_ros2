@@ -25,6 +25,7 @@ from rosidl_runtime_py.utilities import get_message
 import yaml
 
 from .config import CaptureConfig, TopicSpec
+from .export_timing import ExportTimingIndex, export_provenance
 
 
 def _sanitize_topic(topic: str) -> str:
@@ -258,114 +259,120 @@ def convert_bag_to_dataset(
     )
 
     try:
-        reader = SequentialReader()
-        storage_options = StorageOptions(
-            uri=str(bag_to_read),
-            storage_id=config.bag.storage,
-        )
-        converter_options = ConverterOptions(
-            input_serialization_format="cdr",
-            output_serialization_format="cdr",
-        )
-        reader.open(storage_options, converter_options)
+        provenance = export_provenance(bag_uri, config, (None, cutoff_stamp_ns))
+        with ExportTimingIndex(output_dir, provenance) as timing:
+            reader = SequentialReader()
+            storage_options = StorageOptions(
+                uri=str(bag_to_read),
+                storage_id=config.bag.storage,
+            )
+            converter_options = ConverterOptions(
+                input_serialization_format="cdr",
+                output_serialization_format="cdr",
+            )
+            reader.open(storage_options, converter_options)
 
-        topic_specs = {spec.name: spec for spec in config.topics}
-        message_types = _prepare_message_types(topic_specs.values())
+            topic_specs = {spec.name: spec for spec in config.topics}
+            message_types = _prepare_message_types(topic_specs.values())
 
-        bridge = CvBridge()
-        image_dirs: Dict[str, Path] = {}
-        csv_rows_by_topic: dict[str, list[dict[str, object]]] = defaultdict(list)
-        skipped_messages: dict[str, int] = defaultdict(int)
-        csv_field_map = _load_csv_field_map(
-            getattr(config, "csv_config_path", None),
-            logger,
-        )
+            bridge = CvBridge()
+            image_dirs: Dict[str, Path] = {}
+            csv_rows_by_topic: dict[str, list[dict[str, object]]] = defaultdict(list)
+            skipped_messages: dict[str, int] = defaultdict(int)
+            csv_field_map = _load_csv_field_map(
+                getattr(config, "csv_config_path", None),
+                logger,
+            )
 
-        while reader.has_next():
-            topic, data, stamp = reader.read_next()
-            if cutoff_stamp_ns is not None and stamp > cutoff_stamp_ns:
-                continue
-            spec = topic_specs.get(topic)
-            if spec is None:
-                continue
+            while reader.has_next():
+                topic, data, stamp = reader.read_next()
+                if cutoff_stamp_ns is not None and stamp > cutoff_stamp_ns:
+                    continue
+                spec = topic_specs.get(topic)
+                if spec is None:
+                    continue
 
-            msg_cls = message_types[topic]
-            try:
-                message = deserialize_message(data, msg_cls)
-            except Exception as exc:  # noqa: BLE001
-                skipped_messages[topic] += 1
-                if logger and skipped_messages[topic] == 1:
-                    logger.warning(
-                        f"Skipping messages for topic {topic}: deserialization failed ({exc})"
-                    )
-                continue
+                msg_cls = message_types[topic]
+                try:
+                    message = deserialize_message(data, msg_cls)
+                except Exception as exc:  # noqa: BLE001
+                    skipped_messages[topic] += 1
+                    timing.record(topic, stamp, None, status="deserialize_failed", error=str(exc))
+                    if logger and skipped_messages[topic] == 1:
+                        logger.warning(
+                            f"Skipping messages for topic {topic}: deserialization failed ({exc})"
+                        )
+                    continue
 
-            # Treat explicit image modes and compressed image types as image outputs.
-            if spec.mode == "image" or spec.type.endswith("CompressedImage"):
-                folder = image_dirs.get(topic)
-                if folder is None:
-                    folder = output_dir / "images" / _sanitize_topic(topic)
-                    folder.mkdir(parents=True, exist_ok=True)
-                    image_dirs[topic] = folder
+                # Treat explicit image modes and compressed image types as image outputs.
+                if spec.mode == "image" or spec.type.endswith("CompressedImage"):
+                    folder = image_dirs.get(topic)
+                    if folder is None:
+                        folder = output_dir / "images" / _sanitize_topic(topic)
+                        folder.mkdir(parents=True, exist_ok=True)
+                        image_dirs[topic] = folder
 
-                if isinstance(message, CompressedImage):
-                    image = bridge.compressed_imgmsg_to_cv2(message)
+                    if isinstance(message, CompressedImage):
+                        image = bridge.compressed_imgmsg_to_cv2(message)
+                    else:
+                        image = bridge.imgmsg_to_cv2(
+                            message,
+                            desired_encoding=spec.encoding or "bgr8",
+                        )
+
+                    filename = folder / f"{stamp}.png"
+                    timing.claim_image_path(filename)
+                    if not cv2.imwrite(str(filename), image):
+                        timing.record(topic, stamp, message, filename, status="write_failed")
+                        raise OSError(f"Failed to write image for topic {topic} at stamp {stamp}")
+                    timing.record(topic, stamp, message, filename)
                 else:
-                    image = bridge.imgmsg_to_cv2(
-                        message,
-                        desired_encoding=spec.encoding or "bgr8",
-                    )
+                    row = {
+                        "stamp_ns": stamp,
+                    }
+                    flattened = _flatten(message_to_ordereddict(message))
+                    prefix = _sanitize_topic(topic)
+                    for key, value in flattened.items():
+                        column = f"{prefix}.{key}" if key else prefix
+                        row[column] = _format_csv_value(value)
+                    field_map = csv_field_map.get(topic)
+                    if field_map:
+                        remapped = {}
+                        for src, dst in field_map.items():
+                            if src == "stamp_ns":
+                                remapped[dst] = stamp
+                            else:
+                                remapped[dst] = row.get(src)
+                        row = remapped
+                    csv_rows_by_topic[prefix].append(row)
+                    timing.record(topic, stamp, message, output_dir / "csv" / f"{prefix}.csv",
+                                  artifact_row=len(csv_rows_by_topic[prefix]))
 
-                filename = folder / f"{stamp}.png"
-                if not cv2.imwrite(str(filename), image) and logger:
-                    logger.warning(
-                        f"Failed to write image for topic {topic} at stamp {stamp}"
-                    )
-            else:
-                row = {
-                    "stamp_ns": stamp,
-                }
-                flattened = _flatten(message_to_ordereddict(message))
-                prefix = _sanitize_topic(topic)
-                for key, value in flattened.items():
-                    column = f"{prefix}.{key}" if key else prefix
-                    row[column] = _format_csv_value(value)
-                field_map = csv_field_map.get(topic)
-                if field_map:
-                    remapped = {}
-                    for src, dst in field_map.items():
-                        if src == "stamp_ns":
-                            remapped[dst] = stamp
-                        else:
-                            remapped[dst] = row.get(src)
-                    row = remapped
-                csv_rows_by_topic[prefix].append(row)
+            csv_dir = output_dir / "csv"
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            for prefix, rows in csv_rows_by_topic.items():
+                if not rows:
+                    continue
+                data_fields = sorted(
+                    {key for row in rows for key in row.keys() if key != "stamp_ns"}
+                )
+                fieldnames = ["stamp_ns", *data_fields]
+                csv_path = csv_dir / f"{prefix}.csv"
+                with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                if logger:
+                    logger.info(f"Wrote {len(rows)} rows to {csv_path}")
 
-        csv_dir = output_dir / "csv"
-        csv_dir.mkdir(parents=True, exist_ok=True)
-        for prefix, rows in csv_rows_by_topic.items():
-            if not rows:
-                continue
-            data_fields = sorted(
-                {key for row in rows for key in row.keys() if key != "stamp_ns"}
-            )
-            fieldnames = ["stamp_ns", *data_fields]
-            csv_path = csv_dir / f"{prefix}.csv"
-            with csv_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
-            if logger:
-                logger.info(f"Wrote {len(rows)} rows to {csv_path}")
-
-        if logger and skipped_messages:
-            total_skipped = sum(skipped_messages.values())
-            topics = ", ".join(
-                f"{name} ({count})" for name, count in skipped_messages.items()
-            )
-            logger.warning(
-                f"Skipped {total_skipped} messages due to deserialization errors: {topics}"
-            )
+            if logger and skipped_messages:
+                total_skipped = sum(skipped_messages.values())
+                topics = ", ".join(
+                    f"{name} ({count})" for name, count in skipped_messages.items()
+                )
+                logger.warning(
+                    f"Skipped {total_skipped} messages due to deserialization errors: {topics}"
+                )
     finally:
         if temp_handle:
             temp_handle.cleanup()
