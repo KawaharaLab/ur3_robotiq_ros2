@@ -90,6 +90,7 @@ class GelSightMini:
         target_width: int = 320,
         target_height: int = 240,
         border_fraction: float = 0.15,
+        timing_diagnostics: bool = False,
     ):
         self.camera: Camera = None
         self.recording: bool = False
@@ -104,6 +105,8 @@ class GelSightMini:
         self.border_fraction: float = border_fraction
         self.video_writer = None
         self.serial_number = None
+        self.timing_diagnostics = timing_diagnostics
+        self.last_frame_timing = {}
 
     def get_device_list(self) -> dict:
         return Camera.list_devices()
@@ -219,12 +222,16 @@ class GelSightMini:
         if not self.camera:
             return None
 
+        if self.timing_diagnostics:
+            read_start_ns = time.monotonic_ns()
         try:
             frame = self.camera.read_frame()
         except Exception as e:
             log_message(f"Error reading frame: {e}")
             return None
 
+        if self.timing_diagnostics:
+            read_end_ns = time.monotonic_ns()
         time_now = time.time()
         actual_dt = time_now - self.time_prev
         self.fps = 1.0 / actual_dt if actual_dt > 0 else 0
@@ -243,6 +250,13 @@ class GelSightMini:
         if self.recording and self.video_writer is not None:
             self.video_writer.write(cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR))
 
+        if self.timing_diagnostics:
+            preprocess_end_ns = time.monotonic_ns()
+            self.last_frame_timing = {
+                "read_block_decode_ms": (read_end_ns - read_start_ns) / 1e6,
+                "preprocess_ms": (preprocess_end_ns - read_end_ns) / 1e6,
+                "read_end_monotonic_ns": read_end_ns,
+            }
         return self.current_frame
 
     def create_folder(self) -> str:

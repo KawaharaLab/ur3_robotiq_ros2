@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import threading
 from typing import Optional
@@ -13,10 +14,12 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 
 from .config import GSConfig, ConfigModel
 from .utilities.gelsightmini import GelSightMini
+from .timing_diagnostics import TimingWindow
 
 
 class GelSightMiniPublisher(Node):
@@ -30,6 +33,7 @@ class GelSightMiniPublisher(Node):
         device_path: Optional[str] = None,
         publish_compressed: bool = True,
         compressed_quality: int = 90,
+        timing_diagnostics: bool = False,
     ) -> None:
         super().__init__("gelsight_mini_publisher")
         self._bridge = CvBridge()
@@ -39,10 +43,20 @@ class GelSightMiniPublisher(Node):
         self._publish_compressed = publish_compressed
         self._compressed_quality = max(1, min(100, compressed_quality))
 
+        self._timing = TimingWindow() if timing_diagnostics else None
+        self._previous_read_end_ns = None
+        self._diagnostics_publisher = None
+        if self._timing is not None:
+            self._diagnostics_publisher = self.create_publisher(
+                String, "~/acquisition_diagnostics", 10
+            )
+            self._diagnostics_timer = self.create_timer(1.0, self._report_timing)
+
         self._cam_stream = GelSightMini(
             target_width=config.camera_width,
             target_height=config.camera_height,
             border_fraction=config.border_fraction,
+            timing_diagnostics=timing_diagnostics,
         )
 
         target_device = device_index if device_index is not None else config.default_camera_index
@@ -71,26 +85,56 @@ class GelSightMiniPublisher(Node):
             # OpenCV側でフレームが届くまでブロックする（バッファを空に保つ）
             frame = self._cam_stream.update(0.0)
             if frame is None:
+                if self._timing is not None:
+                    self._timing.add(counters={"read_failures": 1})
                 continue
+            if self._timing is not None:
+                measured = self._cam_stream.last_frame_timing
+                read_end_ns = measured["read_end_monotonic_ns"]
+                metrics = {key: value for key, value in measured.items() if key.endswith("_ms")}
+                if self._previous_read_end_ns is not None:
+                    metrics["read_return_interval_ms"] = (read_end_ns - self._previous_read_end_ns) / 1e6
+                self._previous_read_end_ns = read_end_ns
+                self._timing.add(counters={"frames_read": 1}, metrics=metrics)
 
             current_time = time.time()
             
             # 指定された publish_rate_hz の間隔に達していなければ、画像を読み捨てる
             if (current_time - last_publish_time) < period:
+                if self._timing is not None:
+                    self._timing.add(counters={"frames_throttled": 1})
                 continue
 
             # 画像が届いた直後の時間をROSタイムスタンプにする
+            if self._timing is not None:
+                message_start_ns = time.monotonic_ns()
             msg = self._bridge.cv2_to_imgmsg(frame, encoding="rgb8")
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = self._frame_id
+            if self._timing is not None:
+                header_done_ns = time.monotonic_ns()
             self._publisher.publish(msg)
+            if self._timing is not None:
+                raw_done_ns = time.monotonic_ns()
+                self._timing.add(counters={"raw_publish_calls": 1}, metrics={
+                    "message_prepare_ms": (header_done_ns - message_start_ns) / 1e6,
+                    "read_end_to_header_ms": (header_done_ns - read_end_ns) / 1e6,
+                    "raw_publish_ms": (raw_done_ns - header_done_ns) / 1e6,
+                })
 
             if self._compressed_publisher:
                 try:
+                    if self._timing is not None:
+                        encode_start_ns = time.monotonic_ns()
                     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self._compressed_quality]
                     bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     ok, buffer = cv2.imencode('.jpg', bgr, encode_params)
+                    if self._timing is not None:
+                        encode_end_ns = time.monotonic_ns()
+                        self._timing.add(metrics={"jpeg_prepare_encode_ms": (encode_end_ns - encode_start_ns) / 1e6})
                     if not ok:
+                        if self._timing is not None:
+                            self._timing.add(counters={"jpeg_failures": 1})
                         self.get_logger().warn(
                             "Failed to JPEG-encode GelSight frame", throttle_duration_sec=2.0
                         )
@@ -100,12 +144,28 @@ class GelSightMiniPublisher(Node):
                     cmsg.format = 'jpeg'
                     cmsg.data = buffer.tobytes()
                     self._compressed_publisher.publish(cmsg)
+                    if self._timing is not None:
+                        self._timing.add(counters={"compressed_publish_calls": 1}, metrics={
+                            "compressed_message_publish_ms": (time.monotonic_ns() - encode_end_ns) / 1e6,
+                        })
                 except Exception as exc:  # noqa: BLE001
+                    if self._timing is not None:
+                        self._timing.add(counters={"jpeg_failures": 1})
                     self.get_logger().warn(
                         f"Compressed publish failed: {exc}", throttle_duration_sec=2.0
                     )
             
             last_publish_time = current_time
+
+    def _report_timing(self) -> None:
+        report = self._timing.snapshot()
+        report.update({
+            "schema_version": 1, "kind": "gelsight", "node": self.get_name(),
+            "frame_id": self._frame_id, "image_topic": self._topic_name,
+            "report_ros_ns": self.get_clock().now().nanoseconds,
+            "note": "Host-side durations. OpenCV read includes waiting and decoding; no exposure timestamp or calibrated sensor latency.",
+        })
+        self._diagnostics_publisher.publish(String(data=json.dumps(report)))
 
     def destroy_node(self) -> None:
         self.get_logger().info("Shutting down GelSight Mini publisher")
@@ -175,6 +235,10 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
         help="JPEG quality (1-100) for compressed output.",
     )
 
+    parser.add_argument(
+        "--timing-diagnostics", type=_str2bool, default=False,
+        help="Publish optional 1 s timing summaries; does not change image header semantics.",
+    )
     return parser.parse_known_args()
 
 
@@ -192,6 +256,7 @@ def main() -> None:
         device_path=args.device_path,
         publish_compressed=args.publish_compressed,
         compressed_quality=args.compressed_quality,
+        timing_diagnostics=args.timing_diagnostics,
     )
 
     try:

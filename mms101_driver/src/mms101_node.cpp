@@ -5,6 +5,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
+#include <std_msgs/msg/string.hpp>
+#include "acquisition_timing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -15,6 +17,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <mutex>
+#include <sys/ioctl.h>
 #include <stdexcept>
 #include <string>
 #include <termios.h>
@@ -27,6 +31,11 @@ class MMS101Node : public rclcpp::Node
 public:
   MMS101Node() : Node("mms101_driver")
   {
+    declare_parameter("timing_diagnostics", false);
+    timing_enabled_ = get_parameter("timing_diagnostics").as_bool();
+    if (timing_enabled_) {
+      timing_publisher_ = create_publisher<std_msgs::msg::String>("~/acquisition_diagnostics", 10);
+    }
     declare_parameter("port", "/dev/ttyUSB1");
     declare_parameter("frame_id", "sensor_link");
     declare_parameter("force_scale", 0.001);
@@ -128,6 +137,12 @@ private:
   static constexpr std::size_t PACKET_SIZE = 25;
   static constexpr uint8_t HEADER0 = 0x00;
   static constexpr uint8_t HEADER1 = 0x17;
+
+  bool timing_enabled_{false};
+  std::mutex timing_mutex_;
+  acquisition_timing::Window timing_window_;
+  std::chrono::steady_clock::time_point timing_start_{std::chrono::steady_clock::now()};
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr timing_publisher_;
 
   int serial_fd_{-1};
   std::string port_name_;
@@ -489,17 +504,43 @@ private:
   {
     std::array<uint8_t, 512> temp{};
     rx_buffer_.reserve(4096);
+    std::chrono::steady_clock::time_point previous_read_end{};
 
     while (running_.load(std::memory_order_relaxed) && rclcpp::ok()) {
+      const auto read_start = timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       const ssize_t n = read(serial_fd_, temp.data(), temp.size());
+      const auto read_end = timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       read_calls_.fetch_add(1, std::memory_order_relaxed);
 
       if (n > 0) {
+        int unread = -1;
+        int64_t read_end_ros_ns = 0;
+        uint64_t packets_before = 0;
+        if (timing_enabled_) {
+          read_end_ros_ns = now().nanoseconds();
+          if (ioctl(serial_fd_, FIONREAD, &unread) < 0) unread = -1;
+          packets_before = valid_packets_.load(std::memory_order_relaxed);
+        }
         bytes_received_.fetch_add(
           static_cast<uint64_t>(n), std::memory_order_relaxed);
         rx_buffer_.insert(
           rx_buffer_.end(), temp.begin(), temp.begin() + n);
         parse_available_packets();
+        if (timing_enabled_) {
+          const auto parse_end = std::chrono::steady_clock::now();
+          const double interval_ms = previous_read_end.time_since_epoch().count() == 0 ? -1.0 :
+            std::chrono::duration<double, std::milli>(read_end - previous_read_end).count();
+          const auto parsed = valid_packets_.load(std::memory_order_relaxed) - packets_before;
+          {
+            std::lock_guard<std::mutex> lock(timing_mutex_);
+            timing_window_.add(
+              std::chrono::duration<double, std::milli>(read_end - read_start).count(),
+              interval_ms, static_cast<double>(n), static_cast<double>(parsed),
+              std::chrono::duration<double, std::milli>(parse_end - read_end).count(),
+              unread, read_end_ros_ns);
+          }
+          previous_read_end = read_end;
+        }
 
         if (rx_buffer_.size() > 64 * 1024) {
           RCLCPP_ERROR(
@@ -550,6 +591,21 @@ private:
       static_cast<unsigned long>(discarded_delta),
       static_cast<unsigned long>(error_delta),
       rx_pending_.load(std::memory_order_relaxed));
+    if (timing_enabled_) {
+      acquisition_timing::Window snapshot;
+      double seconds;
+      {
+        std::lock_guard<std::mutex> lock(timing_mutex_);
+        const auto end = std::chrono::steady_clock::now();
+        seconds = std::chrono::duration<double>(end - timing_start_).count();
+        timing_start_ = end;
+        snapshot = timing_window_;
+        timing_window_ = acquisition_timing::Window{};
+      }
+      std_msgs::msg::String report;
+      report.data = snapshot.json(seconds, now().nanoseconds(), get_name(), port_name_, frame_id_);
+      timing_publisher_->publish(report);
+    }
   }
 };
 

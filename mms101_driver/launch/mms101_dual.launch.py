@@ -33,6 +33,7 @@ def generate_launch_description():
         remappings=[('force_torque', LaunchConfiguration('topic1'))],
         parameters=[
             {
+                'timing_diagnostics': LaunchConfiguration('timing_diagnostics'),
                 'port': LaunchConfiguration('port1'),
                 'frame_id': LaunchConfiguration('frame1'),
                 'force_scale': LaunchConfiguration('force_scale'),
@@ -49,6 +50,7 @@ def generate_launch_description():
         remappings=[('force_torque', LaunchConfiguration('topic2'))],
         parameters=[
             {
+                'timing_diagnostics': LaunchConfiguration('timing_diagnostics'),
                 'port': LaunchConfiguration('port2'),
                 'frame_id': LaunchConfiguration('frame2'),
                 'force_scale': LaunchConfiguration('force_scale'),
@@ -58,6 +60,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('timing_diagnostics', default_value='false', description='Optional host-side serial timing summaries'),
         port1_arg,
         port2_arg,
         frame1_arg,
