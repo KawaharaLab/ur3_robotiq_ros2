@@ -12,6 +12,7 @@ def generate_launch_description():
     default_config = os.path.join(package_share, 'config', 'default_config.json')
 
     args = [
+        DeclareLaunchArgument('acquisition_records', default_value='false', description='Per-image acquisition timing records'),
         DeclareLaunchArgument('timing_diagnostics', default_value='false', description='Optional host-side timing summaries'),
         DeclareLaunchArgument('gs_config', default_value=default_config, description='Path to GelSight config JSON'),
         DeclareLaunchArgument('device_path_1', default_value='/dev/v4l/by-id/usb-Arducam_Technology_Co.__Ltd._GelSight_Mini_R0B_65JA-VXKU_65JAVXKU-video-index0', description='Device path for camera 1 (/dev/v4l/by-id/...)'),
@@ -39,6 +40,7 @@ def generate_launch_description():
         '--publish-compressed', LaunchConfiguration('enable_compressed'),
         '--compressed-quality', LaunchConfiguration('compressed_quality'),
         '--timing-diagnostics', LaunchConfiguration('timing_diagnostics'),
+        '--acquisition-records', LaunchConfiguration('acquisition_records'),
     ]
 
     node2_args = [
@@ -51,6 +53,7 @@ def generate_launch_description():
         '--publish-compressed', LaunchConfiguration('enable_compressed'),
         '--compressed-quality', LaunchConfiguration('compressed_quality'),
         '--timing-diagnostics', LaunchConfiguration('timing_diagnostics'),
+        '--acquisition-records', LaunchConfiguration('acquisition_records'),
     ]
 
     nodes = [

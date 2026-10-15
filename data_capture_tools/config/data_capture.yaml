@@ -60,6 +60,19 @@ bag_record:
   compression_mode: file
   compression_format: zstd
 topics:
+  # Optional acquisition records. Published only with acquisition_records:=true.
+  - name: /gelsight_mini_publisher_1/acquisition_timing
+    type: std_msgs/msg/String
+    mode: csv
+  - name: /gelsight_mini_publisher_2/acquisition_timing
+    type: std_msgs/msg/String
+    mode: csv
+  - name: /mms101_driver_1/acquisition_timing
+    type: std_msgs/msg/String
+    mode: csv
+  - name: /mms101_driver_2/acquisition_timing
+    type: std_msgs/msg/String
+    mode: csv
   - name: /camera_wrist/realsense2_camera/color/image_raw
     type: sensor_msgs/msg/Image
     mode: image

@@ -34,6 +34,7 @@ def generate_launch_description():
         parameters=[
             {
                 'timing_diagnostics': LaunchConfiguration('timing_diagnostics'),
+                'acquisition_records': LaunchConfiguration('acquisition_records'),
                 'port': LaunchConfiguration('port1'),
                 'frame_id': LaunchConfiguration('frame1'),
                 'force_scale': LaunchConfiguration('force_scale'),
@@ -51,6 +52,7 @@ def generate_launch_description():
         parameters=[
             {
                 'timing_diagnostics': LaunchConfiguration('timing_diagnostics'),
+                'acquisition_records': LaunchConfiguration('acquisition_records'),
                 'port': LaunchConfiguration('port2'),
                 'frame_id': LaunchConfiguration('frame2'),
                 'force_scale': LaunchConfiguration('force_scale'),
@@ -60,6 +62,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('acquisition_records', default_value='false', description='Per-read acquisition records in 100 ms batches'),
         DeclareLaunchArgument('timing_diagnostics', default_value='false', description='Optional host-side serial timing summaries'),
         port1_arg,
         port2_arg,

@@ -7,6 +7,7 @@ import argparse
 import json
 import time
 import threading
+import uuid
 from typing import Optional
 
 import cv2
@@ -34,6 +35,7 @@ class GelSightMiniPublisher(Node):
         publish_compressed: bool = True,
         compressed_quality: int = 90,
         timing_diagnostics: bool = False,
+        acquisition_records: bool = False,
     ) -> None:
         super().__init__("gelsight_mini_publisher")
         self._bridge = CvBridge()
@@ -43,6 +45,12 @@ class GelSightMiniPublisher(Node):
         self._publish_compressed = publish_compressed
         self._compressed_quality = max(1, min(100, compressed_quality))
 
+        self._acquisition_publisher = None
+        self._acquisition_stream_id = uuid.uuid4().hex if acquisition_records else None
+        self._acquisition_publish_errors = 0
+        self._acquisition_backend = "unknown"
+        if acquisition_records:
+            self._acquisition_publisher = self.create_publisher(String, "~/acquisition_timing", 100)
         self._timing = TimingWindow() if timing_diagnostics else None
         self._previous_read_end_ns = None
         self._diagnostics_publisher = None
@@ -57,6 +65,7 @@ class GelSightMiniPublisher(Node):
             target_height=config.camera_height,
             border_fraction=config.border_fraction,
             timing_diagnostics=timing_diagnostics,
+            acquisition_clock=self._acquisition_clock if acquisition_records else None,
         )
 
         target_device = device_index if device_index is not None else config.default_camera_index
@@ -64,6 +73,11 @@ class GelSightMiniPublisher(Node):
         self.get_logger().info(f"Opening GelSight Mini camera (device: {log_target})")
         self._cam_stream.select_device(target_device, device_path=device_path)
         self._cam_stream.start()
+        if acquisition_records and self._cam_stream.camera is not None:
+            try:
+                self._acquisition_backend = self._cam_stream.camera.cap.getBackendName()
+            except Exception:
+                pass
 
         self._publisher = self.create_publisher(Image, topic_name, 10)
         self._compressed_publisher: Optional[rclpy.publisher.Publisher] = None
@@ -122,6 +136,7 @@ class GelSightMiniPublisher(Node):
                     "raw_publish_ms": (raw_done_ns - header_done_ns) / 1e6,
                 })
 
+            compressed_published = False
             if self._compressed_publisher:
                 try:
                     if self._timing is not None:
@@ -138,12 +153,14 @@ class GelSightMiniPublisher(Node):
                         self.get_logger().warn(
                             "Failed to JPEG-encode GelSight frame", throttle_duration_sec=2.0
                         )
+                        self._publish_acquisition_record(msg, False)
                         continue
                     cmsg = CompressedImage()
                     cmsg.header = msg.header
                     cmsg.format = 'jpeg'
                     cmsg.data = buffer.tobytes()
                     self._compressed_publisher.publish(cmsg)
+                    compressed_published = True
                     if self._timing is not None:
                         self._timing.add(counters={"compressed_publish_calls": 1}, metrics={
                             "compressed_message_publish_ms": (time.monotonic_ns() - encode_end_ns) / 1e6,
@@ -155,7 +172,39 @@ class GelSightMiniPublisher(Node):
                         f"Compressed publish failed: {exc}", throttle_duration_sec=2.0
                     )
             
+            self._publish_acquisition_record(msg, compressed_published)
             last_publish_time = current_time
+
+    def _acquisition_clock(self):
+        # Clock read is bracketed by monotonic readings: do not assume zero skew.
+        before = time.monotonic_ns()
+        ros_ns = self.get_clock().now().nanoseconds
+        return [before, ros_ns, time.monotonic_ns()]
+
+    def _publish_acquisition_record(self, msg, compressed_published):
+        if self._acquisition_publisher is None:
+            return
+        stamp = msg.header.stamp
+        record = {
+            "schema_version": 1, "kind": "gelsight_frame",
+            "stream_id": self._acquisition_stream_id,
+            "frame_seq": self._cam_stream.frame_count,
+            "header_ns": stamp.sec * 1_000_000_000 + stamp.nanosec,
+            "image_topic": self._topic_name, "frame_id": self._frame_id,
+            "opencv_version": cv2.__version__, "backend": self._acquisition_backend,
+            "clock_type": str(self.get_clock().clock_type),
+            "use_sim_time": bool(self.get_parameter("use_sim_time").value),
+            "host_monotonic_clock": "time.monotonic_ns",
+            "clock_sample_layout": ["monotonic_before_ns", "ros_ns", "monotonic_after_ns"],
+            "stages": self._cam_stream.last_acquisition_timing,
+            "compressed_published": compressed_published,
+            "record_publish_errors_total": self._acquisition_publish_errors,
+        }
+        try:
+            self._acquisition_publisher.publish(String(data=json.dumps(record, allow_nan=False)))
+        except Exception as exc:  # additional metadata must not stop image acquisition
+            self._acquisition_publish_errors += 1
+            self.get_logger().error(f"Acquisition timing publish failed: {exc}", throttle_duration_sec=2.0)
 
     def _report_timing(self) -> None:
         report = self._timing.snapshot()
@@ -239,6 +288,10 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
         "--timing-diagnostics", type=_str2bool, default=False,
         help="Publish optional 1 s timing summaries; does not change image header semantics.",
     )
+    parser.add_argument(
+        "--acquisition-records", type=_str2bool, default=False,
+        help="Publish per-image acquisition timing, separate from the original image header.",
+    )
     return parser.parse_known_args()
 
 
@@ -257,6 +310,7 @@ def main() -> None:
         publish_compressed=args.publish_compressed,
         compressed_quality=args.compressed_quality,
         timing_diagnostics=args.timing_diagnostics,
+        acquisition_records=args.acquisition_records,
     )
 
     try:

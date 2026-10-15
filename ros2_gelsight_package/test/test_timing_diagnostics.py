@@ -70,7 +70,7 @@ class AcquisitionPathTests(unittest.TestCase):
                 self.assertEqual(clock.tick, 0)
         self.assertEqual(outputs[0], outputs[1])
 
-    def publisher(self, enabled, compressed=True, encode_ok=True, throttle=False):
+    def publisher(self, enabled, compressed=True, encode_ok=True, throttle=False, records=False):
         clock = FakeTime()
         class Message:
             def __init__(self):
@@ -85,6 +85,13 @@ class AcquisitionPathTests(unittest.TestCase):
                            cvtColor=lambda frame, code: frame, imencode=lambda *args: (encode_ok, Buffer()))}
         cls = load_class(PACKAGE / "ros2_gelsight_publisher.py", "GelSightMiniPublisher", environment)
         node = cls.__new__(cls)
+        node._acquisition_output = []
+        node._acquisition_publisher = types.SimpleNamespace(publish=node._acquisition_output.append) if records else None
+        node._acquisition_stream_id = "test"
+        node._acquisition_backend = "V4L2"
+        node._acquisition_publish_errors = 0
+        node._topic_name = "image"
+        node.get_parameter = lambda name: types.SimpleNamespace(value=False)
         node._timing = TimingWindow() if enabled else None
         node._previous_read_end_ns = None
         node._publish_rate_hz = 25
@@ -95,14 +102,16 @@ class AcquisitionPathTests(unittest.TestCase):
         node._bridge = types.SimpleNamespace(cv2_to_imgmsg=lambda *args, **kwargs: Message())
         node._publisher = types.SimpleNamespace(publish=raw.append)
         node._compressed_publisher = types.SimpleNamespace(publish=jpeg.append) if compressed else None
-        node.get_clock = lambda: types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_msg=lambda: "original_stamp"))
+        stamp = types.SimpleNamespace(sec=1, nanosec=2) if records else "original_stamp"
+        node.get_clock = lambda: types.SimpleNamespace(clock_type=1, now=lambda: types.SimpleNamespace(to_msg=lambda: stamp))
+        environment["cv2"].__version__ = "test"
         node.get_logger = lambda: types.SimpleNamespace(warn=lambda *args, **kwargs: None)
         def update(dt):
             node._running = False
             if throttle:
                 clock.time = lambda: 0.0
             return "unchanged_pixels"
-        node._cam_stream = types.SimpleNamespace(update=update, last_frame_timing={
+        node._cam_stream = types.SimpleNamespace(update=update, frame_count=1, last_acquisition_timing={}, last_frame_timing={
             "read_end_monotonic_ns": 0, "read_block_decode_ms": 53.3, "preprocess_ms": 2.0})
         node._capture_loop()
         return node, raw, jpeg, clock
@@ -120,6 +129,16 @@ class AcquisitionPathTests(unittest.TestCase):
                 self.assertEqual(counters["compressed_publish_calls"], 1)
             else:
                 self.assertEqual(clock.tick, 0)
+
+    def test_per_image_record_tracks_success_and_jpeg_failure_without_changing_raw(self):
+        for encode_ok in (True, False):
+            node, raw, jpeg, _ = self.publisher(False, encode_ok=encode_ok, records=True)
+            self.assertEqual(len(raw), 1)
+            self.assertEqual(len(jpeg), int(encode_ok))
+            self.assertEqual(len(node._acquisition_output), 1)
+            record = json.loads(node._acquisition_output[0].data)
+            self.assertEqual(record["header_ns"], 1_000_000_002)
+            self.assertEqual(record["compressed_published"], encode_ok)
 
     def test_jpeg_failure_is_counted_without_undoing_raw_publish(self):
         node, raw, jpeg, _ = self.publisher(True, encode_ok=False)

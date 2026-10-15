@@ -7,6 +7,8 @@
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include "acquisition_timing.hpp"
+#include "acquisition_records.hpp"
+#include <ctime>
 
 #include <algorithm>
 #include <array>
@@ -31,6 +33,12 @@ class MMS101Node : public rclcpp::Node
 public:
   MMS101Node() : Node("mms101_driver")
   {
+    declare_parameter("acquisition_records", false);
+    acquisition_records_enabled_ = get_parameter("acquisition_records").as_bool();
+    if (acquisition_records_enabled_) {
+      acquisition_stream_id_ = std::to_string(getpid()) + "-" + std::to_string(now().nanoseconds());
+      acquisition_publisher_ = create_publisher<std_msgs::msg::String>("~/acquisition_timing", 100);
+    }
     declare_parameter("timing_diagnostics", false);
     timing_enabled_ = get_parameter("timing_diagnostics").as_bool();
     if (timing_enabled_) {
@@ -70,6 +78,7 @@ public:
         attempt, initialization_retries_, port_name_.c_str());
 
       stop_read_thread();
+      acquisition_startup_attempt_ = attempt;
       first_packet_received_.store(false, std::memory_order_relaxed);
       rx_buffer_.clear();
       rx_pending_.store(0, std::memory_order_relaxed);
@@ -111,6 +120,10 @@ public:
       throw std::runtime_error("MMS101 startup failed after all retry attempts");
     }
 
+    if (acquisition_records_enabled_) {
+      acquisition_timer_ = create_wall_timer(std::chrono::milliseconds(100),
+        std::bind(&MMS101Node::report_acquisition_records, this));
+    }
     diagnostics_timer_ = create_wall_timer(
       std::chrono::seconds(1),
       std::bind(&MMS101Node::report_diagnostics, this));
@@ -137,6 +150,49 @@ private:
   static constexpr std::size_t PACKET_SIZE = 25;
   static constexpr uint8_t HEADER0 = 0x00;
   static constexpr uint8_t HEADER1 = 0x17;
+
+  bool acquisition_records_enabled_{false};
+  std::string acquisition_stream_id_;
+  int acquisition_startup_attempt_{0};
+  uint64_t acquisition_read_sequence_{0}, acquisition_batch_sequence_{0};
+  uint64_t acquisition_failed_reads_{0}, acquisition_failed_samples_{0};
+  acquisition_records::Buffer acquisition_buffer_;
+  acquisition_records::Read * active_acquisition_read_{nullptr};  // read-thread only
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr acquisition_publisher_;
+  rclcpp::TimerBase::SharedPtr acquisition_timer_;
+
+  static int64_t monotonic_ns()
+  {
+    timespec ts{};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+      throw std::runtime_error("CLOCK_MONOTONIC read failed");
+    }
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+  }
+  acquisition_records::ClockSample acquisition_clock()
+  {
+    const auto before = monotonic_ns();
+    const auto ros = now().nanoseconds();
+    return {{before, ros, monotonic_ns()}};
+  }
+  void report_acquisition_records()
+  {
+    auto snapshot = acquisition_buffer_.take();
+    if (snapshot.reads.empty()) return;
+    std_msgs::msg::String report;
+    report.data = acquisition_records::json(snapshot, acquisition_stream_id_,
+      ++acquisition_batch_sequence_, get_name(), port_name_, frame_id_,
+      static_cast<int>(get_clock()->get_clock_type()), get_parameter("use_sim_time").as_bool(),
+      force_scale_, torque_scale_,
+      acquisition_failed_reads_, acquisition_failed_samples_);
+    try {
+      acquisition_publisher_->publish(report);
+    } catch (const std::exception & error) {
+      acquisition_failed_reads_ += snapshot.reads.size();
+      for (const auto & read : snapshot.reads) acquisition_failed_samples_ += read.samples.size();
+      RCLCPP_ERROR(get_logger(), "Acquisition timing publish failed: %s", error.what());
+    }
+  }
 
   bool timing_enabled_{false};
   std::mutex timing_mutex_;
@@ -449,6 +505,12 @@ private:
     message.wrench.torque.z = parse_24bit_be(&packet[19]) * torque_scale_;
 
     publisher_->publish(message);
+    if (active_acquisition_read_) {
+      active_acquisition_read_->samples.push_back({
+        valid_packets_.load(std::memory_order_relaxed) + 1,
+        static_cast<int64_t>(message.header.stamp.sec) * 1000000000LL + message.header.stamp.nanosec,
+        bytes_received_.load(std::memory_order_relaxed) - rx_buffer_.size()});
+    }
     valid_packets_.fetch_add(1, std::memory_order_relaxed);
     first_packet_received_.store(true, std::memory_order_relaxed);
   }
@@ -507,12 +569,25 @@ private:
     std::chrono::steady_clock::time_point previous_read_end{};
 
     while (running_.load(std::memory_order_relaxed) && rclcpp::ok()) {
+      acquisition_records::Read acquisition_read;
+      if (acquisition_records_enabled_) acquisition_read.start = acquisition_clock();
       const auto read_start = timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       const ssize_t n = read(serial_fd_, temp.data(), temp.size());
+      const int read_errno = errno;
+      if (acquisition_records_enabled_) acquisition_read.end = acquisition_clock();
       const auto read_end = timing_enabled_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       read_calls_.fetch_add(1, std::memory_order_relaxed);
 
       if (n > 0) {
+        if (acquisition_records_enabled_) {
+          acquisition_read.sequence = ++acquisition_read_sequence_;
+          acquisition_read.startup_attempt = acquisition_startup_attempt_;
+          acquisition_read.byte_offset = bytes_received_.load(std::memory_order_relaxed);
+          acquisition_read.pending_before = rx_buffer_.size();
+          acquisition_read.discarded_bytes = discarded_bytes_.load(std::memory_order_relaxed);
+          acquisition_read.bytes.assign(temp.begin(), temp.begin() + n);
+          active_acquisition_read_ = &acquisition_read;
+        }
         int unread = -1;
         int64_t read_end_ros_ns = 0;
         uint64_t packets_before = 0;
@@ -526,6 +601,12 @@ private:
         rx_buffer_.insert(
           rx_buffer_.end(), temp.begin(), temp.begin() + n);
         parse_available_packets();
+        active_acquisition_read_ = nullptr;
+        if (acquisition_records_enabled_) {
+          acquisition_read.pending_after = rx_buffer_.size();
+          acquisition_read.discarded_bytes = discarded_bytes_.load(std::memory_order_relaxed) - acquisition_read.discarded_bytes;
+          acquisition_buffer_.push(std::move(acquisition_read));
+        }
         if (timing_enabled_) {
           const auto parse_end = std::chrono::steady_clock::now();
           const double interval_ms = previous_read_end.time_since_epoch().count() == 0 ? -1.0 :
@@ -553,13 +634,13 @@ private:
         }
       } else if (n == 0) {
         continue;
-      } else if (errno == EINTR || errno == EAGAIN) {
+      } else if (read_errno == EINTR || read_errno == EAGAIN) {
         continue;
       } else {
         read_errors_.fetch_add(1, std::memory_order_relaxed);
         RCLCPP_ERROR_THROTTLE(
           get_logger(), *get_clock(), 1000,
-          "serial read failed: %s", std::strerror(errno));
+          "serial read failed: %s", std::strerror(read_errno));
       }
     }
   }

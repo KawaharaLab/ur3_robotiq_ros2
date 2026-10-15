@@ -91,6 +91,7 @@ class GelSightMini:
         target_height: int = 240,
         border_fraction: float = 0.15,
         timing_diagnostics: bool = False,
+        acquisition_clock=None,
     ):
         self.camera: Camera = None
         self.recording: bool = False
@@ -107,6 +108,8 @@ class GelSightMini:
         self.serial_number = None
         self.timing_diagnostics = timing_diagnostics
         self.last_frame_timing = {}
+        self.acquisition_clock = acquisition_clock
+        self.last_acquisition_timing = None
 
     def get_device_list(self) -> dict:
         return Camera.list_devices()
@@ -224,12 +227,25 @@ class GelSightMini:
 
         if self.timing_diagnostics:
             read_start_ns = time.monotonic_ns()
+        if self.acquisition_clock is not None:
+            self.last_acquisition_timing = None
+            acquisition_start = self.acquisition_clock()
         try:
             frame = self.camera.read_frame()
         except Exception as e:
             log_message(f"Error reading frame: {e}")
             return None
 
+        if self.acquisition_clock is not None:
+            acquisition_end = self.acquisition_clock()
+            # V4L2 exposes its buffer timestamp here. Keep the backend value
+            # unmodified: clock/source flags and physical accuracy need validation.
+            try:
+                backend_pos_msec = float(self.camera.cap.get(cv2.CAP_PROP_POS_MSEC))
+                if not (0.0 < backend_pos_msec < float("inf")):
+                    backend_pos_msec = None
+            except Exception:
+                backend_pos_msec = None
         if self.timing_diagnostics:
             read_end_ns = time.monotonic_ns()
         time_now = time.time()
@@ -247,6 +263,9 @@ class GelSightMini:
             border_fraction=self.border_fraction,
         )
 
+        if self.acquisition_clock is not None:
+            acquisition_preprocess_end = self.acquisition_clock()
+
         if self.recording and self.video_writer is not None:
             self.video_writer.write(cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR))
 
@@ -256,6 +275,13 @@ class GelSightMini:
                 "read_block_decode_ms": (read_end_ns - read_start_ns) / 1e6,
                 "preprocess_ms": (preprocess_end_ns - read_end_ns) / 1e6,
                 "read_end_monotonic_ns": read_end_ns,
+            }
+        if self.acquisition_clock is not None:
+            self.last_acquisition_timing = {
+                "read_start": acquisition_start,
+                "read_end": acquisition_end,
+                "preprocess_end": acquisition_preprocess_end,
+                "backend_pos_msec": backend_pos_msec,
             }
         return self.current_frame
 
