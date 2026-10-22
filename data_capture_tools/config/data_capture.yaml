@@ -48,6 +48,10 @@ centering_min_step_grip: 0.0005   # 探査時のグリッパ閉じ幅の最小�
 safe_margin: 0.015          # 接触前の事前アプローチ用余白 (m)  <-- ★追加
 
 # viewer_topics:
+  # Experimental af stages/status; original timestamps and trial IDs are in JSON.
+  - name: /force_press_event
+    type: std_msgs/msg/String
+    mode: csv
 #   - /camera_fixed/realsense2_camera/color/image_raw
 #   - /camera_wrist/realsense2_camera/color/image_raw
 viewer_topics: []

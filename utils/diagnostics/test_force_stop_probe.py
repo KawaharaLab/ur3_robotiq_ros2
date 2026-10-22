@@ -118,13 +118,15 @@ class WireTests(unittest.TestCase):
 
 
 class SimulatedRunTests(unittest.TestCase):
-    def simulate(self,mode):
-        callbacks=[];stopped=threading.Event();controller={'moving':False,'commands':[],'active':True,'last_status':None,'status_gaps':[],'status_reads':0}
+    def simulate(self,mode,collection=None):
+        callbacks=[];stopped=threading.Event();controller={'moving':False,'commands':[],'active':True,'last_status':None,'status_gaps':[],'status_reads':0,
+                    'position':getattr(collection,'start_raw',50),'target':getattr(collection,'start_raw',50)}
         class Node:
             def __init__(self,*a):pass
             def get_parameter(self,*a):return types.SimpleNamespace(value=False)
             def get_clock(self):return types.SimpleNamespace(now=lambda:types.SimpleNamespace(nanoseconds=time.time_ns()))
             def create_subscription(self,typ,topic,callback,qos):callbacks.append((topic,callback));return object()
+            def create_publisher(self,*a):return types.SimpleNamespace(publish=lambda msg:None)
             def count_publishers(self,t):return 0
             def destroy_node(self):pass
         class Executor:
@@ -132,6 +134,7 @@ class SimulatedRunTests(unittest.TestCase):
             def spin(self):
                 while not stopped.is_set():
                     ns=time.time_ns();value=.6 if controller['moving'] and mode=='force' else 0.
+                    if mode=='collection':value=max(0.,min(.8,(controller['position']-collection.start_raw)*.2))
                     for topic,callback in callbacks:
                         v=types.SimpleNamespace(x=0.,y=value,z=0.)
                         msg=types.SimpleNamespace(header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=ns//10**9,nanosec=ns%10**9)),wrench=types.SimpleNamespace(force=v,torque=v))
@@ -145,9 +148,16 @@ class SimulatedRunTests(unittest.TestCase):
                 if last is not None:controller['status_gaps'].append(now-last)
                 controller['last_status']=now;controller['status_reads']+=1
                 fault=9 if mode=='watchdog' and (last is None or now-last>1.) else 0
-                return {'g_act':int(controller['active']),'g_sta':3 if controller['active'] else 0,'g_flt':fault,'g_gto':int(controller['moving']),'g_obj':0 if controller['moving'] else 3,'g_po':50,'g_pr':50,'g_cu':0}
+                if mode=='collection' and controller['moving']:
+                    controller['position']+=(controller['target']>controller['position'])-(controller['target']<controller['position'])
+                position=controller['position'] if mode=='collection' else 50
+                target=controller['target'] if mode=='collection' else 50
+                return {'g_act':int(controller['active']),'g_sta':3 if controller['active'] else 0,'g_flt':fault,
+                        'g_gto':int(controller['moving']),'g_obj':0 if controller['moving'] and position!=target else 3,
+                        'g_po':position,'g_pr':target,'g_cu':0}
             def command(self,pos,speed,force,go):
                 controller['commands'].append(go);controller['moving']=go
+                if mode=='collection':controller['target']=pos if go else controller['target']
                 if mode=='manual' and go: os.write(master,b'\n')
                 if mode=='ack_failure' and go:raise TimeoutError('simulated lost ACK')
             def close(self):pass
@@ -156,12 +166,14 @@ class SimulatedRunTests(unittest.TestCase):
         for name,values in {'rclpy.node':{'Node':Node},'rclpy.executors':{'SingleThreadedExecutor':Executor},
             'rclpy.signals':{'SignalHandlerOptions':types.SimpleNamespace(NO=0)},
             'rclpy.qos':{'QoSProfile':lambda **kw:kw,'ReliabilityPolicy':types.SimpleNamespace(BEST_EFFORT=0)},
-            'geometry_msgs.msg':{'WrenchStamped':object}}.items():
+            'geometry_msgs.msg':{'WrenchStamped':object},
+            'std_msgs.msg':{'String':lambda **kw:types.SimpleNamespace(**kw),'Float32':lambda **kw:types.SimpleNamespace(**kw)},
+            'robotiq_2f_gripper_msgs.msg':{'GripperStatus':lambda:types.SimpleNamespace(header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=0,nanosec=0)))}}.items():
             m=types.ModuleType(name);m.__dict__.update(values);modules[name]=m
         with tempfile.TemporaryDirectory() as temp:
             a=types.SimpleNamespace(port='/dev/test',baud=115200,slave=9,out=Path(temp)/'result',enable_motion=mode!='readonly',
                 close_ticks=4,speed_byte=0,force_byte=0,threshold_n=.5,hard_limit_n=1.,force_metric='max',
-                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode in ('timed','watchdog') else None,hold_seconds=0.)
+                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode in ('timed','watchdog') else None,hold_seconds=0.,target_confirm_ms=5. if mode=='collection' else 0.)
             master,slave=pty.openpty()
             with os.fdopen(slave,'r',buffering=1) as stdin:
                 go_writer=None
@@ -171,7 +183,7 @@ class SimulatedRunTests(unittest.TestCase):
                     go_writer=threading.Thread(target=delayed_go);go_writer.start()
                 else:os.write(master,b'GO\n')
                 with patch.dict('sys.modules',modules),patch.object(probe,'Port',Port),patch.object(probe.sys,'stdin',stdin),patch('sys.stdout',new=io.StringIO()):
-                    code=probe.run(a)
+                    code=probe.run(a,collection=collection)
                 if go_writer:go_writer.join(timeout=2)
                 if mode=='watchdog':
                     self.assertGreater(controller['status_reads'],20)

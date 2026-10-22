@@ -1,0 +1,175 @@
+"""Force-triggered press/position-hold collection menu, isolated from legacy AP/init."""
+import json
+import select
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+from .force_press_worker import validate_plan
+
+
+class ForcePressCollectionMixin:
+    def _init_force_press(self):
+        self._force_press_process = None
+        self._force_press_handoff_active = False
+        self._force_press_lock = threading.Lock()
+        defaults = dict(port='/dev/ttyUSB0', baud=115200, slave=9, threshold_n=.5,
+                        hard_limit_n=1., hold_seconds=4., clearance_m=.002,
+                        max_depth_per_side_m=float(self.config.push_depth),
+                        close_ticks=20, max_motion_ms=2000, target_confirm_ms=5.)
+        self._force_press_settings = {
+            name: self.declare_parameter('force_press_'+name, default).value
+            for name, default in defaults.items()
+        }
+
+    def _force_press_normal_control_ready(self, command):
+        normal_commands={'i','s','ap','as','av','arp','ah','aur','ad','ak','ae'}
+        if not self._force_press_handoff_active or command not in normal_commands: return True
+        if self.count_publishers('/robotiq_2f_gripper/status') and self.count_subscribers('/robot_cmd'):
+            self._force_press_handoff_active=False
+            return True
+        self.get_logger().error('Restart the normal gripper driver and gripper_client before init/AP. af currently owns the experimental control path.')
+        return False
+
+    def _stop_force_press_worker(self):
+        with self._force_press_lock:
+            process = self._force_press_process
+        if process is not None and process.poll() is None:
+            try:
+                process.send_signal(signal.SIGINT)
+                process.wait(timeout=3.)
+            except ProcessLookupError:
+                pass
+            except subprocess.TimeoutExpired:
+                # Killing the serial owner would prevent its best-effort STOP.
+                self.get_logger().error('Force worker did not exit; use independent gripper stop. Worker left alive for STOP cleanup.')
+
+    def _run_force_press_worker(self, plan_path, output):
+        command = [sys.executable, '-m', 'data_capture_tools.force_press_worker',
+                   '--plan', str(plan_path), '--out', str(output), '--enable-motion']
+        with self._force_press_lock:
+            if self._stop_event.is_set(): return None
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+            self._force_press_process = process
+        self.get_logger().info('Force trial active. Enter aborts this trial and the remaining loop.')
+        stop_sent = False
+        next_health_check = time.monotonic()+.2
+        try:
+            while process.poll() is None:
+                manual = False
+                if sys.stdin.isatty() and select.select([sys.stdin], [], [], .02)[0]:
+                    sys.stdin.readline()
+                    manual = True
+                recorder_failed = self._bag_process is None or self._bag_process.poll() is not None
+                sensors_failed = False
+                if time.monotonic() >= next_health_check:
+                    sensors_failed = not self._check_sensors_health()
+                    next_health_check = time.monotonic()+.2
+                if (manual or self._stop_event.is_set() or recorder_failed or sensors_failed) and not stop_sent:
+                    try: process.send_signal(signal.SIGINT)
+                    except ProcessLookupError: pass
+                    stop_sent = True
+                time.sleep(.01)
+            return process.returncode
+        finally:
+            with self._force_press_lock:
+                if process.poll() is not None: self._force_press_process = None
+
+    def _prepare_force_press_session(self):
+        # Reserve a fresh directory before the legacy helper copies config.
+        # A fixed session_id must not overwrite a previous experiment.
+        original=self._session_id_override
+        timestamp=original or datetime.now().strftime('%Y%m%d_%H%M%S')
+        destination=self.config.output_root/self.config.task_name/timestamp
+        destination.mkdir(parents=True,exist_ok=False)
+        self._session_id_override=timestamp
+        try: self._prepare_session()
+        finally: self._session_id_override=original
+
+    def _execute_force_press_loop(self):
+        from std_msgs.msg import String
+        if not self._check_sensors_health(): return
+        if self._effective_object_width_m is None:
+            self.get_logger().error('Run init [i] first.')
+            return
+        if self.count_publishers('/robotiq_2f_gripper/status'):
+            self.get_logger().error('Finish init, stop gripper_client and the normal gripper driver (deactivate_on_shutdown:=false), then select af again. Keep this manager and sensors running.')
+            return
+        self._force_press_handoff_active=True
+        if not sys.stdin.isatty():
+            self.get_logger().error('af requires an interactive terminal.')
+            return
+        count = self._read_positive_int('Number of force-stop trials: ')
+        if count is None: return
+        base = dict(self._force_press_settings, effective_width_m=self._effective_object_width_m, trial_index=1)
+        try:
+            start_width, minimum_width = validate_plan(base)
+        except ValueError as exc:
+            self.get_logger().error(str(exc))
+            return
+        self.get_logger().warn(
+            f"af: target={base['threshold_n']} N (max of baseline-relative Fy), "
+            f"raw hard limit={base['hard_limit_n']} N, confirm={base['target_confirm_ms']} ms, "
+            f"start width={start_width*1000:.2f} mm, minimum width={minimum_width*1000:.2f} mm, "
+            f"relative cap={base['close_ticks']} counts, hold={base['hold_seconds']} s. "
+            'Preparation and release are automatic. Clear hands; Enter/Ctrl+C requests STOP. '
+            'The probe does not regulate force during hold.'
+        )
+        print('Type GO to record and execute this force-stop series: ', end='', flush=True)
+        if sys.stdin.readline().strip() != 'GO': return
+        if not any(t.name == '/force_press_event' for t in self.config.topics):
+            self.get_logger().error('Config must record /force_press_event (std_msgs/msg/String). No motion started.')
+            return
+        metadata = None
+        try:
+            for index in range(1, count+1):
+                if self._stop_event.is_set() or not self._check_sensors_health(): break
+                if (index-1) % 10 == 0:
+                    if self._bag_process: self._stop_rosbag()
+                    self._prepare_force_press_session()
+                    metadata_path = self._session_dir/'force_press_metadata.json'
+                    if metadata_path.exists(): raise RuntimeError('Existing force collection session; use a new session id')
+                    (self._session_dir/'force_press').mkdir(exist_ok=False)
+                    metadata = dict(schema_version=1, experiment='af', effective_object_width_m=self._effective_object_width_m,
+                                    settings=base, actual_condition_order=[],
+                                    note='Position hold after force-triggered stop; not constant-force feedback. Original bag and per-trial sidecars are required.')
+                    metadata_path.write_text(json.dumps(metadata,indent=2)+'\n')
+                    self._start_rosbag()
+                    if self._stop_event.wait(3.5): break
+                    if self._bag_process.poll() is not None: raise RuntimeError('Bag recorder exited; no force motion started')
+                plan = dict(base, trial_index=index)
+                directory = self._session_dir/'force_press'
+                plan_path = directory/f'trial_{index:04d}_plan.json'
+                output = directory/f'trial_{index:04d}'
+                plan_path.write_text(json.dumps(plan,indent=2)+'\n')
+                self._publish_trial_event('START',index,'force_press_hold',minimum_width,0.)
+                self._marker_pub.publish(String(data=f'START,trial:{index},model:force_press_hold,target_force_n:{base["threshold_n"]}'))
+                self._is_active_session=True
+                code=self._run_force_press_worker(plan_path,output)
+                self._is_active_session=False
+                result_path=output/'summary.json'
+                result=json.loads(result_path.read_text()) if result_path.exists() else {}
+                success=(code==0 and result.get('error') is None and result.get('stop_acknowledged') is True
+                         and (result.get('stop_trigger') or {}).get('reason')=='force_threshold'
+                         and result.get('collection',{}).get('completed') is True
+                         and result.get('collection',{}).get('event_publish_errors',1)==0)
+                event='END' if success else 'ABORT'
+                self._publish_trial_event(event,index,'force_press_hold',minimum_width,0.)
+                self._marker_pub.publish(String(data=f'{event},trial:{index},model:force_press_hold'))
+                metadata['actual_condition_order'].append(dict(trial_index=index,plan=plan,success=success,
+                                                             result=str(result_path.relative_to(self._session_dir))))
+                metadata_path.write_text(json.dumps(metadata,indent=2)+'\n')
+                self.get_logger().info(f'Force trial {index}: {event}; logs: {output}')
+                if not success:
+                    self.get_logger().error('Force series stopped. No automatic retry or release on failed trial. Review summary before continuing.')
+                    break
+                if self._stop_event.wait(1.): break
+        except Exception as exc:
+            self.get_logger().error('Force collection stopped: '+str(exc))
+        finally:
+            self._stop_force_press_worker()
+            self._is_active_session=False
+            if self._bag_process: self._stop_rosbag()

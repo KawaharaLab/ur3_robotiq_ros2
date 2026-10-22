@@ -13,6 +13,8 @@ setup(
             ['resource/' + package_name],
         ),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/diagnostics', ['../utils/diagnostics/force_stop_probe.py']),
+        ('share/' + package_name + '/docs', ['docs/force_press_collection.md']),
         (
             'share/' + package_name + '/config',
             glob('config/*.yaml'),

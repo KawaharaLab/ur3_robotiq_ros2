@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Experimental MMS101-triggered Robotiq stop probe. Linux, ROS Humble, exclusive serial ownership.
-No arm commands or automatic reopening. No activation or reset. Default is read-only.
+No arm commands, activation or reset. Standalone CLI is read-only by default and
+never reopens automatically. An explicitly authorized collection hook may prepare/release.
 """
 import argparse
 import collections
@@ -175,7 +176,7 @@ class Port:
 
 class ForceState:
     """Raw, tared Fy. Stop decision happens in the receiving callback; it is latched."""
-    def __init__(self, threshold, hard_limit, stale_ms, metric):
+    def __init__(self, threshold, hard_limit, stale_ms, metric, target_confirm_ms=0.):
         self.lock = threading.RLock()
         self.latest = {}
         self.offsets = {}
@@ -186,6 +187,8 @@ class ForceState:
         self.armed = False
         self.reason = None
         self.trigger = None
+        self.target_confirm_ns = round(target_confirm_ms*1e6)
+        self.target_candidates = {}
 
     def update(self, side, header_ns, received_ns, ros_now_ns, wrench):
         with self.lock:
@@ -205,6 +208,9 @@ class ForceState:
             self.reason = reason
             self.trigger = {'reason': reason, 'monotonic_ns': now,
                             'force_n': self.values(),
+                            'target_confirm_ms': self.target_confirm_ns/1e6,
+                            'target_confirmation_reset_ratio': .8,
+                            'target_evidence': dict(self.target_candidates),
                             'source_headers_ns': {s:r['header_ns'] for s,r in self.latest.items()}}
 
     def _evaluate(self, now):
@@ -224,8 +230,33 @@ class ForceState:
             self._latch('invalid_force_value', now)
         elif max(values.values()) >= self.hard_limit:
             self._latch('force_hard_limit', now)
-        elif (max(values.values()) if self.metric == 'max' else sum(values.values())/2) >= self.threshold:
+        elif self._target_confirmed(values):
             self._latch('force_threshold', now)
+
+    def _target_confirmed(self, values):
+        if not self.target_confirm_ns:
+            return (max(values.values()) if self.metric == 'max' else sum(values.values())/2) >= self.threshold
+        # Collection uses max: each side must supply its own consecutive evidence.
+        # Other-side callbacks and main-loop checks cannot advance this duration.
+        if self.metric != 'max': raise ValueError('Confirmation currently requires max metric')
+        reached = False
+        for side, row in self.latest.items():
+            received, header = row['receive_monotonic_ns'], row['header_ns']
+            old = self.target_candidates.get(side)
+            # Hysteresis tolerates small threshold-edge fluctuations; a return
+            # below 80% cancels the candidate. Confirmation itself still requires
+            # the current sample to be at or above the target.
+            if values[side] < self.threshold * (.8 if old is not None else 1.):
+                self.target_candidates.pop(side, None)
+                continue
+            if old is None or received-old[2] > max(10_000_000, 2*self.target_confirm_ns) or header-old[3] > max(10_000_000, 2*self.target_confirm_ns) or header <= old[3] and received != old[2]:
+                old = (received, header, received, header, 1)
+            elif received != old[2]:
+                old = (old[0], old[1], received, header, old[4]+1)
+            self.target_candidates[side] = old
+            reached |= (values[side] >= self.threshold and old[4] >= 3
+                        and received-old[0] >= self.target_confirm_ns and header-old[1] >= self.target_confirm_ns)
+        return reached
 
     def check(self, now):
         with self.lock:
@@ -280,7 +311,7 @@ def arguments():
     return a
 
 
-def run(a):
+def run(a, collection=None):
     import rclpy
     from rclpy.node import Node
     from rclpy.executors import SingleThreadedExecutor
@@ -292,13 +323,16 @@ def run(a):
     node = Node('force_stop_probe')
     if node.get_parameter('use_sim_time').value:
         raise RuntimeError('Physical probe requires use_sim_time=false')
-    state = ForceState(a.threshold_n, a.hard_limit_n, a.stale_ms, a.force_metric)
+    state = ForceState(a.threshold_n, a.hard_limit_n, a.stale_ms, a.force_metric,
+                       getattr(a, 'target_confirm_ms', 0.))
+    if collection is not None: collection.setup(node)
     events, statuses = [], []
     stop_watch = threading.Event()
     manual_stop = threading.Event()
     def event(name, **data):
         row = {'event':name,'monotonic_ns':time.monotonic_ns(),'ros_ns':node.get_clock().now().nanoseconds,**data}
         events.append(row)
+        if collection is not None: collection.on_event(row)
         return row
     def callback(side):
         def receive(msg):
@@ -336,7 +370,9 @@ def run(a):
     def status():
         before = time.monotonic_ns()
         value = port.status()
-        statuses.append({'request_monotonic_ns':before,'response_monotonic_ns':time.monotonic_ns(),**value})
+        record = {'request_monotonic_ns':before,'response_monotonic_ns':time.monotonic_ns(),**value}
+        statuses.append(record)
+        if collection is not None: collection.on_status(record)
         return value
     def stop():
         nonlocal stop_acknowledged
@@ -357,7 +393,13 @@ def run(a):
         initial_status = status()
         event('handoff_initial_status', status=initial_status)
         initial_status = recover_handoff_timeout(initial_status, status, event, manual_stop.is_set)
+        if collection is not None:
+            if not a.enable_motion: raise RuntimeError('Collection requires explicit motion authorization')
+            collection.prepare(port, status, event, state, manual_stop)
+            initial_status = status()
+            require_ready_status(initial_status)
         target = min(255,initial_status['g_po']+a.close_ticks)
+        if collection is not None: target = collection.bound_target(target)
         if target==initial_status['g_po']: raise RuntimeError('No closing range remains')
         print(f'Current raw position={initial_status["g_po"]}; bounded target={target}; speed byte={a.speed_byte}.', flush=True)
         if not a.enable_motion:
@@ -365,10 +407,11 @@ def run(a):
             print('READ ONLY: no motion/activation/stop command sent. Use --enable-motion only for a deliberate test.',flush=True)
             return 0
         print('Pressing starts only after GO. Enter stops after start; Ctrl+C also requests STOP. Hardware stop remains independent.',flush=True)
-        if not confirm('GO'):
+        if collection is None and not confirm('GO'):
             event('not_started');return 0
         if state.reason: raise RuntimeError('Stop was requested before start')
         begin = time.monotonic_ns()
+        event('baseline_start')
         while time.monotonic_ns()-begin<1_000_000_000 and state.reason is None:
             require_ready_status(status())
             time.sleep(.05)
@@ -382,7 +425,7 @@ def run(a):
             state.armed = True
             state._evaluate(time.monotonic_ns())
         if state.reason: raise RuntimeError('Force/timestamp check failed before motion: '+state.reason)
-        event('baseline_ready', offsets=dict(state.offsets))
+        event('baseline_ready', offsets=dict(state.offsets), target_confirm_ms=getattr(a, 'target_confirm_ms', 0.))
         keyboard_input = sys.stdin
         def keyboard():
             while not stop_watch.is_set():
@@ -393,7 +436,8 @@ def run(a):
                     if not stop_watch.is_set():request_manual('manual_input_closed')
                     return
         keyboard_thread = threading.Thread(target=keyboard,daemon=True)
-        keyboard_thread.start()
+        if collection is None: keyboard_thread.start()
+        else: keyboard_thread = None
         if state.check(time.monotonic_ns()) is not None or manual_stop.is_set():
             event('not_started_after_guard');return 2
         motion_event = event('motion_write_start',target_raw=target)
@@ -416,6 +460,7 @@ def run(a):
             time.sleep(.001)
         stop()
         # Observe controller state and quantized position. This is NOT a high-speed physical motion measurement.
+        if collection is not None: event('hold_start', stop_reason=state.reason)
         hold_end = time.monotonic()+max(.2, a.hold_seconds if state.reason in ('force_threshold','timed_stop') else .2)
         clear_seen = False
         first_observation = True
@@ -425,9 +470,13 @@ def run(a):
             if not s['g_gto'] and not clear_seen:
                 event('controller_gto_clear_observed',g_po=s['g_po']);clear_seen=True
             if s['g_flt']:event('post_stop_fault',fault=s['g_flt']);break
+            if collection is not None: collection.check_health(state, manual_stop)
             time.sleep(.05)
         event('observation_end',controller_stop_echo_seen=clear_seen)
         if not clear_seen: raise RuntimeError('No gGTO=0 echo observed after stop')
+        if collection is not None:
+            if manual_stop.is_set(): raise KeyboardInterrupt('Manual stop during collection hold')
+            collection.finish(port, status, event, state, manual_stop)
     except BaseException as exc:
         error = f'{type(exc).__name__}: {exc}'
         exit_code = 2
@@ -456,6 +505,12 @@ def run(a):
                    'stop_acknowledged':stop_acknowledged,'stop_trigger':trigger,'manual_stop_requested':manual_stop.is_set(),'error':error,
                    'force_log_overflow':state.log_overflow,'offsets':state.offsets,
                    'note':'Host callback/Modbus ACK/controller echo only; not calibrated physical stopping time. Raw register counts are not indentation mm. No automatic reopen.'}
+        if collection is not None:
+            summary['collection'] = collection.summary()
+            summary['press_motion_may_have_started'] = motion_may_have_started
+            summary['motion_may_have_started'] = motion_may_have_started or summary['collection'].get('auxiliary_motion_commanded', False)
+            summary['note'] = 'Host callback/Modbus ACK/controller echo only; not physical stopping time. Collection may prepare and release after successful force stop and hold. Width conversion is empirical.'
+            summary['post_trigger_peak_scope'] = 'All remaining received samples, including hold and release; use events to isolate pressing overshoot.'
         if trigger:
             first = next((e for e in events if e['event']=='stop_write_start'),None)
             ack = next((e for e in events if e['event']=='stop_write_ack'),None)

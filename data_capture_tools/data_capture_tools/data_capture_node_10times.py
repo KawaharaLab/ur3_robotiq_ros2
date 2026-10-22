@@ -28,6 +28,7 @@ from ament_index_python.packages import PackageNotFoundError
 
 from .bag_converter import convert_bag_to_dataset
 from .config import CaptureConfig, load_capture_config
+from .force_press_collection import ForcePressCollectionMixin
 from sensor_msgs.msg import Image, CompressedImage
 
 
@@ -219,7 +220,7 @@ class ForceSensorMonitor:
             return False, "🔴 ERROR (Right のみ通信が途絶)"
 
 
-class DataCaptureNode(Node):
+class DataCaptureNode(ForcePressCollectionMixin, Node):
     """Coordinates rosbag2 recording and dataset conversion."""
 
     def __init__(self) -> None:
@@ -306,6 +307,7 @@ class DataCaptureNode(Node):
         # __init__ メソッド内の適当な場所に追加
         self._calibrated_target_m = None  # ★キャリブレーション済みの目標押し込み幅
         self._effective_object_width_m = None
+        self._init_force_press()
         
         
         # --- 追加: 左右のGelSight監視用変数 ---
@@ -455,6 +457,7 @@ class DataCaptureNode(Node):
             print(" [s]: Start Single Trial (Record & Run)")
             print(" [ae]: Execute Standard Suite")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
+            print(" [af]: Force-triggered press and position hold (experimental)")
             print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [av]: Loading-speed sweep")
             print(" [arp]: Repeated press")
@@ -469,6 +472,8 @@ class DataCaptureNode(Node):
             line = sys.stdin.readline().strip().lower()
             if not line: continue
 
+            if not self._force_press_normal_control_ready(line):
+                continue
             if line == 'i':
                 # 手動でのみ実行
                 self._run_init_sequence()
@@ -476,6 +481,8 @@ class DataCaptureNode(Node):
                 self._execute_trial()
             elif line == 'ap':
                 self._execute_auto_loop()
+            elif line == 'af':
+                self._execute_force_press_loop()
             elif line == 'as':
                 self._execute_push_slide_loop()
             elif line == 'av':
@@ -2591,6 +2598,8 @@ class DataCaptureNode(Node):
 
     def _finalize_all(self) -> None:
         """ノード終了時のクリーンアップ."""
+        self._stop_event.set()
+        self._stop_force_press_worker()
         self._stop_viewers() #
         self._stop_aux_processes() #
         self._cleanup_existing_viewers() #
