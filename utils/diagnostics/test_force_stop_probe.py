@@ -48,6 +48,30 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(s.reason,'manual_signal')
 
 
+class HandoffTimeoutTests(unittest.TestCase):
+    def status(self, fault=0):
+        return dict(g_act=1, g_sta=3, g_flt=fault, g_gto=0, g_obj=0, g_po=3)
+    def test_only_transient_09_is_read_until_clear(self):
+        events=[];reads=[]
+        def read():
+            reads.append(1)
+            return self.status(9 if len(reads)==1 else 0)
+        value=probe.recover_handoff_timeout(self.status(9),read,lambda *a,**kw:events.append(a[0]),lambda:False)
+        self.assertEqual(value['g_flt'],0)
+        self.assertEqual(len(reads),2)
+        self.assertEqual(events,['handoff_communication_timeout_observed','handoff_communication_timeout_cleared'])
+    def test_persistent_09_aborts_without_bypass(self):
+        with self.assertRaisesRegex(RuntimeError,'gFLT=0x09'):
+            probe.recover_handoff_timeout(self.status(9),lambda:self.status(9),lambda *a,**kw:None,lambda:False,timeout_s=.01)
+    def test_other_fault_and_inactive_abort_without_retry(self):
+        for value in [self.status(8), dict(self.status(9),g_act=0)]:
+            with self.assertRaises(RuntimeError):
+                probe.recover_handoff_timeout(value,lambda:self.fail('must not retry'),lambda *a,**kw:None,lambda:False)
+    def test_moving_handoff_aborts(self):
+        with self.assertRaisesRegex(RuntimeError,'already moving'):
+            probe.recover_handoff_timeout(dict(self.status(9),g_gto=1),lambda:self.fail('must not retry'),lambda *a,**kw:None,lambda:False)
+
+
 class WireTests(unittest.TestCase):
     def test_crc_reference_and_stop_has_no_reset_or_release_bits(self):
         self.assertEqual(probe.crc16(b'123456789'),0x4b37)
@@ -95,7 +119,7 @@ class WireTests(unittest.TestCase):
 
 class SimulatedRunTests(unittest.TestCase):
     def simulate(self,mode):
-        callbacks=[];stopped=threading.Event();controller={'moving':False,'commands':[],'active':True}
+        callbacks=[];stopped=threading.Event();controller={'moving':False,'commands':[],'active':True,'last_status':None,'status_gaps':[],'status_reads':0}
         class Node:
             def __init__(self,*a):pass
             def get_parameter(self,*a):return types.SimpleNamespace(value=False)
@@ -116,7 +140,12 @@ class SimulatedRunTests(unittest.TestCase):
             def shutdown(self,**kw):stopped.set()
         class Port:
             def __init__(self,*a):pass
-            def status(self):return {'g_act':int(controller['active']),'g_sta':3 if controller['active'] else 0,'g_flt':0,'g_gto':int(controller['moving']),'g_obj':0 if controller['moving'] else 3,'g_po':50,'g_pr':50,'g_cu':0}
+            def status(self):
+                now=time.monotonic();last=controller['last_status']
+                if last is not None:controller['status_gaps'].append(now-last)
+                controller['last_status']=now;controller['status_reads']+=1
+                fault=9 if mode=='watchdog' and (last is None or now-last>1.) else 0
+                return {'g_act':int(controller['active']),'g_sta':3 if controller['active'] else 0,'g_flt':fault,'g_gto':int(controller['moving']),'g_obj':0 if controller['moving'] else 3,'g_po':50,'g_pr':50,'g_cu':0}
             def command(self,pos,speed,force,go):
                 controller['commands'].append(go);controller['moving']=go
                 if mode=='manual' and go: os.write(master,b'\n')
@@ -132,15 +161,27 @@ class SimulatedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             a=types.SimpleNamespace(port='/dev/test',baud=115200,slave=9,out=Path(temp)/'result',enable_motion=mode!='readonly',
                 close_ticks=4,speed_byte=0,force_byte=0,threshold_n=.5,hard_limit_n=1.,force_metric='max',
-                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode=='timed' else None,hold_seconds=0.)
+                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode in ('timed','watchdog') else None,hold_seconds=0.)
             master,slave=pty.openpty()
             with os.fdopen(slave,'r',buffering=1) as stdin:
-                os.write(master,b'GO\n')
+                go_writer=None
+                if mode=='watchdog':
+                    def delayed_go():
+                        time.sleep(1.2);os.write(master,b'GO\n')
+                    go_writer=threading.Thread(target=delayed_go);go_writer.start()
+                else:os.write(master,b'GO\n')
                 with patch.dict('sys.modules',modules),patch.object(probe,'Port',Port),patch.object(probe.sys,'stdin',stdin),patch('sys.stdout',new=io.StringIO()):
                     code=probe.run(a)
+                if go_writer:go_writer.join(timeout=2)
+                if mode=='watchdog':
+                    self.assertGreater(controller['status_reads'],20)
+                    self.assertLess(max(controller['status_gaps']),.5)
                 result=json.loads((a.out/'summary.json').read_text())
             os.close(master)
             return code,result,controller['commands']
+    def test_watchdog_clears_and_reads_continue_during_go_wait_and_baseline(self):
+        code,r,commands=self.simulate('watchdog');self.assertEqual(code,0,r)
+        self.assertEqual(commands,[True,False]);self.assertEqual(r['stop_trigger']['reason'],'timed_stop')
     def test_readonly_sends_no_motion_or_stop(self):
         code,r,commands=self.simulate('readonly');self.assertEqual(code,0);self.assertEqual(commands,[])
     def test_threshold_stops_and_records_latency(self):

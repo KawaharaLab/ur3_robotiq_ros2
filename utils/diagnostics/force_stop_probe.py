@@ -50,6 +50,36 @@ def decode_status(response):
             'g_po': response[7], 'g_cu': response[8]}
 
 
+def require_ready_status(value):
+    if value['g_act'] != 1 or value['g_sta'] != 3 or value['g_flt'] != 0:
+        raise RuntimeError('Gripper must be activated and fault-free: '
+                           f"gACT={value['g_act']}, gSTA={value['g_sta']}, gFLT=0x{value['g_flt']:02x}; "
+                           'probe will not reset/activate it')
+    if value['g_gto'] and value['g_obj'] == 0:
+        raise RuntimeError('Gripper is already moving')
+
+
+def recover_handoff_timeout(initial, read_status, event, canceled, timeout_s=1.):
+    """Read only: allow a stale 0x09 echo to clear after exclusive serial handoff.
+    No write, reset, activation, or ignoring persistent/other faults.
+    """
+    value = initial
+    deadline = time.monotonic() + timeout_s
+    if value['g_flt'] == 9:
+        event('handoff_communication_timeout_observed', status=value)
+    while value['g_act'] == 1 and value['g_sta'] == 3 and value['g_flt'] == 9:
+        if value['g_gto'] and value['g_obj'] == 0:
+            raise RuntimeError('Gripper is already moving')
+        if canceled(): raise KeyboardInterrupt('Canceled during handoff status check')
+        if time.monotonic() >= deadline: break
+        time.sleep(.05)
+        value = read_status()
+    require_ready_status(value)
+    if initial['g_flt'] == 9:
+        event('handoff_communication_timeout_cleared', status=value)
+    return value
+
+
 class Port:
     """One request at a time, one bounded attempt. Does not share the standard node's port."""
     def __init__(self, name, baud, slave, timeout_s):
@@ -298,8 +328,9 @@ def run(a):
     exit_code = 0
     def confirm(text):
         print('Type '+text+': ',end='',flush=True)
-        while not manual_stop.is_set() and not select.select([sys.stdin],[],[],.05)[0]:
-            pass
+        while not manual_stop.is_set():
+            require_ready_status(status())
+            if select.select([sys.stdin],[],[],.05)[0]: break
         if manual_stop.is_set(): raise KeyboardInterrupt('Canceled before command')
         return sys.stdin.readline().strip()==text
     def status():
@@ -324,10 +355,8 @@ def run(a):
             raise RuntimeError('Normal gripper status publisher is active. Stop the gripper node first.')
         port = Port(a.port,a.baud,a.slave,a.serial_timeout_ms/1000)
         initial_status = status()
-        if initial_status['g_act'] != 1 or initial_status['g_sta'] != 3 or initial_status['g_flt'] != 0:
-            raise RuntimeError('Gripper must already be activated and fault-free; probe will not reset/activate it')
-        if initial_status['g_gto'] and initial_status['g_obj']==0:
-            raise RuntimeError('Gripper is already moving')
+        event('handoff_initial_status', status=initial_status)
+        initial_status = recover_handoff_timeout(initial_status, status, event, manual_stop.is_set)
         target = min(255,initial_status['g_po']+a.close_ticks)
         if target==initial_status['g_po']: raise RuntimeError('No closing range remains')
         print(f'Current raw position={initial_status["g_po"]}; bounded target={target}; speed byte={a.speed_byte}.', flush=True)
@@ -340,7 +369,9 @@ def run(a):
             event('not_started');return 0
         if state.reason: raise RuntimeError('Stop was requested before start')
         begin = time.monotonic_ns()
-        while time.monotonic_ns()-begin<1_000_000_000 and state.reason is None: time.sleep(.01)
+        while time.monotonic_ns()-begin<1_000_000_000 and state.reason is None:
+            require_ready_status(status())
+            time.sleep(.05)
         with state.lock:
             rows = [r for r in state.logs if r['receive_monotonic_ns']>=begin]
             for side in ('left','right'):
