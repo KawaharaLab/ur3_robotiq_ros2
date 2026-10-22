@@ -135,6 +135,58 @@ class MoveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'Stale'):c.check_health(s,threading.Event())
 
 
+class StartupReadinessTests(unittest.TestCase):
+    def status(self):
+        return dict(g_act=1,g_sta=3,g_flt=0,g_gto=0,g_obj=0)
+    def test_startup_gap_can_recover_without_moving_or_weakening_motion_guard(self):
+        collection=Collection(plan(),probe);state=probe.ForceState(.5,1.,100.,'max')
+        old=time.monotonic_ns()-335_000_000;ros=time.time_ns()-335_000_000
+        for side in ('left','right'):state.update(side,ros,old,ros,[0.,2.5,0.,0.,0.,0.])
+        finished=threading.Event();events=[]
+        def producer():
+            time.sleep(.03)
+            while not finished.is_set():
+                for side in ('left','right'):
+                    now=time.monotonic_ns();ros=time.time_ns()
+                    state.update(side,ros,now,ros,[0.,2.5,0.,0.,0.,0.])
+                time.sleep(.001)
+        thread=threading.Thread(target=producer);thread.start()
+        try:
+            collection.wait_for_fresh_startup_force(self.status,lambda event,**kw:events.append(event),
+                                                  state,threading.Event(),timeout_s=.5,stable_s=.05)
+            self.assertEqual(events,['startup_force_wait_start','startup_force_ready'])
+            self.assertFalse(collection.auxiliary_motion_commanded)
+            self.assertGreater(collection.startup_force_wait['initial_health']['left']['receive_age_ms'],300)
+            self.assertEqual(state.stale_ns,100_000_000)
+        finally:finished.set();thread.join(timeout=1)
+    def test_missing_sensor_times_out_without_moving(self):
+        collection=Collection(plan(),probe);state=probe.ForceState(.5,1.,100.,'max');events=[]
+        with self.assertRaisesRegex(RuntimeError,'Fresh force not ready'):
+            collection.wait_for_fresh_startup_force(self.status,lambda event,**kw:events.append(event),
+                                                  state,threading.Event(),timeout_s=.03,stable_s=.01)
+        self.assertEqual(events[-1],'startup_force_timeout')
+        self.assertFalse(collection.auxiliary_motion_commanded)
+    def test_cached_sample_alone_is_not_readiness(self):
+        collection=Collection(plan(),probe);state=probe.ForceState(.5,1.,100.,'max')
+        for side in ('left','right'):
+            now=time.monotonic_ns();ros=time.time_ns()
+            state.update(side,ros,now,ros,[0.,0.,0.,0.,0.,0.])
+        with self.assertRaisesRegex(RuntimeError,'Fresh force not ready'):
+            collection.wait_for_fresh_startup_force(self.status,lambda *a,**kw:None,state,
+                                                  threading.Event(),timeout_s=.03,stable_s=.01)
+    def test_manual_stop_during_readiness_is_immediate(self):
+        collection=Collection(plan(),probe);state=probe.ForceState(.5,1.,100.,'max');stop=threading.Event();stop.set()
+        with self.assertRaises(KeyboardInterrupt):
+            collection.wait_for_fresh_startup_force(lambda:self.fail('should not poll after manual stop'),
+                                                  lambda *a,**kw:None,state,stop)
+    def test_invalid_value_is_not_silently_retried(self):
+        collection=Collection(plan(),probe);state=probe.ForceState(.5,1.,100.,'max')
+        now=time.monotonic_ns();ros=time.time_ns()
+        state.update('left',ros,now,ros,[0.,float('nan'),0.,0.,0.,0.])
+        with self.assertRaisesRegex(RuntimeError,'Invalid force'):
+            collection.wait_for_fresh_startup_force(self.status,lambda *a,**kw:None,state,threading.Event())
+
+
 class HookTests(unittest.TestCase):
     def test_live_but_suspended_normal_driver_is_allowed_only_after_service_confirmation(self):
         p=plan();p['normal_driver_suspended']=True

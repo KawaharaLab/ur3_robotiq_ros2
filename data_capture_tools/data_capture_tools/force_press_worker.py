@@ -76,6 +76,7 @@ class Collection:
         self.status_publisher = None
         self._prepared = False
         self.auxiliary_motion_commanded = False
+        self.startup_force_wait = None
 
     def allows_suspended_driver(self):
         # Manager sets this only after a successful service reply. Port's /proc
@@ -124,19 +125,67 @@ class Collection:
                     start_raw=self.start_raw, minimum_raw=self.minimum_raw,
                     prepared=self._prepared, completed=self.completed,
                     auxiliary_motion_commanded=self.auxiliary_motion_commanded,
+                    startup_force_wait=self.startup_force_wait,
                     event_publish_errors=self.event_publish_errors, target_confirmation_reset_ratio=.8,
                     note='Width/depth limits use the existing empirical gripper conversion. Force is baseline-relative Fy; hold is position hold, not force regulation.')
 
+    def force_health_snapshot(self, state):
+        snapshot={}
+        with state.lock:
+            now=time.monotonic_ns()
+            for side in ('left','right'):
+                row=state.latest.get(side)
+                if row is None:
+                    snapshot[side]={'present':False,'fresh':False}
+                    continue
+                age=row['receive_ros_ns']-row['header_ns']
+                receive_age=now-row['receive_monotonic_ns']
+                valid=all(math.isfinite(v) for v in row['wrench'])
+                snapshot[side]=dict(present=True,valid_values=valid,
+                    receive_age_ms=receive_age/1e6,header_age_at_receive_ms=age/1e6,
+                    receive_monotonic_ns=row['receive_monotonic_ns'],header_ns=row['header_ns'],
+                    fresh=0 <= receive_age <= state.stale_ns and -10_000_000 <= age <= state.stale_ns)
+        return snapshot
+
     def check_health(self, state, manual_stop):
         if manual_stop.is_set(): raise KeyboardInterrupt('Manual collection stop')
-        now = time.monotonic_ns()
-        with state.lock:
-            if set(state.latest) != {'left','right'}: raise RuntimeError('Missing force side')
-            for row in state.latest.values():
-                age = row['receive_ros_ns']-row['header_ns']
-                if now-row['receive_monotonic_ns'] > state.stale_ns or not -10_000_000 <= age <= state.stale_ns:
-                    raise RuntimeError('Stale force during collection')
-                if not all(math.isfinite(v) for v in row['wrench']): raise RuntimeError('Invalid force during collection')
+        snapshot=self.force_health_snapshot(state)
+        if any(value.get('present') and not value.get('valid_values') for value in snapshot.values()):
+            raise RuntimeError('Invalid force during collection: '+json.dumps(snapshot))
+        if not all(value['fresh'] for value in snapshot.values()):
+            raise RuntimeError('Stale force during collection: '+json.dumps(snapshot))
+
+    def wait_for_fresh_startup_force(self, status, event, state, manual_stop,
+                                    timeout_s=2., stable_s=.1):
+        """No motion: re-check subscription readiness after serial/DDS setup.
+        This does not catch/retry a stale sample after any motion has begun.
+        """
+        begin=time.monotonic_ns()
+        deadline=begin+round(timeout_s*1e9)
+        stable_since=None
+        first=self.force_health_snapshot(state)
+        event('startup_force_wait_start', health=first, timeout_s=timeout_s, stable_s=stable_s)
+        while True:
+            if manual_stop.is_set(): raise KeyboardInterrupt('Manual stop while waiting for force readiness')
+            self.probe.require_ready_status(status()) # keep serial alive, read only
+            snapshot=self.force_health_snapshot(state)
+            now=time.monotonic_ns()
+            if any(value.get('present') and not value.get('valid_values') for value in snapshot.values()):
+                raise RuntimeError('Invalid force before preparation: '+json.dumps(snapshot))
+            ready=all(value['fresh'] and value.get('receive_monotonic_ns',0)>=begin for value in snapshot.values())
+            if ready:
+                if stable_since is None: stable_since=now
+                if now-stable_since >= round(stable_s*1e9):
+                    self.startup_force_wait=dict(wait_ms=(now-begin)/1e6,initial_health=first,ready_health=snapshot)
+                    event('startup_force_ready', **self.startup_force_wait)
+                    return
+            else:
+                stable_since=None
+            if now>=deadline:
+                self.startup_force_wait=dict(wait_ms=(now-begin)/1e6,initial_health=first,last_health=snapshot)
+                event('startup_force_timeout', **self.startup_force_wait)
+                raise RuntimeError('Fresh force not ready before preparation: '+json.dumps(snapshot))
+            time.sleep(.01)
 
     def move(self, port, status, event, state, manual_stop, target, stage, force_guard):
         """Bounded preparatory/release move. STOP on all exits, including lost GO ACK."""
@@ -190,6 +239,7 @@ class Collection:
         # approach to effective_width+clearance. Final tare is measured again.
         self.setup_gripper_publishers()
         event('collection_plan', **self.summary())
+        self.wait_for_fresh_startup_force(status,event,state,manual_stop)
         begin = time.monotonic_ns()
         while time.monotonic_ns()-begin < 500_000_000:
             self.check_health(state, manual_stop)
