@@ -16,7 +16,7 @@ def main():
         parser.error('--seconds must be in (0,180]')
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
     from std_msgs.msg import String
     from sensor_msgs.msg import CompressedImage
     from geometry_msgs.msg import WrenchStamped
@@ -45,16 +45,20 @@ def main():
             try:
                 report = json.loads(msg.data)
                 records.append((topic, report))
-                stream.write(json.dumps({'topic': topic, 'report': report})+'\n')
             except ValueError as exc:
                 malformed.append(str(exc))
         return callback
     with (args.out/'timing_records.jsonl').open('w') as stream:
         for i, topic in enumerate(SENSORS):
             subscriptions.append(node.create_subscription(CompressedImage if i<2 else WrenchStamped,
-                topic, receive_sensor(topic), qos_profile_sensor_data))
+                topic, receive_sensor(topic), QoSProfile(
+                    depth=128 if i<2 else 4096,
+                    reliability=ReliabilityPolicy.BEST_EFFORT,
+                    durability=DurabilityPolicy.VOLATILE)))
         for topic in TIMING:
-            subscriptions.append(node.create_subscription(String, topic, receive_timing(topic), qos_profile_sensor_data))
+            subscriptions.append(node.create_subscription(String, topic, receive_timing(topic), QoSProfile(
+                depth=100, reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE)))
         try:
             warmup = time.monotonic()+3
             while rclpy.ok() and time.monotonic()<warmup:
@@ -68,6 +72,9 @@ def main():
             pass
         finally:
             collecting = False
+        # File I/O and JSON encoding belong after acquisition, not in 1 kHz callbacks.
+        for topic, report in records:
+            stream.write(json.dumps({'topic': topic, 'report': report})+'\n')
     (args.out/'sensor_headers.json').write_text(json.dumps(sensors))
     result = validate(records, sensors)
     result['malformed_reports'] = malformed

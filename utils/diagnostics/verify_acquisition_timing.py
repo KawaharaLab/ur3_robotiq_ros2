@@ -26,6 +26,7 @@ def validate(records, sensors):
     pending = {}
     candidates = {t: [] for t in TIMING[:2]}
     counters = {}
+    producer_sequences = {t: [] for t in TIMING}
     packets = {t: {} for t in TIMING[2:]}
     sequence_gaps = collections.Counter()
     previous_sequences = {}
@@ -61,6 +62,8 @@ def validate(records, sensors):
                 check(topic in TIMING[:2], 'wrong frame topic')
                 sequence(topic, stream, 'frame_seq', report['frame_seq'])
                 headers[topic].add(report['header_ns'])
+                if report['stages']['backend_pos_msec'] is not None:
+                    producer_sequences[topic].append((stream, report['frame_seq'], report['stages']['backend_pos_msec']*1e6))
                 start = clock(report['stages']['read_start'])
                 end = clock(report['stages']['read_end'])
                 preprocess = clock(report['stages']['preprocess_end'])
@@ -91,6 +94,7 @@ def validate(records, sensors):
                     for seq, h, packet_offset in read['samples']:
                         sequence(topic, stream, 'sample_seq', seq)
                         headers[topic].add(h)
+                        producer_sequences[topic].append((stream, seq, h))
                         check(packet_offset+25 > offset and packet_offset+25 <= offset+len(raw), 'packet does not end in this read')
                         if begin <= packet_offset and packet_offset+25 <= begin+len(merged):
                             packet = merged[packet_offset-begin:packet_offset-begin+25]
@@ -133,8 +137,19 @@ def validate(records, sensors):
             result['raw_packet_value_comparisons'] = verified
             result['raw_packet_value_mismatches'] = mismatches
             check(mismatches == 0, topic + ': packet values differ from WrenchStamped')
+        # A source-side sequence estimate survives receive-side losses. It is
+        # not a calibrated exposure/ADC rate, and different streams stay separate.
+        groups = collections.defaultdict(list)
+        for stream, seq, timestamp in producer_sequences[topic]:
+            groups[stream].append((seq, timestamp))
+        result['producer_sequence_rate_estimates_hz'] = {
+            stream: (values[-1][0]-values[0][0])*1e9/(values[-1][1]-values[0][1])
+            for stream, values in groups.items()
+            if len(values)>1 and values[-1][1]>values[0][1]
+        }
+        result['producer_rate_basis'] = 'host-read frame sequence / backend timestamp' if i<2 else 'parsed-packet sequence / publisher header'
         results[topic] = result
     return {'schema_version': 1, 'schema_and_mapping_checks_passed': not errors,
             'errors_count': len(errors), 'errors_examples': errors[:20], 'topics': results,
             'sequence_gaps': dict(sequence_gaps), 'value_mismatch_examples': examples,
-            'note': 'Independent subscribers can lose messages; common-range gaps are reported, not repaired. Backend timestamps are uncalibrated candidates, not proof of physical synchronization.'}
+            'note': 'schema_and_mapping_checks_passed is not a no-loss or physical-synchronization result. Callback receive_hz can be distorted by backlog. Independent subscribers can lose messages; common-range gaps are reported, not repaired. Backend timestamps are uncalibrated candidates, not proof of physical synchronization.'}

@@ -43,6 +43,10 @@ def generate_launch_description():
         default_value='False',
         description='Whether to use fake hardware (if real hardware is not available)'
     )
+    shutdown_arg = DeclareLaunchArgument(
+        'deactivate_on_shutdown', default_value='true',
+        description='Set false only for stationary handoff to the force-stop probe'
+    )
     status_poll_rate_arg = DeclareLaunchArgument(
         'status_poll_rate_hz',
         default_value='20.0',
@@ -75,7 +79,8 @@ def generate_launch_description():
             'action_timeout': LaunchConfiguration('action_timeout'),
             'slave_address': LaunchConfiguration('slave_address'),
             'fake_hardware': LaunchConfiguration('fake_hardware'),
-            'status_poll_rate_hz': LaunchConfiguration('status_poll_rate_hz')
+            'status_poll_rate_hz': LaunchConfiguration('status_poll_rate_hz'),
+            'deactivate_on_shutdown': LaunchConfiguration('deactivate_on_shutdown')
         }]
     )
 
@@ -124,6 +129,7 @@ def generate_launch_description():
         slave_address_arg,
         fake_hardware_arg,
         status_poll_rate_arg,
+        shutdown_arg,
         config_file_arg,
         rviz2_arg,
         robotiq_2f_gripper_node,

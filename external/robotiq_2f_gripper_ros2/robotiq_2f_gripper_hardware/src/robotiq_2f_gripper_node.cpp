@@ -64,6 +64,12 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
     fake_hardware_ = get_parameter("fake_hardware").as_bool();
     RCLCPP_INFO(get_logger(), "Using fake hardware: %s", fake_hardware_ ? "true" : "false");
 
+    auto shutdown_descriptor = rcl_interfaces::msg::ParameterDescriptor();
+    shutdown_descriptor.description = "Keep activation only for a stationary exclusive-port probe handoff when false";
+    shutdown_descriptor.read_only = true;
+    declare_parameter<bool>("deactivate_on_shutdown", true, shutdown_descriptor);
+    deactivate_on_shutdown_ = get_parameter("deactivate_on_shutdown").as_bool();
+
     auto poll_rate_descriptor = rcl_interfaces::msg::ParameterDescriptor();
     poll_rate_descriptor.description = "Startup-only status polling rate in Hz; valid range is (0, 100]";
     poll_rate_descriptor.read_only = true;
@@ -138,7 +144,11 @@ GripperNode::~GripperNode()
 {
     if (!fake_hardware_)
     {
-        driver_->deactivate();
+        if (deactivate_on_shutdown_) {
+            driver_->deactivate();
+        } else {
+            RCLCPP_WARN(get_logger(), "Leaving gripper activated for handoff; no motion must be in progress.");
+        }
         driver_->disconnect();
     }
 }

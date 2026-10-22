@@ -37,6 +37,7 @@ namespace robotiq_2f_gripper_hardware
         int action_timeout_;
         int slave_address_;
         bool fake_hardware_;
+        bool deactivate_on_shutdown_{true};
         double status_poll_rate_hz_;
         std::unique_ptr<DefaultDriver> driver_;
 

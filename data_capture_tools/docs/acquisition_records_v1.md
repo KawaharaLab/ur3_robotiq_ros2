@@ -92,3 +92,14 @@ source install/setup.bash
 ## ローカル検証と限界
 
 ROS/cameraなしのPythonテスト11件、C++バッファ/JSON検査、実MMS101パーサをfake publisher/clockへ接続した分割/一括受信検査を実施。画像と既存headerの関係、JPEG失敗時の対応記録、64 bit整数、raw packet byte offsetと力変換を確認した。ROSを使ったノード全体のビルド、実機のCAP_PROP_POS_MSECの挙動、追加負荷はワークステーションで確認が必要。既存bagから新しい取得時刻は復元できない。
+
+
+## 2026-10-15 初回実機確認を受けた検証スクリプトの修正
+
+初回はschema/mappingエラー0、画像左右564枚ずつの対応、力覚左右29,323/29,317点のraw packetとの値一致を確認。取得側通番ベースの力覚レートは左右約993 Hz。GelSightのbackend時刻からread完了まで中央値約87 ms（露光の絶対遅延と確定しない）。
+
+独立検証subscriberでは力覚271/459点が欠け、追加情報も左右1 batchずつ欠けた。取得ノードの記録バッファ超過・公開例外は0だった。従来の検証subscriberはsensor_data既定のdepth=5を全トピックに使い、callback内でJSON再エンコード・ファイル書き込みも行っていたため、この負荷に対して不適切だった。
+
+検証用subscriberのみ、力覚BEST_EFFORT depth4096、画像BEST_EFFORT depth128、追加情報RELIABLE depth100に変更。JSONファイルへの書き込みを収集後へ移した。取得ノード・既存データ・headerは変更しない。source側の通番によるレート見積もりも追加し、callbackレートと区別する。これは原因候補に対する対策で、欠落解消は再確認が必要。
+
+再確認は同じ30秒コマンドで `--out ./acquisition_timing_check_run2` とする。取得ノードは変更していないため、この修正だけなら再ビルド・センサ再起動は不要（git反映後のスクリプトを直接実行）。ロボット操作・APは不要。独立subscriberの欠落が解消しても、通常のbagに全記録があることは別途bagで確認する。
