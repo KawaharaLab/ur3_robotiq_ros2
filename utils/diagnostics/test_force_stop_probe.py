@@ -127,14 +127,14 @@ class SimulatedRunTests(unittest.TestCase):
             def get_clock(self):return types.SimpleNamespace(now=lambda:types.SimpleNamespace(nanoseconds=time.time_ns()))
             def create_subscription(self,typ,topic,callback,qos):callbacks.append((topic,callback));return object()
             def create_publisher(self,*a):return types.SimpleNamespace(publish=lambda msg:None)
-            def count_publishers(self,t):return 0
+            def count_publishers(self,t):return int(mode=='collection_suspended')
             def destroy_node(self):pass
         class Executor:
             def add_node(self,n):pass
             def spin(self):
                 while not stopped.is_set():
                     ns=time.time_ns();value=.6 if controller['moving'] and mode=='force' else 0.
-                    if mode=='collection':value=max(0.,min(.8,(controller['position']-collection.start_raw)*.2))
+                    if mode in ('collection','collection_suspended'):value=max(0.,min(.8,(controller['position']-collection.start_raw)*.2))
                     for topic,callback in callbacks:
                         v=types.SimpleNamespace(x=0.,y=value,z=0.)
                         msg=types.SimpleNamespace(header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=ns//10**9,nanosec=ns%10**9)),wrench=types.SimpleNamespace(force=v,torque=v))
@@ -148,16 +148,16 @@ class SimulatedRunTests(unittest.TestCase):
                 if last is not None:controller['status_gaps'].append(now-last)
                 controller['last_status']=now;controller['status_reads']+=1
                 fault=9 if mode=='watchdog' and (last is None or now-last>1.) else 0
-                if mode=='collection' and controller['moving']:
+                if mode in ('collection','collection_suspended') and controller['moving']:
                     controller['position']+=(controller['target']>controller['position'])-(controller['target']<controller['position'])
-                position=controller['position'] if mode=='collection' else 50
-                target=controller['target'] if mode=='collection' else 50
+                position=controller['position'] if mode in ('collection','collection_suspended') else 50
+                target=controller['target'] if mode in ('collection','collection_suspended') else 50
                 return {'g_act':int(controller['active']),'g_sta':3 if controller['active'] else 0,'g_flt':fault,
                         'g_gto':int(controller['moving']),'g_obj':0 if controller['moving'] and position!=target else 3,
                         'g_po':position,'g_pr':target,'g_cu':0}
             def command(self,pos,speed,force,go):
                 controller['commands'].append(go);controller['moving']=go
-                if mode=='collection':controller['target']=pos if go else controller['target']
+                if mode in ('collection','collection_suspended'):controller['target']=pos if go else controller['target']
                 if mode=='manual' and go: os.write(master,b'\n')
                 if mode=='ack_failure' and go:raise TimeoutError('simulated lost ACK')
             def close(self):pass
@@ -173,7 +173,7 @@ class SimulatedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             a=types.SimpleNamespace(port='/dev/test',baud=115200,slave=9,out=Path(temp)/'result',enable_motion=mode!='readonly',
                 close_ticks=4,speed_byte=0,force_byte=0,threshold_n=.5,hard_limit_n=1.,force_metric='max',
-                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode in ('timed','watchdog') else None,hold_seconds=0.,target_confirm_ms=5. if mode=='collection' else 0.)
+                stale_ms=100.,serial_timeout_ms=30.,max_motion_ms=500.,stop_after_ms=20. if mode in ('timed','watchdog') else None,hold_seconds=0.,target_confirm_ms=5. if mode in ('collection','collection_suspended') else 0.)
             master,slave=pty.openpty()
             with os.fdopen(slave,'r',buffering=1) as stdin:
                 go_writer=None
@@ -225,12 +225,13 @@ class HandoffTests(unittest.TestCase):
         prefix='''#include <cassert>
 #define RCLCPP_WARN(...) ((void)0)
 struct Driver {int off=0,disconnects=0;void deactivate(){++off;}void disconnect(){++disconnects;}};
-struct GripperNode {bool fake_hardware_=false;bool deactivate_on_shutdown_=true;Driver* driver_;~GripperNode();};
+struct GripperNode {bool fake_hardware_=false;bool deactivate_on_shutdown_=true;bool serial_leased_=false;Driver* driver_;~GripperNode();};
 '''
         suffix='''int main(){
 Driver a;{GripperNode n;n.driver_=&a;}assert(a.off==1 && a.disconnects==1);
 Driver b;{GripperNode n;n.driver_=&b;n.deactivate_on_shutdown_=false;}assert(b.off==0 && b.disconnects==1);
 Driver c;{GripperNode n;n.driver_=&c;n.fake_hardware_=true;}assert(c.off==0 && c.disconnects==0);
+Driver d;{GripperNode n;n.driver_=&d;n.serial_leased_=true;}assert(d.off==0 && d.disconnects==0);
 }'''
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp)/'handoff.cpp';p.write_text(prefix+destructor+suffix)

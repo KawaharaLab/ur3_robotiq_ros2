@@ -387,7 +387,8 @@ def run(a, collection=None):
             time.sleep(.01)
         if len(state.latest)<2: raise RuntimeError('Both force topics are required')
         # Discovery guard supplements the /proc and TIOCEXCL checks; does not replace operator exclusivity.
-        if node.count_publishers('/robotiq_2f_gripper/status'):
+        owner_suspended = collection is not None and getattr(collection, 'allows_suspended_driver', lambda: False)()
+        if node.count_publishers('/robotiq_2f_gripper/status') and not owner_suspended:
             raise RuntimeError('Normal gripper status publisher is active. Stop the gripper node first.')
         port = Port(a.port,a.baud,a.slave,a.serial_timeout_ms/1000)
         initial_status = status()

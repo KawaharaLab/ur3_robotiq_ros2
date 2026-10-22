@@ -15,6 +15,7 @@ find_package(rclcpp_action REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(robotiq_2f_gripper_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(serial REQUIRED)
 find_package(robotiq_2f_gripper_interfaces REQUIRED)
@@ -40,6 +41,7 @@ ament_target_dependencies(robotiq_2f_gripper_node
   serial
   robotiq_2f_gripper_msgs
   std_msgs
+  std_srvs
   ament_index_cpp
   sensor_msgs 
   robotiq_2f_gripper_interfaces

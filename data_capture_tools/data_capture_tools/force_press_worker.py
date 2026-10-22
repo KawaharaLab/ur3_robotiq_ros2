@@ -77,6 +77,11 @@ class Collection:
         self._prepared = False
         self.auxiliary_motion_commanded = False
 
+    def allows_suspended_driver(self):
+        # Manager sets this only after a successful service reply. Port's /proc
+        # scan and TIOCEXCL remain mandatory; an open normal owner still fails.
+        return self.plan.get('normal_driver_suspended') is True
+
     def setup(self, node):
         from std_msgs.msg import String
         self.message_type = String

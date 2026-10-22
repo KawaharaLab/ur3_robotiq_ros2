@@ -108,6 +108,9 @@ public:
   /** Return the most recently retained status without performing an I/O read. */
   StatusRegisters get_last_status() const;
 
+  /** Cached gGTO=1 AND gOBJ=0, after read_status(). STOP with gOBJ=0 is stationary. */
+  bool motion_command_in_progress() const;
+
 private:
   /**
    * With this command we send a request and wait for a response of given size.

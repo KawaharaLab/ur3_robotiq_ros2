@@ -136,6 +136,17 @@ class MoveTests(unittest.TestCase):
 
 
 class HookTests(unittest.TestCase):
+    def test_live_but_suspended_normal_driver_is_allowed_only_after_service_confirmation(self):
+        p=plan();p['normal_driver_suspended']=True
+        collection=Collection(p,probe)
+        code,result,commands=old_tests.SimulatedRunTests().simulate('collection_suspended',collection=collection)
+        self.assertEqual(code,0,result);self.assertTrue(result['collection']['completed'])
+        self.assertEqual(commands,[True,False,True,False])
+    def test_live_normal_driver_without_service_confirmation_is_rejected(self):
+        collection=Collection(plan(),probe)
+        code,result,commands=old_tests.SimulatedRunTests().simulate('collection_suspended',collection=collection)
+        self.assertEqual(code,2);self.assertEqual(commands,[])
+        self.assertIn('Normal gripper status publisher is active',result['error'])
     def test_collection_without_motion_authorization_cannot_prepare(self):
         class Hook:
             def setup(self,*a):pass
@@ -188,9 +199,14 @@ class ManagerTests(unittest.TestCase):
                 self._effective_object_width_m=.040
                 self._force_press_settings={k:v for k,v in plan().items() if k not in ('effective_width_m','trial_index')}
                 self._stop_event=Event();self._bag_process=None;self.events=[];self.calls=0
+                self._force_press_handoff_active=False
+                self._force_press_control_client=types.SimpleNamespace(wait_for_service=lambda **kw:True)
+                self.borrowed=0;self.restored=0
                 self.config=types.SimpleNamespace(topics=[types.SimpleNamespace(name='/force_press_event')])
                 self.root=root;self._session_dir=None
                 self._marker_pub=types.SimpleNamespace(publish=lambda msg:None)
+            def _borrow_force_press_control(self,base):self.borrowed+=1
+            def _restore_force_press_control(self):self.restored+=1;return True
             def _check_sensors_health(self):return True
             def count_publishers(self,*a):return 0
             def _read_positive_int(self,*a):return 3
@@ -213,6 +229,7 @@ class ManagerTests(unittest.TestCase):
             with patch.dict('sys.modules',{'std_msgs.msg':message}),patch('sys.stdin',Input('GO\n')):
                 m._execute_force_press_loop()
             self.assertEqual(m.calls,2)
+            self.assertEqual((m.borrowed,m.restored),(1,1))
             self.assertEqual(m.events,[('START',1),('END',1),('START',2),('ABORT',2)])
             metadata=json.loads((Path(temp)/'force_press_metadata.json').read_text())
             self.assertEqual([r['success'] for r in metadata['actual_condition_order']],[True,False])

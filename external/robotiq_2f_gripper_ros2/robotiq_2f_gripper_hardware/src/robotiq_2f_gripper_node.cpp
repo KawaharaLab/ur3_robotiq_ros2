@@ -5,6 +5,8 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <sstream>
+#include <iomanip>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
@@ -137,12 +139,15 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
         std::bind(&GripperNode::gripper_binary_command_callback, this, _1));
     RCLCPP_INFO(get_logger(), "Gripper binary command subscriber created on topic: %s", binary_command_topic.c_str());
 
+    force_press_control_service_ = create_service<std_srvs::srv::SetBool>(
+        "~/set_force_press_control",
+        std::bind(&GripperNode::set_force_press_control, this, _1, _2));
     RCLCPP_INFO(get_logger(), "Gripper node initialized");
 }
 
 GripperNode::~GripperNode()
 {
-    if (!fake_hardware_)
+    if (!fake_hardware_ && !serial_leased_)
     {
         if (deactivate_on_shutdown_) {
             driver_->deactivate();
@@ -153,16 +158,87 @@ GripperNode::~GripperNode()
     }
 }
 
+void GripperNode::set_force_press_control(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+{
+    // Services, timers, goal acceptance and direct-command callbacks use the
+    // same mutually-exclusive default callback group. A detached action worker
+    // is excluded by running_, retained until its final serial operation ends.
+    bool acquired_by_request = false;
+    auto reply = [&](bool success, const std::string &reason) {
+        std::ostringstream out;
+        out << "{\"reason\":" << std::quoted(reason)
+            << ",\"leased\":" << (serial_leased_ ? "true" : "false")
+            << ",\"request_acquired\":" << (acquired_by_request ? "true" : "false")
+            << ",\"port\":" << std::quoted(serial_port_)
+            << ",\"baud\":" << baudrate_ << ",\"slave\":" << slave_address_ << "}";
+        response->success = success;
+        response->message = out.str();
+    };
+    if (fake_hardware_ || !driver_) { reply(false, "Real connected gripper required"); return; }
+    if (running_) { reply(false, "Action or direct command still running"); return; }
+    if (request->data)
+    {
+        if (serial_leased_) { reply(false, "Serial already leased; no second owner allowed"); return; }
+        try
+        {
+            if (!driver_->is_gripper_active()) { reply(false, "Gripper not active"); return; }
+            const auto status = driver_->read_status();
+            if (status.g_flt != 0 || driver_->motion_command_in_progress())
+            {
+                reply(false, "Gripper must be healthy and stationary before handoff");
+                return;
+            }
+            serial_leased_ = true;
+            acquired_by_request = true;
+            driver_->disconnect(); // Never deactivate, activate, move or release fingers here.
+            reply(true, "Serial released for force collection");
+        }
+        catch (const std::exception &e) { reply(false, e.what()); }
+        return;
+    }
+    if (!serial_leased_) { reply(true, "Normal control already active"); return; }
+    try
+    {
+        // The collection owner must have exited and closed its TIOCEXCL port.
+        // Reconnect and read only; never run an activation/reset sequence.
+        if (!driver_->connect()) throw std::runtime_error("Could not reopen serial port");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        auto status = driver_->read_status();
+        while (status.g_flt == 9 && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            status = driver_->read_status();
+        }
+        if (status.g_flt != 0 || !driver_->is_gripper_active())
+            throw std::runtime_error("Gripper did not return healthy and active; no automatic reset performed");
+        status = driver_->get_last_status();
+        if (status.g_flt != 0 || driver_->motion_command_in_progress())
+            throw std::runtime_error("Gripper is faulted or still moving; normal commands remain blocked");
+        gripper_position_ = convertToMeters(status.g_po);
+        serial_leased_ = false;
+        reply(true, "Normal serial control restored without activation or motion");
+    }
+    catch (const std::exception &e)
+    {
+        try { driver_->disconnect(); } catch (...) {}
+        // Keep ordinary commands/timers disabled after an uncertain return.
+        serial_leased_ = true;
+        reply(false, e.what());
+    }
+}
+
 rclcpp_action::GoalResponse GripperNode::handle_move_goal(
     const rclcpp_action::GoalUUID & /*uuid*/,
     std::shared_ptr<const SetPosition::Goal> goal)
 {
     RCLCPP_INFO(get_logger(), "Received goal request with %f meters", goal->target_position);
 
-    if (running_)
+    if (running_ || serial_leased_)
     {
-        RCLCPP_INFO(get_logger(), "Preempting previous gripper goal with new request");
-        running_ = false;
+        RCLCPP_WARN(get_logger(), "Rejecting goal: gripper busy or serial assigned to force collection");
+        return rclcpp_action::GoalResponse::REJECT;
     }
 
     if (!fake_hardware_)
@@ -199,7 +275,8 @@ rclcpp_action::CancelResponse GripperNode::handle_cancel_move(
     const std::shared_ptr<rclcpp_action::ServerGoalHandle<SetPosition>> /*goal_handle*/)
 {
     RCLCPP_INFO(get_logger(), "Received request to cancel goal");
-    running_ = false;
+    // The worker owns the serial transaction until it observes cancellation.
+    // Keep timers, new goals and handoff blocked until the worker clears running_.
     return rclcpp_action::CancelResponse::ACCEPT;
 }
 
@@ -313,7 +390,7 @@ void GripperNode::execute(
 
 void GripperNode::update_joint_state_callback()
 {
-    if (running_)
+    if (running_ || serial_leased_)
     {
         return;
     }
@@ -383,7 +460,7 @@ void GripperNode::publish_hardware_status(
 
 void GripperNode::update_object_grasped_callback()
 {
-    if (running_)
+    if (running_ || serial_leased_)
     {
         return;
     }
@@ -460,7 +537,7 @@ int GripperNode::convertToGripperSystem(double value)
 
 void GripperNode::gripper_command_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
 {
-    if (running_)
+    if (running_ || serial_leased_)
     {
         RCLCPP_WARN(get_logger(), "Ignoring command, gripper is already running an action");
         return;
@@ -580,7 +657,7 @@ void GripperNode::gripper_command_callback(const std_msgs::msg::Float32MultiArra
 
 void GripperNode::gripper_binary_command_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
 {
-    if (running_)
+    if (running_ || serial_leased_)
     {
         RCLCPP_WARN(get_logger(), "Ignoring binary command, gripper is already running an action");
         return;

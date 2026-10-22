@@ -6,7 +6,7 @@
 
 実機で確認した `force_stop_probe.py` を共有して使用する。setup.pyが同じソースをパッケージshare/diagnosticsへインストールするため、Pythonプローブを変更した場合も収集用にはdata_capture_toolsの再ビルドが必要。単独プローブのCLIは従来どおり。ハードリアルタイムや物理停止時間の保証はない。
 
-同じUSBシリアルを二重使用しないため、実験版ではinit後に通常グリッパドライバとgripper_clientを終了し、afに通信を引き渡す。収集マネージャーは終了しない。これによりinit結果がメモリ内に残る。afを複数試行しても引き渡しは一度でよい。
+同じUSBシリアルを二重使用しないため、afが通常ドライバのサービスに通信の貸し出しを要求する。通常ドライバ・gripper_client・収集マネージャーはすべて起動したままでよい。af終了後に子プロセスの終了とポート解放を確認して通常制御へ自動で返却する。init結果は収集マネージャー内に残り、そのままAPや再initを選択できる。deactivate_on_shutdown:=falseによる手動引き渡しは不要。
 
 ## 既定条件
 
@@ -32,34 +32,33 @@
 
 ## 実行手順
 
-1. GitでWSへ反映し、WSのワークスペースで一度ビルドする。
+1. GitでWSへ反映し、WSで一度ビルドする。今回の更新では下層ドライバとhardwareノードも対象。
 
 ```bash
 cd /home/tsumura/my_robotiq_ws
 source /opt/ros/humble/setup.bash
-colcon build --packages-select data_capture_tools
+colcon build --packages-select robotiq_2f_gripper_interfaces robotiq_2f_gripper_hardware data_capture_tools
 source install/setup.bash
 ```
 
-2. UR3・MMS101左右・GelSight左右を通常どおり起動する。initはGelSightのヘルスも確認するため必要。MMS101とGelSightはacquisition_records:=trueを維持する。新しく起動する各ターミナルでROSとinstall/setup.bashをsourceする。
-
-3. 通常グリッパドライバだけは以下で起動する。既存ドライバがある場合は静止状態で終了してから。起動時の有効化で全ストローク動く可能性があるため手と試料を離す。
+2. 更新を読み込むため、通常グリッパドライバと収集ノードを一度起動し直す。各新規ターミナルでROSとinstall/setup.bashをsourceする。起動コマンドは従来どおりで、今回用の引数は不要。
 
 ```bash
-ros2 launch robotiq_2f_gripper_hardware robotiq_2f_gripper_launch.py \
-  serial_port:=/dev/ttyUSB0 deactivate_on_shutdown:=false
+ros2 launch robotiq_2f_gripper_hardware robotiq_2f_gripper_launch.py
 ```
-
-4. gripper_clientと通常のdata_capture_manager_10を起動する。後者は更新したconfigを指定する。
 
 ```bash
 ros2 run data_capture_tools data_capture_manager_10 --ros-args \
   -p config:=/home/tsumura/my_robotiq_ws/src/ur3_robotiq_ros2/data_capture_tools/config/data_capture.yaml
 ```
 
-5. スポンジを普段の試料位置へ配置し、マネージャーで `i` を実行する。完了後、マネージャーは起動したまま、gripper_clientを終了し、静止したグリッパドライバを終了する。終了ログのLeaving gripper activated for handoffを確認する。falseは終了時のSTOPを追加する設定ではない。
+3. UR3・MMS101左右・GelSight左右・gripper_clientも普段どおり起動しておく。initはGelSightのヘルスも確認する。MMS101とGelSightのacquisition_records:=trueも従来どおり。
 
-6. 同じマネージャーで `af` を入力する。初回は試行数 `1`、表示条件を確認して `GO`。以後は自動準備→記録→基準計測→閉じる→STOP→保持→開放。試行中Enterで中断、Ctrl+Cで終了とSTOP要求。通信断やプロセス停止時の送達保証はないため、グリッパに実際に効く停止手段を用意する。
+4. スポンジを普段の試料位置へ配置し、マネージャーで `i` を実行する。
+
+5. initが完了したら、どのノードも止めずに同じマネージャーで `af` を入力する。初回は試行数 `1`、表示条件を確認して `GO`。通信切り替え→準備→記録→基準計測→閉じる→STOP→保持→開放→通常制御への返却は自動で行う。
+
+試行中Enterで中断、収集ターミナルのCtrl+Cで終了とSTOP要求。通信断やプロセス停止時の送達保証はないため、グリッパに実際に効く停止手段を用意する。他のターミナルでグリッパドライバだけを終了しても、afへの停止要求にはならない。
 
 目標未達、力のhard limit、手動停止、通信・鮮度異常の場合はABORTとしてシリーズを終了し、自動で開放・再試行しない。操作者が状態を確認してから再開する。bag開始失敗時は動作しない。bagプロセスが終了した場合も子プロセスへ中断を要求する。
 
@@ -82,4 +81,15 @@ STOP応答は物理停止ではない。位置の取得はおおむね20 Hz、8b
 
 ## 設定変更
 
-マネージャーの起動時ROSパラメータ `force_press_port`、`force_press_baud`、`force_press_slave`、`force_press_threshold_n`、`force_press_hard_limit_n`、`force_press_hold_seconds`、`force_press_clearance_m`、`force_press_max_depth_per_side_m`、`force_press_close_ticks`、`force_press_max_motion_ms`、`force_press_target_confirm_ms` を使用する。通常init/APのconfig値とは別で、max_depth_per_side_mの既定だけconfig.push_depthを引き継ぐ。深さ・幅・力の変更は実行前の表示とplanにも記録される。
+ポート・baud・slaveは通常ドライバから自動取得し、収集側の従来のforce_press_port/baud/slave設定より優先する。別途ポートを設定する必要はない。名前空間を変更したドライバでは `force_press_control_service`（既定 `/robotiq_2f_gripper_node/set_force_press_control`）を指定する。
+
+マネージャーの起動時ROSパラメータ `force_press_threshold_n`、`force_press_hard_limit_n`、`force_press_hold_seconds`、`force_press_clearance_m`、`force_press_max_depth_per_side_m`、`force_press_close_ticks`、`force_press_max_motion_ms`、`force_press_target_confirm_ms` を使用する。通常init/APのconfig値とは別で、max_depth_per_side_mの既定だけconfig.push_depthを引き継ぐ。深さ・幅・力の変更は実行前の表示とplanにも記録される。
+
+## 自動切り替えの保証範囲
+
+- 通常ドライバの `~/set_force_press_control`（std_srvs/SetBool）でdata=trueは通信の貸し出し、falseは返却。正常動作ではマネージャーが自動で呼び出す。
+- 動作中・機器異常・別の貸し出し中には貸し出さない。通常のstatusポーリングとAction/直接コマンドは貸し出し中に停止・拒否する。
+- workerはサービスの成功が記録されたplanに限って通常status publisherの存在を許容する。プロセスの開いているポート検査とTIOCEXCLは省略しない。
+- 戻す際も読み取りだけで有効状態・異常・運動状態を確認する。通信空白によるgFLT=9は短く読み取って復帰を待つ。reset/activateや位置指令を切り替え処理から送らない。
+- 応答喪失時は状態が不明なまま通常動作を許可しない。子プロセスが終了しなければ返却しない。
+- 並行する通常Actionを以前のように上書きせずbusyとして拒否する。またAction cancel受理時にrunningを先に解除せず、実行スレッドがI/Oを終えるまで保持する。これにより終了前のserial切り替えを防ぐ。通常の順次init/APには影響しない。通常Actionのcancel自体を物理STOPへ変更する修正ではない。

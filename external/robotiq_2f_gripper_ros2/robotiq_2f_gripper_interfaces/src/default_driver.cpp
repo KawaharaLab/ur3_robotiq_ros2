@@ -223,6 +223,12 @@ DefaultDriver::StatusRegisters DefaultDriver::get_last_status() const
   return status_registers_;
 }
 
+bool DefaultDriver::motion_command_in_progress() const
+{
+  return action_status_ == ActionStatus::MOVING &&
+         object_detection_status_ == ObjectDetectionStatus::MOVING;
+}
+
 bool DefaultDriver::is_gripper_active()
 {
   update_status();

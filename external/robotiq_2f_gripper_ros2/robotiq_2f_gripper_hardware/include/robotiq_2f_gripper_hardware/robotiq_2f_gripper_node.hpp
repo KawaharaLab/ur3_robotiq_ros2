@@ -5,6 +5,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <thread>
@@ -77,6 +78,11 @@ namespace robotiq_2f_gripper_hardware
         rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr gripper_binary_command_subscriber_;
 
         std::atomic<bool> running_{false};
+        std::atomic<bool> serial_leased_{false};
+        rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr force_press_control_service_;
+        void set_force_press_control(
+            const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+            std::shared_ptr<std_srvs::srv::SetBool::Response> response);
         sensor_msgs::msg::JointState joint_state_;
         rclcpp::TimerBase::SharedPtr timer_1_, timer_2_;
 

@@ -16,6 +16,11 @@ class ForcePressCollectionMixin:
         self._force_press_process = None
         self._force_press_handoff_active = False
         self._force_press_lock = threading.Lock()
+        from std_srvs.srv import SetBool
+        self._force_press_service_type = SetBool
+        service_name = self.declare_parameter('force_press_control_service',
+            '/robotiq_2f_gripper_node/set_force_press_control').value
+        self._force_press_control_client = self.create_client(SetBool, service_name)
         defaults = dict(port='/dev/ttyUSB0', baud=115200, slave=9, threshold_n=.5,
                         hard_limit_n=1., hold_seconds=4., clearance_m=.002,
                         max_depth_per_side_m=float(self.config.push_depth),
@@ -25,14 +30,59 @@ class ForcePressCollectionMixin:
             for name, default in defaults.items()
         }
 
+    def _request_force_press_control(self, enabled, allow_shutdown=False):
+        if not self._force_press_control_client.wait_for_service(timeout_sec=2.):
+            raise RuntimeError('Updated gripper driver service unavailable; keep the normal driver running')
+        request = self._force_press_service_type.Request()
+        request.data = enabled
+        future = self._force_press_control_client.call_async(request)
+        finished = threading.Event()
+        future.add_done_callback(lambda result: finished.set())
+        deadline = time.monotonic()+15.
+        while not finished.wait(.05):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Serial handoff response timed out; control state is uncertain')
+            if self._stop_event.is_set() and not allow_shutdown:
+                raise RuntimeError('Shutdown during serial handoff; recovery will be attempted')
+        response = future.result()
+        if response is None: raise RuntimeError('No serial handoff response')
+        payload = json.loads(response.message)
+        return response, payload
+
+    def _borrow_force_press_control(self, base):
+        # Set before RPC so a lost response cannot silently permit ordinary AP.
+        self._force_press_handoff_active=True
+        response, payload = self._request_force_press_control(True)
+        self._force_press_handoff_active=bool(payload.get('request_acquired', False))
+        if not response.success or not payload.get('leased') or not self._force_press_handoff_active:
+            raise RuntimeError('Could not borrow gripper control: '+payload.get('reason','invalid response'))
+        base.update(port=payload['port'], baud=payload['baud'], slave=payload['slave'],
+                    normal_driver_suspended=True, handoff_mode='automatic_service')
+        validate_plan(base)
+        self.get_logger().info('Gripper serial automatically borrowed: '+base['port'])
+
+    def _restore_force_press_control(self):
+        if not self._force_press_handoff_active: return True
+        with self._force_press_lock:
+            process=self._force_press_process
+        if process is not None and process.poll() is None:
+            self.get_logger().error('Force worker still running; normal control remains blocked')
+            return False
+        try:
+            response, payload=self._request_force_press_control(False, allow_shutdown=True)
+            if not response.success or payload.get('leased', True):
+                raise RuntimeError(payload.get('reason','return not confirmed'))
+            self._force_press_handoff_active=False
+            self.get_logger().info('Normal gripper control automatically restored. AP/init may run normally.')
+            return True
+        except Exception as exc:
+            self.get_logger().error('Normal control was not restored: '+str(exc))
+            return False
+
     def _force_press_normal_control_ready(self, command):
         normal_commands={'i','s','ap','as','av','arp','ah','aur','ad','ak','ae'}
         if not self._force_press_handoff_active or command not in normal_commands: return True
-        if self.count_publishers('/robotiq_2f_gripper/status') and self.count_subscribers('/robot_cmd'):
-            self._force_press_handoff_active=False
-            return True
-        self.get_logger().error('Restart the normal gripper driver and gripper_client before init/AP. af currently owns the experimental control path.')
-        return False
+        return self._restore_force_press_control()
 
     def _stop_force_press_worker(self):
         with self._force_press_lock:
@@ -95,10 +145,10 @@ class ForcePressCollectionMixin:
         if self._effective_object_width_m is None:
             self.get_logger().error('Run init [i] first.')
             return
-        if self.count_publishers('/robotiq_2f_gripper/status'):
-            self.get_logger().error('Finish init, stop gripper_client and the normal gripper driver (deactivate_on_shutdown:=false), then select af again. Keep this manager and sensors running.')
+        if self._force_press_handoff_active and not self._restore_force_press_control(): return
+        if not self._force_press_control_client.wait_for_service(timeout_sec=2.):
+            self.get_logger().error('Start the updated normal gripper driver. No manual shutdown/handoff is required.')
             return
-        self._force_press_handoff_active=True
         if not sys.stdin.isatty():
             self.get_logger().error('af requires an interactive terminal.')
             return
@@ -125,6 +175,7 @@ class ForcePressCollectionMixin:
             return
         metadata = None
         try:
+            self._borrow_force_press_control(base)
             for index in range(1, count+1):
                 if self._stop_event.is_set() or not self._check_sensors_health(): break
                 if (index-1) % 10 == 0:
@@ -171,5 +222,6 @@ class ForcePressCollectionMixin:
             self.get_logger().error('Force collection stopped: '+str(exc))
         finally:
             self._stop_force_press_worker()
+            self._restore_force_press_control()
             self._is_active_session=False
             if self._bag_process: self._stop_rosbag()
