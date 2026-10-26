@@ -58,6 +58,15 @@ def validate_plan(plan):
     if plan['baud'] not in (9600,19200,38400,57600,115200): raise ValueError('unsupported baud')
     if not isinstance(plan.get('port'), str) or not plan['port'].startswith('/dev/'):
         raise ValueError('explicit /dev serial port required')
+    if plan.get('press_mode', 'continuous') not in ('continuous', 'stepped'):
+        raise ValueError('unknown press mode')
+    if plan.get('press_mode') == 'stepped':
+        for name, default, lo, hi in [('step_counts',1,1,3), ('step_settle_ms',100,50,1000),
+                                      ('step_sample_ms',50,20,200), ('step_timeout_ms',500,100,2000),
+                                      ('step_total_timeout_ms',10000,1000,30000)]:
+            value = plan.get(name, default)
+            if type(value) is not int or not lo <= value <= hi:
+                raise ValueError('invalid '+name)
     start = plan['effective_width_m'] + plan['clearance_m']
     minimum = max(.001, plan['effective_width_m'] - 2*plan['max_depth_per_side_m'])
     width_to_raw(start); width_to_raw(minimum)
@@ -70,6 +79,8 @@ class Collection:
         self.plan, self.probe = plan, probe
         self.start_width, self.minimum_width = validate_plan(plan)
         self.start_raw, self.minimum_raw = width_to_raw(self.start_width), width_to_raw(self.minimum_width)
+        self.is_stepped = plan.get('press_mode', 'continuous') == 'stepped'
+        self.step_records = []
         self.completed = False
         self.event_publish_errors = 0
         self.node = None
@@ -90,7 +101,7 @@ class Collection:
         self.publisher = node.create_publisher(String, '/force_press_event', 100)
 
     def on_event(self, row):
-        value = dict(row, schema_version=1, trial_index=self.plan['trial_index'], action='force_press_hold')
+        value = dict(row, schema_version=1, trial_index=self.plan['trial_index'], action='force_press_step_hold' if self.is_stepped else 'force_press_hold')
         # File log remains authoritative if ROS event publication fails.
         try:
             self.publisher.publish(self.message_type(data=json.dumps(self.probe.json_safe(value), allow_nan=False)))
@@ -121,7 +132,8 @@ class Collection:
         self.width_publisher=self.node.create_publisher(Float32,'/robotiq_2f_gripper/finger_distance_mm',10)
 
     def summary(self):
-        return dict(plan=self.plan, start_width_m=self.start_width, minimum_width_m=self.minimum_width,
+        return dict(plan=self.plan, press_mode='stepped' if self.is_stepped else 'continuous',
+                    steps=self.step_records, start_width_m=self.start_width, minimum_width_m=self.minimum_width,
                     start_raw=self.start_raw, minimum_raw=self.minimum_raw,
                     prepared=self._prepared, completed=self.completed,
                     auxiliary_motion_commanded=self.auxiliary_motion_commanded,
@@ -267,6 +279,119 @@ class Collection:
 
     def bound_target(self, relative_target):
         return min(relative_target, self.minimum_raw)
+
+    def run_stepped_press(self, port, status, event, state, manual_stop, initial, limit):
+        """Bound each GO by position; evaluate target only after STOP and settling.
+
+        The probe's outer exception handler always attempts STOP on failures here.
+        ForceState remains armed for immediate hard-limit/invalid/stale stops.
+        """
+        deadline = time.monotonic() + self.plan.get('step_total_timeout_ms', 10000)/1000
+        current = initial['g_po']
+        state.target_enabled = False
+
+        def guarded_status(stopped=False):
+            self.check_health(state, manual_stop)
+            reason = state.check(time.monotonic_ns())
+            if reason:
+                return None
+            if time.monotonic() >= deadline:
+                state.request_stop('stepped_total_timeout')
+                return None
+            value = status()
+            if value['g_flt'] or value['g_act'] != 1 or value['g_sta'] != 3:
+                raise RuntimeError('Gripper fault during stepped pressing')
+            if value['g_po'] > limit:
+                raise RuntimeError('Observed position exceeds stepped closing limit')
+            if stopped and value['g_gto']:
+                raise RuntimeError('Gripper GO unexpectedly active during step pause')
+            self.check_health(state, manual_stop)
+            if state.check(time.monotonic_ns()):
+                return None
+            return value
+
+        while current < limit:
+            value = guarded_status(stopped=True)
+            if value is None:
+                return
+            current = value['g_po']
+            if current >= limit:
+                break
+            target = min(limit, current + self.plan.get('step_counts', 1))
+            number = len(self.step_records) + 1
+            record = dict(step_index=number, start_raw=current, target_raw=target)
+            self.step_records.append(record)  # incomplete moves survive exceptions
+            record['write_start_ns'] = event('step_write_start', **record)['monotonic_ns']
+            port.command(target, 0, 0, True)
+            event('step_write_ack', step_index=number, target_raw=target)
+            move_deadline = time.monotonic() + self.plan.get('step_timeout_ms', 500)/1000
+            while True:
+                value = guarded_status()
+                if value is None:
+                    return  # outer probe sends the terminal STOP
+                if value['g_pr'] == target and value['g_po'] >= target:
+                    break
+                if value['g_obj'] in (1, 2):
+                    state.request_stop('position_or_hardware_contact_limit')
+                    return
+                if time.monotonic() >= move_deadline:
+                    state.request_stop('step_motion_timeout')
+                    return
+                time.sleep(.005)
+            event('step_position_observed', step_index=number, g_po=value['g_po'])
+            event('step_stop_write_start', step_index=number)
+            port.command(current, 0, 0, False)  # rGTO=0, never a reverse GO
+            record['stop_ack_ns'] = event('step_stop_write_ack', step_index=number)['monotonic_ns']
+            value = guarded_status()
+            if value is None:
+                return
+            if value['g_gto']:
+                raise RuntimeError('No STOP echo between force steps')
+            current = value['g_po']
+            record['stopped_raw'] = current
+            if current > limit:
+                raise RuntimeError('Observed position exceeds stepped closing limit')
+            settle_end = time.monotonic() + self.plan.get('step_settle_ms', 100)/1000
+            while time.monotonic() < settle_end:
+                if guarded_status(stopped=True) is None:
+                    return
+                time.sleep(.005)
+            # Require newly acquired samples after settling, not queued pre-STOP data.
+            begin = time.monotonic_ns()
+            begin_ros = self.node.get_clock().now().nanoseconds
+            window_ns = self.plan.get('step_sample_ms', 50)*1_000_000
+            event('step_measure_start', step_index=number, sample_start_ros_ns=begin_ros)
+            while time.monotonic_ns()-begin < window_ns:
+                if guarded_status(stopped=True) is None:
+                    return
+                time.sleep(.005)
+            measured, evidence = {}, {}
+            with state.lock:
+                if state.reason:
+                    return
+                for side in ('left', 'right'):
+                    rows = [r for r in state.logs if r['side'] == side
+                            and begin <= r['receive_monotonic_ns'] < begin+window_ns
+                            and begin_ros <= r['header_ns'] < begin_ros+window_ns]
+                    if len(rows) < 10 or rows[-1]['header_ns']-rows[0]['header_ns'] < window_ns//2:
+                        raise RuntimeError('Insufficient newly acquired settled force: '+side)
+                    measured[side] = abs(statistics.median(r['wrench'][1] for r in rows)-state.offsets[side])
+                    evidence[side] = dict(samples=len(rows), first_header_ns=rows[0]['header_ns'],
+                                          last_header_ns=rows[-1]['header_ns'])
+                record.update(measured_force_n=measured, evidence=evidence,
+                              sample_start_monotonic_ns=begin, sample_end_monotonic_ns=begin+window_ns,
+                              sample_start_ros_ns=begin_ros, sample_end_ros_ns=begin_ros+window_ns,
+                              measurement_end_ns=time.monotonic_ns())
+                if max(measured.values()) >= self.plan['threshold_n']:
+                    state._latch('force_threshold', time.monotonic_ns())
+                    state.trigger.update(decision_method='settled_window_median',
+                                         measured_force_n=measured, step_index=number,
+                                         settled_evidence=evidence)
+            event('step_measurement', **record)
+            if state.reason:
+                return
+        # The final allowed step is measured before declaring range exhaustion.
+        state.request_stop('position_limit_before_target')
 
     def finish(self, port, status, event, state, manual_stop):
         if state.reason != 'force_threshold':

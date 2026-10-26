@@ -24,7 +24,9 @@ class ForcePressCollectionMixin:
         defaults = dict(port='/dev/ttyUSB0', baud=115200, slave=9, threshold_n=.5,
                         hard_limit_n=1., hold_seconds=4., clearance_m=.002,
                         max_depth_per_side_m=float(self.config.push_depth),
-                        close_ticks=20, max_motion_ms=2000, target_confirm_ms=5.)
+                        close_ticks=20, max_motion_ms=2000, target_confirm_ms=5.,
+                        step_counts=1, step_settle_ms=100, step_sample_ms=50,
+                        step_timeout_ms=500, step_total_timeout_ms=10000)
         self._force_press_settings = {
             name: self.declare_parameter('force_press_'+name, default).value
             for name, default in defaults.items()
@@ -139,7 +141,7 @@ class ForcePressCollectionMixin:
         try: self._prepare_session()
         finally: self._session_id_override=original
 
-    def _execute_force_press_loop(self):
+    def _execute_force_press_loop(self, stepped=False):
         from std_msgs.msg import String
         if not self._check_sensors_health(): return
         if self._effective_object_width_m is None:
@@ -155,19 +157,27 @@ class ForcePressCollectionMixin:
         count = self._read_positive_int('Number of force-stop trials: ')
         if count is None: return
         base = dict(self._force_press_settings, effective_width_m=self._effective_object_width_m, trial_index=1)
+        base['press_mode'] = 'stepped' if stepped else 'continuous'
+        action = 'force_press_step_hold' if stepped else 'force_press_hold'
+        experiment = 'afs' if stepped else 'af'
         try:
             start_width, minimum_width = validate_plan(base)
         except ValueError as exc:
             self.get_logger().error(str(exc))
             return
         self.get_logger().warn(
-            f"af: target={base['threshold_n']} N (max of baseline-relative Fy), "
+            f"{experiment}: target={base['threshold_n']} N (max of baseline-relative Fy), "
             f"raw hard limit={base['hard_limit_n']} N, confirm={base['target_confirm_ms']} ms, "
             f"start width={start_width*1000:.2f} mm, minimum width={minimum_width*1000:.2f} mm, "
             f"relative cap={base['close_ticks']} counts, hold={base['hold_seconds']} s. "
             'Preparation and release are automatic. Clear hands; Enter/Ctrl+C requests STOP. '
             'The probe does not regulate force during hold.'
         )
+        if stepped:
+            self.get_logger().warn(
+                f"Stepped: {base['step_counts']} raw count(s) per move, STOP, "
+                f"settle={base['step_settle_ms']} ms, median window={base['step_sample_ms']} ms; "
+                'target uses settled force, not the continuous confirmation timer. Hard limit remains immediate.')
         print('Type GO to record and execute this force-stop series: ', end='', flush=True)
         if sys.stdin.readline().strip() != 'GO': return
         if not any(t.name == '/force_press_event' for t in self.config.topics):
@@ -184,7 +194,7 @@ class ForcePressCollectionMixin:
                     metadata_path = self._session_dir/'force_press_metadata.json'
                     if metadata_path.exists(): raise RuntimeError('Existing force collection session; use a new session id')
                     (self._session_dir/'force_press').mkdir(exist_ok=False)
-                    metadata = dict(schema_version=1, experiment='af', effective_object_width_m=self._effective_object_width_m,
+                    metadata = dict(schema_version=1, experiment=experiment, effective_object_width_m=self._effective_object_width_m,
                                     settings=base, actual_condition_order=[],
                                     note='Position hold after force-triggered stop; not constant-force feedback. Original bag and per-trial sidecars are required.')
                     metadata_path.write_text(json.dumps(metadata,indent=2)+'\n')
@@ -196,8 +206,8 @@ class ForcePressCollectionMixin:
                 plan_path = directory/f'trial_{index:04d}_plan.json'
                 output = directory/f'trial_{index:04d}'
                 plan_path.write_text(json.dumps(plan,indent=2)+'\n')
-                self._publish_trial_event('START',index,'force_press_hold',minimum_width,0.)
-                self._marker_pub.publish(String(data=f'START,trial:{index},model:force_press_hold,target_force_n:{base["threshold_n"]}'))
+                self._publish_trial_event('START',index,action,minimum_width,0.)
+                self._marker_pub.publish(String(data=f'START,trial:{index},model:{action},target_force_n:{base["threshold_n"]}'))
                 self._is_active_session=True
                 code=self._run_force_press_worker(plan_path,output)
                 self._is_active_session=False
@@ -208,8 +218,8 @@ class ForcePressCollectionMixin:
                          and result.get('collection',{}).get('completed') is True
                          and result.get('collection',{}).get('event_publish_errors',1)==0)
                 event='END' if success else 'ABORT'
-                self._publish_trial_event(event,index,'force_press_hold',minimum_width,0.)
-                self._marker_pub.publish(String(data=f'{event},trial:{index},model:force_press_hold'))
+                self._publish_trial_event(event,index,action,minimum_width,0.)
+                self._marker_pub.publish(String(data=f'{event},trial:{index},model:{action}'))
                 metadata['actual_condition_order'].append(dict(trial_index=index,plan=plan,success=success,
                                                              result=str(result_path.relative_to(self._session_dir))))
                 metadata_path.write_text(json.dumps(metadata,indent=2)+'\n')

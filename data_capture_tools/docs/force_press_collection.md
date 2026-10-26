@@ -101,3 +101,31 @@ STOP応答は物理停止ではない。位置の取得はおおむね20 Hz、8b
 `startup_force_wait_start`、`startup_force_ready` / `startup_force_timeout`をイベントに残し、summary.collection.startup_force_waitに待機時間・左右の受信経過時間・受信時header年齢を保存する。以後の鮮度エラーにも左右別の詳細を含める。
 
 起動時だけの無動作待機であり、準備・押し込み・保持・開放に入った後の100 ms基準は緩和しない。無効な値や手動中断は待機中でも中止する。データが戻らない場合も動かさずABORTで終了する。この修正はdata_capture_toolsだけ再ビルドし、収集ノードを再起動する。init結果はメモリ内なので再起動後にiを実行する。他のノードの再起動は不要。
+
+## 追加方式 afs：小刻み移動と停止後の力計測（2026-10-26）
+
+通常の `af` は連続方式のまま残し、新しいメニュー `afs` を追加する。initの小刻み探索と同様に「少し閉じる→止める→力を見る」を繰り返す。init本体、アームのセンタリング、通常APには変更しない。
+
+### 動作と既定値
+
+- initの有効物体幅＋2 mmへの準備移動、仮基準・最終基準計測は既存afと同じ。準備移動は連続移動のまま。
+- 本番だけを **1 raw count** ずつ最小速度・最小駆動力設定で閉じる。mmは既存近似式による推定で、1 countは任意に小さくできる変位ではない。
+- 各位置要求の到達確認後、rGTO=0のSTOPを送り、ACKとgGTO=0を確認。既存準備移動の±1 count許容は本番には使わない。
+- STOP後100 ms待機し、その後の新しい50 msのFyから左右それぞれ中央値を求める。試行開始時の基準中央値との差の絶対値を力とする。途中でtareし直さない。最低10サンプルと25 ms以上のheader時刻範囲を必要とする。
+- 左右の大きい方が0.5 N以上なら、その位置で約4秒保持して準備位置へ開放する。未達なら次の1 countへ進む。
+- 1 Nの即時上限、100 msの鮮度確認、無効値、手動停止は移動・待機・計測中も有効。目標力については移動中の瞬間値ではなく停止後の中央値を使う。継続確認3/5 msパラメータはafs本番の目標到達には使わない。
+- 総移動範囲は既存afと同じ、開始位置からclose_ticks（既定20）とinit幅からの最小開口幅の厳しい方。各移動500 ms、本番全体10秒で打ち切り。限界に達した最後の刻みも計測してから未達を判断する。失敗はシリーズ中断し、自動開放・自動再試行はしない。
+
+### 制限
+
+刻み中の速度は最小設定のままで、連続した5 mm/s動作にはならない。1 countで硬い試料の力が上限を超える可能性は残る。停止指令ACK・位置レジスタは物理停止の較正ではない。待機中の緩和によって動作中ピークと判定時の力は異なる。既存af同様、目標到達後は位置保持であり、力の再調節や上限以下の力の保証はない。
+
+### 記録
+
+metadataのexperimentは `afs`、planのpress_modeは `stepped`、TrialEvent.mode / force_press_event.actionは `force_press_step_hold` として連続方式から区別する。ファイル配置は既存のforce_press_metadata.json、force_press/trial_NNNN/のまま。各step_write_start / step_position_observed / step_stop_write_start / step_stop_write_ack / step_measure_start / step_measurementイベント、summary.collection.stepsに位置・測定中央値・証拠header時刻・サンプル数を保存。stop_trigger.decision_method=settled_window_median、measured_force_nが到達判定に用いた値で、従来のforce_nは判定時最新の瞬間値。判定から最終STOPまでの時間は、すでに止まった後の処理時間なので連続方式の停止応答と同列に比較しない。
+
+### 実機手順
+
+反映後 `colcon build --packages-select data_capture_tools`。収集ノードを終了して、同じターミナルでsource install/setup.bash後、通常コマンドで収集ノードを起動し直す。他ドライバの再起動・新しいポート設定は不要。`i` → `afs` → 試行数1 → GO。画面に1 count、settle=100 ms、median window=50 msと出ることを確認する。
+
+調整用ROSパラメータはforce_press_step_counts（1..3）、force_press_step_settle_ms（50..1000）、force_press_step_sample_ms（20..200）、force_press_step_timeout_ms（100..2000）、force_press_step_total_timeout_ms（1000..30000）。まず既定を使う。元データ・時刻定義は変更しない。

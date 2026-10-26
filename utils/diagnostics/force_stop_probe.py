@@ -189,6 +189,7 @@ class ForceState:
         self.trigger = None
         self.target_confirm_ns = round(target_confirm_ms*1e6)
         self.target_candidates = {}
+        self.target_enabled = True
 
     def update(self, side, header_ns, received_ns, ros_now_ns, wrench):
         with self.lock:
@@ -230,7 +231,7 @@ class ForceState:
             self._latch('invalid_force_value', now)
         elif max(values.values()) >= self.hard_limit:
             self._latch('force_hard_limit', now)
-        elif self._target_confirmed(values):
+        elif self.target_enabled and self._target_confirmed(values):
             self._latch('force_threshold', now)
 
     def _target_confirmed(self, values):
@@ -399,6 +400,8 @@ def run(a, collection=None):
             collection.prepare(port, status, event, state, manual_stop)
             initial_status = status()
             require_ready_status(initial_status)
+            if getattr(collection, 'is_stepped', False):
+                state.target_enabled = False  # hard/freshness guards remain active
         target = min(255,initial_status['g_po']+a.close_ticks)
         if collection is not None: target = collection.bound_target(target)
         if target==initial_status['g_po']: raise RuntimeError('No closing range remains')
@@ -441,24 +444,29 @@ def run(a, collection=None):
         else: keyboard_thread = None
         if state.check(time.monotonic_ns()) is not None or manual_stop.is_set():
             event('not_started_after_guard');return 2
-        motion_event = event('motion_write_start',target_raw=target)
-        motion_may_have_started = True  # even an ACK timeout can leave a command executing
-        port.command(target,a.speed_byte,a.force_byte,True)
-        started = motion_event['monotonic_ns']
-        event('motion_write_ack')
-        next_status = time.monotonic()+.05
-        while state.check(time.monotonic_ns()) is None:
-            elapsed_ms = (time.monotonic_ns()-started)/1e6
-            if a.stop_after_ms is not None and elapsed_ms>=a.stop_after_ms:
-                state.request_stop('timed_stop');break
-            if elapsed_ms>=a.max_motion_ms:
-                state.request_stop('motion_timeout');break
-            if time.monotonic()>=next_status:
-                s = status()
-                next_status = time.monotonic()+.05
-                if s['g_flt']: state.request_stop('gripper_fault')
-                elif s['g_po']>=target or s['g_obj'] in (1,2): state.request_stop('position_or_hardware_contact_limit')
-            time.sleep(.001)
+        if collection is not None and getattr(collection, 'is_stepped', False):
+            motion_may_have_started = True  # includes lost per-step GO ACK
+            event('motion_write_start', target_raw=target, press_mode='stepped')
+            collection.run_stepped_press(port, status, event, state, manual_stop, initial_status, target)
+        else:
+            motion_event = event('motion_write_start',target_raw=target)
+            motion_may_have_started = True  # even an ACK timeout can leave a command executing
+            port.command(target,a.speed_byte,a.force_byte,True)
+            started = motion_event['monotonic_ns']
+            event('motion_write_ack')
+            next_status = time.monotonic()+.05
+            while state.check(time.monotonic_ns()) is None:
+                elapsed_ms = (time.monotonic_ns()-started)/1e6
+                if a.stop_after_ms is not None and elapsed_ms>=a.stop_after_ms:
+                    state.request_stop('timed_stop');break
+                if elapsed_ms>=a.max_motion_ms:
+                    state.request_stop('motion_timeout');break
+                if time.monotonic()>=next_status:
+                    s = status()
+                    next_status = time.monotonic()+.05
+                    if s['g_flt']: state.request_stop('gripper_fault')
+                    elif s['g_po']>=target or s['g_obj'] in (1,2): state.request_stop('position_or_hardware_contact_limit')
+                time.sleep(.001)
         stop()
         # Observe controller state and quantized position. This is NOT a high-speed physical motion measurement.
         if collection is not None: event('hold_start', stop_reason=state.reason)

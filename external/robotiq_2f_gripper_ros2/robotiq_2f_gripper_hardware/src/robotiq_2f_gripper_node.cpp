@@ -20,6 +20,31 @@ using namespace std::placeholders;
 using robotiq_2f_gripper_interfaces::DefaultDriver;
 using robotiq_2f_gripper_interfaces::DefaultSerial;
 
+namespace
+{
+std::string make_initialization_record(
+    int64_t start_ros, int64_t start_steady, int64_t ready_ros,
+    const std::string &port, int baud, int slave, bool fake,
+    bool active_at_start, bool activated, bool deactivate_on_shutdown)
+{
+    std::ostringstream out;
+    out << std::boolalpha
+        << "{\"schema_version\":1,\"startup_id\":"
+        << std::quoted(std::to_string(start_ros) + "-" + std::to_string(start_steady))
+        << ",\"node_start_ros_ns\":" << start_ros
+        << ",\"node_start_monotonic_ns\":" << start_steady
+        << ",\"ready_ros_ns\":" << ready_ros
+        << ",\"port\":" << std::quoted(port)
+        << ",\"baud\":" << baud << ",\"slave\":" << slave
+        << ",\"fake_hardware\":" << fake
+        << ",\"active_at_start\":" << active_at_start
+        << ",\"activation_performed\":" << activated
+        << ",\"deactivate_on_shutdown\":" << deactivate_on_shutdown
+        << ",\"conversion_model\":\"legacy_piecewise_polynomial_v1_uncalibrated\"}";
+    return out.str();
+}
+}
+
 GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
 {
     // Declare parameter for config file path
@@ -83,6 +108,13 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
     }
     RCLCPP_INFO(get_logger(), "Using status polling rate: %.3f Hz", status_poll_rate_hz_);
 
+    const auto startup_ros_ns = now().nanoseconds();
+    const auto startup_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool activation_performed = false;
+    bool active_at_start = false;
+    initialization_publisher_ = create_publisher<std_msgs::msg::String>(
+        "/robotiq_2f_gripper/initialization", rclcpp::QoS(1).reliable().transient_local());
     if (!fake_hardware_)
     {
         auto serial = std::make_unique<DefaultSerial>();
@@ -101,10 +133,12 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
         }
         RCLCPP_INFO(get_logger(), "The gripper is connected.");
 
-        if (!(driver_->is_gripper_active()))
+        active_at_start = driver_->is_gripper_active();
+        if (!active_at_start)
         {
             driver_->deactivate();
             driver_->activate();
+            activation_performed = true;
         }
         RCLCPP_INFO(get_logger(), "The gripper is activated.");
     }
@@ -142,6 +176,12 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
     force_press_control_service_ = create_service<std_srvs::srv::SetBool>(
         "~/set_force_press_control",
         std::bind(&GripperNode::set_force_press_control, this, _1, _2));
+    auto initialization = std_msgs::msg::String();
+    initialization.data = make_initialization_record(
+        startup_ros_ns, startup_steady_ns, now().nanoseconds(), serial_port_, baudrate_,
+        slave_address_, fake_hardware_, active_at_start, activation_performed,
+        deactivate_on_shutdown_);
+    initialization_publisher_->publish(initialization);
     RCLCPP_INFO(get_logger(), "Gripper node initialized");
 }
 

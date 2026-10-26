@@ -29,6 +29,7 @@ from ament_index_python.packages import PackageNotFoundError
 from .bag_converter import convert_bag_to_dataset
 from .config import CaptureConfig, load_capture_config
 from .force_press_collection import ForcePressCollectionMixin
+from .init_recording import InitRecordingMixin
 from sensor_msgs.msg import Image, CompressedImage
 
 
@@ -175,10 +176,12 @@ class ForceSensorMonitor:
     def _left_callback(self, msg: WrenchStamped) -> None:
         self._history_left.append(msg.wrench.force.y)
         self._last_msg_time_left = time.time()  # ★ 追加
+        self.node._init_force_callback('left', msg)
 
     def _right_callback(self, msg: WrenchStamped) -> None:
         self._history_right.append(msg.wrench.force.y)
         self._last_msg_time_right = time.time() # ★ 追加
+        self.node._init_force_callback('right', msg)
 
     def _get_raw_average(self, history: collections.deque) -> float:
         if len(history) == 0:
@@ -192,6 +195,8 @@ class ForceSensorMonitor:
         self.node.get_logger().info(
             f"[Tare] 力覚センサのゼロ点をセットしました: Left={self._offset_left:.3f}N, Right={self._offset_right:.3f}N"
         )
+
+        self.node._init_record_tare()
 
     def get_calibrated_left(self) -> float:
         """ゼロ点補正済みの純粋な力（絶対値）を取得"""
@@ -220,7 +225,7 @@ class ForceSensorMonitor:
             return False, "🔴 ERROR (Right のみ通信が途絶)"
 
 
-class DataCaptureNode(ForcePressCollectionMixin, Node):
+class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
     """Coordinates rosbag2 recording and dataset conversion."""
 
     def __init__(self) -> None:
@@ -292,6 +297,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
         self._urscript_pub = self.create_publisher(String, "/urscript_interface/script_command", 10)
         
         # --- 追加: 力覚センサモニターの初期化 ---
+        self._setup_init_recording()
         self._force_monitor = ForceSensorMonitor(self)
         self._is_testing_force = False
         
@@ -359,6 +365,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
 
     def _phase_cb(self, msg: Int32) -> None:
         """C++側からのフェーズ情報を受信."""
+        self._init_observe('phase', phase=int(msg.data))
         self._current_phase = msg.data
         if msg.data == -1:
             self.get_logger().error("Sequence failure detected from gripper_client.")
@@ -370,6 +377,10 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
 
     def _robot_action_event_cb(self, msg: RobotActionEvent) -> None:
         """Track knead failures without changing legacy sequence completion behavior."""
+        self._init_observe('robot_action_event', header_ns=msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,
+                           event=msg.event, phase_id=msg.phase_id, trial_index=msg.trial_index,
+                           action_type=msg.action_type, target_position=msg.target_position,
+                           target_speed=msg.target_speed, success=msg.success)
         if msg.event == "knead_sequence_failed" or (
             msg.event.startswith("knead_") and msg.event.endswith("_action_failed")
         ):
@@ -402,6 +413,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
     def _width_cb(self, msg: Float32) -> None:
         # トピックが mm 単位なので、m 単位に変換して保持
         self._current_gripper_width_m = msg.data / 1000.0
+        self._init_observe('width', estimated_width_mm=float(msg.data))
             
     def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0, speed = 0.3):
         w_obj = self.config.target_diameter
@@ -458,6 +470,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
             print(" [ae]: Execute Standard Suite")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [af]: Force-triggered press and position hold (experimental)")
+            print(" [afs]: Stepped force press and position hold (experimental)")
             print(" [as]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [av]: Loading-speed sweep")
             print(" [arp]: Repeated press")
@@ -483,6 +496,8 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
                 self._execute_auto_loop()
             elif line == 'af':
                 self._execute_force_press_loop()
+            elif line == 'afs':
+                self._execute_force_press_loop(stepped=True)
             elif line == 'as':
                 self._execute_push_slide_loop()
             elif line == 'av':
@@ -1369,7 +1384,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
         if self._bag_process: self._stop_rosbag() #
         self.get_logger().info("Auto slide loop completed.")
 
-    def _run_init_sequence(self) -> bool:
+    def _run_init_motion_sequence(self) -> bool:
         # ★ 開始前にGelSightと力センサの両方が生きているかチェック
         if not self._check_sensors_health():
             self.get_logger().error("センサーの停止を検知したため、初期化を開始できません。")
@@ -1408,6 +1423,8 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
         effective_width_m = self._execute_active_centering()
         if effective_width_m is None:
             return False
+
+        self._mark_init_contact(effective_width_m)
 
         # 次のデータ収集ループに備えて少し開く
         self._sequence_finished_event.clear()
@@ -1868,6 +1885,12 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
         f_r = self._force_monitor.get_calibrated_right()
         self.get_logger().info(f"最終確定値: 幅{self._current_gripper_width_m*1000:.1f}mm | L={f_l:.3f}N, R={f_r:.3f}N")
             
+        self._init_observe('centering_result', selected_best_state=dict(best_state),
+                           final_force_n=dict(left=f_l, right=f_r),
+                           final_balanced_contact=(f_l >= T_min and f_r >= T_min and abs(f_l-f_r) <= balance_tol),
+                           final_estimated_width_m=self._current_gripper_width_m,
+                           contact_min_n=T_min, contact_max_n=T_max, balance_tolerance_n=balance_tol,
+                           note='Observational only; legacy return criteria are unchanged.')
         return self._current_gripper_width_m
     
     # def _execute_active_centering(self) -> float:
@@ -2620,6 +2643,7 @@ class DataCaptureNode(ForcePressCollectionMixin, Node):
         )
 
         bag_uri = session_dir / "bag" / f"session_{timestamp}"
+        self._attach_init_record(session_dir)
         self._session_dir = session_dir
         self._bag_uri = bag_uri
 

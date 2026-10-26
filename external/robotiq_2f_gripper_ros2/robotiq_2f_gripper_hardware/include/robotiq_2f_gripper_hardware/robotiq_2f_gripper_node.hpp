@@ -5,6 +5,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
@@ -41,6 +42,7 @@ namespace robotiq_2f_gripper_hardware
         bool deactivate_on_shutdown_{true};
         double status_poll_rate_hz_;
         std::unique_ptr<DefaultDriver> driver_;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr initialization_publisher_;
 
         // Topic names
         std::string gripper_action_topic = "robotiq_2f_gripper_action";
