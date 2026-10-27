@@ -1,6 +1,19 @@
 # Example configuration for data_capture_tools
 output_root: /mnt/nvme1/tsumura/afterDICOMO/controlled_experiment
 task_name: object11_ctrl
+# Optional observations. specimen_id defaults to task_name; no second JSON needed.
+# These values are recorded only and never change target_diameter or motion.
+# Unknown values stay null. Imperfect mounting/reused samples are permitted.
+specimen_metadata:
+  specimen_width_mm: null       # Measured sample width (mm)
+  width_measurement_state: null # e.g. before clamping, unloaded
+  clamp_gap_mm: null            # Measured clamp gap (mm), independent of sample width
+  notes: ""                    # Optional mounting/state changes; exact use count not required
+  # Low-frequency optional hardware labels; update only when known/changed.
+  finger_id: null
+  force_sensor_left_id: null
+  force_sensor_right_id: null
+
 prompt: ""
 label: "ぷりぷり, puri-puri" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
@@ -26,10 +39,10 @@ base_tcp_pose:
 #   rz: -0.010
 
 # 実験パラメータ
-target_diameter: 0.010 # 物体幅 (m) #クランプ:
+target_diameter: 0.010 # 動作計画用の幅 (m)。初期位置に合わせて調整可能。実測幅とは独立。
 gripper_offset: 0.000 # デバイス誤差 (m)
 arm_offset: 0.003 # アームの位置誤差 (m)
-push_depth: 0.004 # 押し込み量 (m)
+push_depth: 0.004 # 固定深さ動作の既定値 (m)。ad等の各試行条件とは区別する。
 
 # Loading speed policy. Use "fixed" for repeatability pilots; "random" keeps
 # the existing data-augmentation behavior.
@@ -60,6 +73,16 @@ bag_record:
   compression_mode: file
   compression_format: zstd
 topics:
+  # Raw commanded register targets; return events are not physical completion.
+  - name: /robotiq_2f_gripper/command_event
+    type: std_msgs/msg/String
+    mode: csv
+  - name: /robotiq_2f_gripper/initialization
+    type: std_msgs/msg/String
+    mode: csv
+  - name: /robot_cmd
+    type: std_msgs/msg/String
+    mode: csv
   # Experimental af stages/status; original timestamps and trial IDs are in JSON.
   - name: /force_press_event
     type: std_msgs/msg/String

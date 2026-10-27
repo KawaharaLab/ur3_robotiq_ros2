@@ -16,12 +16,12 @@ def main():
     if a.out.exists():p.error('Output exists; choose a new --out')
     files=sorted(a.root.glob('*/summary.json'))
     if not files:p.error('No init summaries under '+str(a.root))
-    records=[];groups=collections.defaultdict(list)
+    records=[];groups=collections.defaultdict(list);selections=collections.defaultdict(list)
     for f in files:
         s=json.loads(f.read_text());contact=s.get('contact') or {};metadata=s.get('metadata') or {}
         status=contact.get('sources',{}).get('gripper_status',{})
         startup=metadata.get('driver_initialization') or {}
-        config=metadata.get('config') or {}
+        config=metadata.get('effective_config') or metadata.get('config') or {}
         settings={k:config.get(k) for k in ('target_diameter','contact_threshold','contact_margin',
                                             'centering_step_grip','centering_step_arm','safe_margin')}
         settings_id=hashlib.sha256(json.dumps(settings,sort_keys=True).encode()).hexdigest()[:16]
@@ -38,19 +38,30 @@ def main():
                  status_header_ns=status.get('header_ns'),status_age_ms=status.get('receive_age_ms'),
                  effective_width_m=contact.get('effective_width_m'),
                  force_monitor=contact.get('force_monitor'),contact_warnings=contact.get('warnings'),
-                 centering_result=contact.get('sources',{}).get('centering_result'))
+                 centering_result=contact.get('sources',{}).get('centering_result'),
+                 record_quality_valid=s.get('record_quality_valid',s.get('valid_for_collection')),
+                 contact_criteria_met=s.get('contact_criteria_met'),
+                 selected_contact=s.get('selected_contact'),
+                 selected_to_final_count_delta=s.get('selected_to_final_count_delta'),
+                 measurements=metadata.get('measurements'),
+                 sensor_metadata=s.get('sensor_metadata_at_end',metadata.get('sensor_metadata')))
         records.append(row)
         if row['valid_for_collection'] and row['g_po'] is not None:
             driver_key=row['driver_startup_id'] or ('unknown:'+str(row['node_run_id']))
-            groups[(driver_key,row['reference_id'],row['reference_width_mm'],row['mount_id'],settings_id)].append(row['g_po'])
+            key=(driver_key,row['reference_id'],row['reference_width_mm'],row['mount_id'],settings_id,
+                 (metadata.get('measurements') or {}).get('physical_condition_id'))
+            groups[key].append(row['g_po'])
+            selected=(s.get('selected_contact') or {}).get('observed_count')
+            if selected is not None:selections[key].append(selected)
         print(s['init_id'],'valid='+str(row['valid_for_collection']),'gPO='+str(row['g_po']),
               'activation='+str(row['activation_performed']))
-    result=dict(schema_version=1,records=records,
-                groups=[dict(driver_startup_id=k[0],reference_id=k[1],reference_width_mm=k[2],mount_id=k[3],init_settings_id=k[4],
-                             repeats=len(v),contact_g_po=v,median_count=statistics.median(v),
+    result=dict(schema_version=2,records=records,
+                groups=[dict(driver_startup_id=k[0],reference_id=k[1],reference_width_mm=k[2],mount_id=k[3],init_settings_id=k[4],physical_condition_id=k[5],
+                             repeats=len(v),contact_g_po=v,position_basis='final_reference_g_po',
+                             selected_contact_g_po=selections[k],median_count=statistics.median(v),
                              min_count=min(v),max_count=max(v)) for k,v in groups.items()],
                 note='Grouped by driver startup and reference, not proof of a physical width calibration. '
-                     'Compare force/tare and centering results as well as count.')
+                     'contact_g_po is a legacy name for final reference count, not necessarily physical contact. Compare selected_contact_g_po, forces, and centering results.')
     with a.out.open('x') as f:f.write(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
     print('Send:',a.out.resolve())
 

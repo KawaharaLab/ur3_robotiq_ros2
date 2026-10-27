@@ -11,11 +11,12 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import sys
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('init_recording', ROOT/'data_capture_tools/data_capture_tools/init_recording.py')
-module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+sys.path.insert(0,str(ROOT/'data_capture_tools'))
+from data_capture_tools import init_recording as module
 
 
 class FakeNode(module.InitRecordingMixin):
@@ -181,7 +182,7 @@ class DriverRecordTests(unittest.TestCase):
     def test_cpp_initialization_json_for_activation_and_reuse(self):
         source=(ROOT/'external/robotiq_2f_gripper_ros2/robotiq_2f_gripper_hardware/src/robotiq_2f_gripper_node.cpp').read_text()
         start=source.index('std::string make_initialization_record(')
-        end=source.index('\n}\n}',start)+2
+        end=source.index('return out.str();\n}',start)+len('return out.str();\n}')
         function=source[start:end]
         prefix='#include <cstdint>\n#include <string>\n#include <sstream>\n#include <iomanip>\n#include <iostream>\n'
         main='''int main(){

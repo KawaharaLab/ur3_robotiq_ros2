@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cstdint>
 #include <thread>
 #include <iostream>
 #include <memory>
@@ -29,7 +30,7 @@ std::string make_initialization_record(
 {
     std::ostringstream out;
     out << std::boolalpha
-        << "{\"schema_version\":1,\"startup_id\":"
+        << "{\"schema_version\":2,\"startup_id\":"
         << std::quoted(std::to_string(start_ros) + "-" + std::to_string(start_steady))
         << ",\"node_start_ros_ns\":" << start_ros
         << ",\"node_start_monotonic_ns\":" << start_steady
@@ -40,9 +41,27 @@ std::string make_initialization_record(
         << ",\"active_at_start\":" << active_at_start
         << ",\"activation_performed\":" << activated
         << ",\"deactivate_on_shutdown\":" << deactivate_on_shutdown
+        << ",\"command_event_topic\":\"/robotiq_2f_gripper/command_event\""
         << ",\"conversion_model\":\"legacy_piecewise_polynomial_v1_uncalibrated\"}";
     return out.str();
 }
+std::string make_command_record(const std::string &startup_id, uint64_t sequence,
+    const std::string &stage, const std::string &source, int64_t ros_ns, int64_t steady_ns,
+    int position, int speed, int force, double width_m)
+{
+    std::ostringstream out;
+    out << std::setprecision(17)
+        << "{\"schema_version\":1,\"startup_id\":" << std::quoted(startup_id)
+        << ",\"command_seq\":" << sequence << ",\"stage\":" << std::quoted(stage)
+        << ",\"source\":" << std::quoted(source) << ",\"ros_ns\":" << ros_ns
+        << ",\"monotonic_ns\":" << steady_ns << ",\"position_count\":" << position
+        << ",\"speed_count\":" << speed << ",\"force_count\":" << force
+        << ",\"requested_width_m\":";
+    if (std::isfinite(width_m)) out << width_m; else out << "null";
+    out << "}";
+    return out.str();
+}
+
 }
 
 GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
@@ -111,10 +130,13 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
     const auto startup_ros_ns = now().nanoseconds();
     const auto startup_steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    startup_id_ = std::to_string(startup_ros_ns) + "-" + std::to_string(startup_steady_ns);
     bool activation_performed = false;
     bool active_at_start = false;
     initialization_publisher_ = create_publisher<std_msgs::msg::String>(
         "/robotiq_2f_gripper/initialization", rclcpp::QoS(1).reliable().transient_local());
+    command_event_publisher_ = create_publisher<std_msgs::msg::String>(
+        "/robotiq_2f_gripper/command_event", rclcpp::QoS(100).reliable());
     if (!fake_hardware_)
     {
         auto serial = std::make_unique<DefaultSerial>();
@@ -183,6 +205,33 @@ GripperNode::GripperNode() : Node("robotiq_2f_gripper_node")
         deactivate_on_shutdown_);
     initialization_publisher_->publish(initialization);
     RCLCPP_INFO(get_logger(), "Gripper node initialized");
+}
+
+void GripperNode::send_recorded_position(
+    uint8_t raw_position, double width_m, double speed, double force, const std::string &source)
+{
+    const auto sequence = ++command_sequence_;
+    auto record = [&](const char *stage) {
+        try {
+            auto message = std_msgs::msg::String();
+            const auto steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            message.data = make_command_record(startup_id_, sequence, stage, source,
+                now().nanoseconds(), steady_ns, raw_position,
+                convertToGripperSystem(speed), convertToGripperSystem(force), width_m);
+            command_event_publisher_->publish(message);
+        } catch (const std::exception &e) {
+            RCLCPP_ERROR(get_logger(), "Command event publication failed: %s", e.what());
+        }
+    };
+    record("write_start");
+    try {
+        driver_->set_gripper_position(raw_position);
+    } catch (...) {
+        record("write_exception");
+        throw;
+    }
+    record("write_return"); // returned from Modbus write, not physical completion
 }
 
 GripperNode::~GripperNode()
@@ -350,7 +399,8 @@ void GripperNode::execute(
             driver_->set_speed(convertToGripperSystem(goal->target_speed));
             const auto requested_position = static_cast<uint8_t>(
                 convertToGripperSystemPosition(goal->target_position));
-            driver_->set_gripper_position(requested_position);
+            send_recorded_position(requested_position, goal->target_position,
+                                   goal->target_speed, goal->target_force, "action");
             RCLCPP_INFO(get_logger(), "Gripper command sent; waiting for physical completion.");
 
             const auto start_time = std::chrono::steady_clock::now();
@@ -663,7 +713,7 @@ void GripperNode::gripper_command_callback(const std_msgs::msg::Float32MultiArra
         {
             driver_->set_force(convertToGripperSystem(force));
             driver_->set_speed(convertToGripperSystem(speed));
-            driver_->set_gripper_position(convertToGripperSystemPosition(position));
+            send_recorded_position(convertToGripperSystemPosition(position), position, speed, force, "confidence");
 
             auto start_time = std::chrono::steady_clock::now();
             auto timeout = std::chrono::seconds(action_timeout_);
@@ -755,7 +805,7 @@ void GripperNode::gripper_binary_command_callback(const std_msgs::msg::Float32Mu
     {
         driver_->set_force(convertToGripperSystem(force));
         driver_->set_speed(convertToGripperSystem(speed));
-        driver_->set_gripper_position(convertToGripperSystemPosition(position));
+        send_recorded_position(convertToGripperSystemPosition(position), position, speed, force, "binary");
 
         auto start_time = std::chrono::steady_clock::now();
         auto timeout = std::chrono::seconds(action_timeout_);

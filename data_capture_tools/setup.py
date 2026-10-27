@@ -17,7 +17,7 @@ setup(
         ('share/' + package_name + '/docs', ['docs/force_press_collection.md', 'docs/init_recording.md']),
         (
             'share/' + package_name + '/config',
-            glob('config/*.yaml'),
+            glob('config/*.yaml') + glob('config/*.json'),
         ),
     ],
     install_requires=['setuptools', 'PyYAML'],

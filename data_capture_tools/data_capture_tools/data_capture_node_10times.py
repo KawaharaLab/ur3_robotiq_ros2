@@ -361,6 +361,7 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         msg.mode = mode
         msg.target_position = target_position
         msg.target_speed = target_speed
+        self._record_trial_provenance(event, trial_index, mode, target_position, target_speed)
         self._trial_event_pub.publish(msg)
 
     def _phase_cb(self, msg: Int32) -> None:
@@ -398,6 +399,8 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         return True
             
     def _joint_cb(self, msg: JointState) -> None:
+        self._init_observe('arm_joint_state', header_ns=msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,
+                           names=list(msg.name), position=list(msg.position), velocity=list(msg.velocity), effort=list(msg.effort))
         """最新の関節角度を常に保持しておく"""
         # UR3のジョイント名順序を固定して取得
         joint_names = [
@@ -1747,6 +1750,10 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         # 探査前の初期幅(probe_w)より開く/そこからアプローチすることはあり得ないので、
         # safe_stop_width が probe_w を超えないように抑えるだけで十分です。
         safe_stop_width = min(safe_stop_width, probe_w)
+        self._init_observe('centering_geometry', probe_width_m=probe_w,
+                           right_edge_offset_m=pos_right, left_edge_offset_m=pos_left,
+                           center_offset_m=center_pos, estimated_object_width_m=measured_width,
+                           approach_target_width_m=safe_stop_width)
 
         if safe_stop_width < self._current_gripper_width_m:
             self.get_logger().info(
@@ -1785,6 +1792,7 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
             
             if f_l >= T_min and f_r >= T_min and force_diff < best_state["diff"]:
                 best_state = {"f_l": f_l, "f_r": f_r, "w": current_w, "pos": current_pos, "diff": force_diff}
+                self._mark_init_selection(best_state)
                 self.get_logger().info(f"ベスト更新: グリッパ{current_w*1000:.1f}mm, アーム{current_pos*1000:.1f}mm, 差{force_diff:.3f}N")
             
             # --- 1. 【最優先】両方が接触し、かつバランスが取れている場合（大成功） ---

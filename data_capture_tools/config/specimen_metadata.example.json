@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "specimen_id": null,
+  "material_id": null,
+  "mount_id": null,
+  "clamp_gap_mm": null,
+  "specimen_width_mm": null,
+  "clamp_insertion_depth_mm": null,
+  "measurement_uncertainty_mm": null,
+  "measurement_method": null,
+  "measured_at": null,
+  "orientation": null,
+  "finger_id": null,
+  "force_sensor_left_id": null,
+  "force_sensor_right_id": null,
+  "ambient_temperature_c": null,
+  "notes": ""
+}

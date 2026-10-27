@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -43,6 +44,11 @@ namespace robotiq_2f_gripper_hardware
         double status_poll_rate_hz_;
         std::unique_ptr<DefaultDriver> driver_;
         rclcpp::Publisher<std_msgs::msg::String>::SharedPtr initialization_publisher_;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr command_event_publisher_;
+        std::string startup_id_;
+        std::atomic<uint64_t> command_sequence_{0};
+        void send_recorded_position(uint8_t raw_position, double width_m, double speed,
+                                    double force, const std::string &source);
 
         // Topic names
         std::string gripper_action_topic = "robotiq_2f_gripper_action";
