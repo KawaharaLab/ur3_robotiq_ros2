@@ -173,6 +173,94 @@ class SteppedTests(unittest.TestCase):
         self.assertEqual(s.state.reason, 'stepped_total_timeout')
         self.assertLessEqual(len([c for c in s.commands if c[3]]), 7)
 
+    def test_full_probe_hard_limit_aborts_but_opens_and_preserves_reason(self):
+        spec = importlib.util.spec_from_file_location('abort_release_simulation', ROOT/'utils/diagnostics/test_force_stop_probe.py')
+        tests = importlib.util.module_from_spec(spec); spec.loader.exec_module(tests)
+        class LowLimitCollection(worker.Collection):
+            def run_stepped_press(self, port, status, event, state, manual, initial, limit):
+                state.hard_limit = .3  # deterministic simulated crossing at count 2
+                return super().run_stepped_press(port,status,event,state,manual,initial,limit)
+        collection = LowLimitCollection(plan(), tests.probe)
+        code, result, commands = tests.SimulatedRunTests().simulate('collection', collection=collection)
+        self.assertEqual(code,2)
+        self.assertEqual(result['stop_trigger']['reason'],'force_hard_limit')
+        self.assertIn('force_hard_limit',result['error'])
+        self.assertFalse(result['collection']['completed'])
+        self.assertTrue(result['collection']['abort_release']['completed'])
+        self.assertEqual(result['collection']['abort_release']['target_raw'],collection.start_raw)
+        self.assertEqual(commands[-2:],[True,False])
+
+    def test_continuous_collection_hard_limit_also_releases_and_stays_aborted(self):
+        spec=importlib.util.spec_from_file_location('continuous_abort_simulation',ROOT/'utils/diagnostics/test_force_stop_probe.py')
+        tests=importlib.util.module_from_spec(spec);spec.loader.exec_module(tests)
+        class LowLimitCollection(worker.Collection):
+            def prepare(self,port,status,event,state,manual):
+                super().prepare(port,status,event,state,manual)
+                state.hard_limit=.3
+        p=plan();p['press_mode']='continuous'
+        collection=LowLimitCollection(p,tests.probe)
+        code,result,commands=tests.SimulatedRunTests().simulate('collection',collection=collection)
+        self.assertEqual(code,2)
+        self.assertEqual(result['stop_trigger']['reason'],'force_hard_limit')
+        self.assertTrue(result['collection']['abort_release']['completed'])
+        self.assertFalse(result['collection']['completed'])
+        self.assertEqual(commands[-2:],[True,False])
+
+    def release_simulation(self):
+        s=Simulation(force_per_count=1.2);s.run()
+        s.command(s.position,0,0,False)
+        s.collection._prepared=True
+        return s
+
+    def release(self, s, status=None, ack=True):
+        clock=SimpleNamespace(monotonic=lambda:s.clock_ns/1e9,
+                              monotonic_ns=lambda:s.clock_ns,sleep=s.sleep)
+        with patch.object(worker,'time',clock):
+            s.collection.release_after_hard_limit(s,status or s.status,s.event,s.state,s.manual,ack)
+
+    def test_hard_limit_release_is_opening_only_and_preserves_latched_state(self):
+        s=self.release_simulation();before=len(s.commands)
+        self.release(s)
+        self.assertTrue(s.collection.abort_release['completed'])
+        self.assertEqual(s.commands[before][0],s.start)
+        self.assertTrue(s.commands[before][3])
+        self.assertEqual(s.state.reason,'force_hard_limit')
+        self.assertFalse(s.collection.completed)
+
+    def test_manual_stale_fault_stop_unconfirmed_or_closing_target_do_not_open(self):
+        for condition in ('manual','stale','fault','go_active','no_ack','closing_target','not_prepared'):
+            s=self.release_simulation();ack=True;status=s.status
+            if condition=='manual':s.manual.set()
+            if condition=='stale':s.clock_ns+=200_000_000
+            if condition=='fault':
+                def status():return dict(s.status(),g_flt=9)
+            if condition=='go_active':s.go=True
+            if condition=='no_ack':ack=False
+            if condition=='closing_target':s.collection.start_raw=s.position+1
+            if condition=='not_prepared':s.collection._prepared=False
+            before=len(s.commands)
+            self.release(s,status,ack)
+            self.assertEqual(len(s.commands),before,condition)
+            self.assertFalse(s.collection.abort_release['completed'],condition)
+            self.assertIn('error',s.collection.abort_release)
+
+    def test_lost_opening_ack_attempts_stop_and_records_failed_release(self):
+        s=self.release_simulation();original=s.command
+        def command(target,speed,force,go):
+            original(target,speed,force,go)
+            if go:raise TimeoutError('lost opening ACK')
+        s.command=command
+        self.release(s)
+        self.assertFalse(s.collection.abort_release['completed'])
+        self.assertIn('lost opening ACK',s.collection.abort_release['error'])
+        self.assertFalse(s.commands[-1][3])
+
+    def test_non_hard_limit_abort_does_not_open(self):
+        s=Simulation(force_per_count=.05,limit_delta=1);s.run();before=len(s.commands)
+        self.release(s)
+        self.assertEqual(len(s.commands),before)
+        self.assertIsNone(s.collection.abort_release)
+
     def test_invalid_step_settings_rejected(self):
         for key, value in [('step_counts', 0), ('step_counts', 4), ('step_settle_ms', 0),
                            ('step_sample_ms', 1), ('step_timeout_ms', float('nan')),

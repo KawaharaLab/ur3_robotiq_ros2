@@ -470,7 +470,10 @@ def run(a, collection=None):
         stop()
         # Observe controller state and quantized position. This is NOT a high-speed physical motion measurement.
         if collection is not None: event('hold_start', stop_reason=state.reason)
-        hold_end = time.monotonic()+max(.2, a.hold_seconds if state.reason in ('force_threshold','timed_stop') else .2)
+        observation_seconds = max(.2, a.hold_seconds if state.reason in ('force_threshold','timed_stop') else .2)
+        if collection is not None and state.reason == 'force_hard_limit':
+            observation_seconds = 0.  # STOP echo first, then unload without a hold
+        hold_end = time.monotonic()+observation_seconds
         clear_seen = False
         first_observation = True
         while first_observation or (time.monotonic()<hold_end and not manual_stop.is_set()):
@@ -499,6 +502,10 @@ def run(a, collection=None):
                     stop();break
                 except Exception as exc:
                     event('stop_attempt_failed',attempt=attempt+1,error=str(exc))
+        if collection is not None and port is not None and motion_may_have_started:
+            release = getattr(collection, 'release_after_hard_limit', None)
+            if release is not None:
+                release(port, status, event, state, manual_stop, stop_acknowledged)
         stop_watch.set()
         if keyboard_thread is not None:keyboard_thread.join(timeout=.1)
         if port is not None:port.close()
@@ -518,7 +525,7 @@ def run(a, collection=None):
             summary['collection'] = collection.summary()
             summary['press_motion_may_have_started'] = motion_may_have_started
             summary['motion_may_have_started'] = motion_may_have_started or summary['collection'].get('auxiliary_motion_commanded', False)
-            summary['note'] = 'Host callback/Modbus ACK/controller echo only; not physical stopping time. Collection may prepare and release after successful force stop and hold. Width conversion is empirical.'
+            summary['note'] = 'Host callback/Modbus ACK/controller echo only; not physical stopping time. Collection may release after successful hold or confirmed hard-limit STOP; abort release does not imply trial success. Width conversion is empirical.'
             summary['post_trigger_peak_scope'] = 'All remaining received samples, including hold and release; use events to isolate pressing overshoot.'
         if trigger:
             first = next((e for e in events if e['event']=='stop_write_start'),None)

@@ -225,7 +225,7 @@ class ForcePressCollectionMixin:
                 metadata_path.write_text(json.dumps(metadata,indent=2)+'\n')
                 self.get_logger().info(f'Force trial {index}: {event}; logs: {output}')
                 if not success:
-                    self.get_logger().error('Force series stopped. No automatic retry or release on failed trial. Review summary before continuing.')
+                    self.get_logger().error('Force series stopped; no automatic retry. Hard-limit abort release outcome is in summary.collection.abort_release; other failures remain STOP-only. Review summary before continuing.')
                     break
                 if self._stop_event.wait(1.): break
         except Exception as exc:

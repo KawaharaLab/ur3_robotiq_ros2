@@ -60,7 +60,7 @@ ros2 run data_capture_tools data_capture_manager_10 --ros-args \
 
 試行中Enterで中断、収集ターミナルのCtrl+Cで終了とSTOP要求。通信断やプロセス停止時の送達保証はないため、グリッパに実際に効く停止手段を用意する。他のターミナルでグリッパドライバだけを終了しても、afへの停止要求にはならない。
 
-目標未達、力のhard limit、手動停止、通信・鮮度異常の場合はABORTとしてシリーズを終了し、自動で開放・再試行しない。操作者が状態を確認してから再開する。bag開始失敗時は動作しない。bagプロセスが終了した場合も子プロセスへ中断を要求する。
+目標未達、力のhard limit、手動停止、通信・鮮度異常の場合はABORTとしてシリーズを終了し、自動再試行しない。力のhard limitで本番押し込みを中断した場合のみ、STOPと健全な状態を確認して準備開始幅へ自動開放する。手動停止、通信・鮮度異常などでは自動開放しない。操作者が状態を確認してから再開する。bag開始失敗時は動作しない。bagプロセスが終了した場合も子プロセスへ中断を要求する。
 
 APや再initへ戻る場合は通常グリッパドライバとgripper_clientを起動し直す。通常運用ではdeactivate_on_shutdownの既定trueに戻す。
 
@@ -114,7 +114,7 @@ STOP応答は物理停止ではない。位置の取得はおおむね20 Hz、8b
 - STOP後100 ms待機し、その後の新しい50 msのFyから左右それぞれ中央値を求める。試行開始時の基準中央値との差の絶対値を力とする。途中でtareし直さない。最低10サンプルと25 ms以上のheader時刻範囲を必要とする。
 - 左右の大きい方が0.5 N以上なら、その位置で約4秒保持して準備位置へ開放する。未達なら次の1 countへ進む。
 - 1 Nの即時上限、100 msの鮮度確認、無効値、手動停止は移動・待機・計測中も有効。目標力については移動中の瞬間値ではなく停止後の中央値を使う。継続確認3/5 msパラメータはafs本番の目標到達には使わない。
-- 総移動範囲は既存afと同じ、開始位置からclose_ticks（既定20）とinit幅からの最小開口幅の厳しい方。各移動500 ms、本番全体10秒で打ち切り。限界に達した最後の刻みも計測してから未達を判断する。失敗はシリーズ中断し、自動開放・自動再試行はしない。
+- 総移動範囲は既存afと同じ、開始位置からclose_ticks（既定20）とinit幅からの最小開口幅の厳しい方。各移動500 ms、本番全体10秒で打ち切り。限界に達した最後の刻みも計測してから未達を判断する。失敗はシリーズ中断し、自動再試行はしない。hard limitによる本番中断時は確認後に開始幅へ開放する（下記参照）。
 
 ### 制限
 
@@ -129,3 +129,14 @@ metadataのexperimentは `afs`、planのpress_modeは `stepped`、TrialEvent.mod
 反映後 `colcon build --packages-select data_capture_tools`。収集ノードを終了して、同じターミナルでsource install/setup.bash後、通常コマンドで収集ノードを起動し直す。他ドライバの再起動・新しいポート設定は不要。`i` → `afs` → 試行数1 → GO。画面に1 count、settle=100 ms、median window=50 msと出ることを確認する。
 
 調整用ROSパラメータはforce_press_step_counts（1..3）、force_press_step_settle_ms（50..1000）、force_press_step_sample_ms（20..200）、force_press_step_timeout_ms（100..2000）、force_press_step_total_timeout_ms（1000..30000）。まず既定を使う。元データ・時刻定義は変更しない。
+
+
+## 力上限による中断時の自動開放（2026-10-27）
+
+af/afsの本番押し込みでforce_hard_limitとなった場合、STOP送信・応答とgGTO=0、アクティブ状態・faultなし、力データの鮮度を確認し、準備位置（initの有効幅＋clearance）へ最小速度で開く。中断後の0.2秒の観察待機は省き、STOP状態を確認して開放へ進む。停止確認は物理停止時間の校正ではない。
+
+開始位置より閉じる向きの開放指令は拒否する。試行はABORT、completed=false、元のforce_hard_limitとエラーを維持し、後続試行を実行しない。開放が成功しても試行成功とはしない。解放時の力のhard limitは元理由として保持するが、力の大きさだけで除荷の開き動作を再中断しない。手動停止・力データ鮮度・機器状態・3秒の移動上限は有効。開放中の例外でもSTOPを試みる。
+
+summary.collection.abort_releaseにattempted/completed/開始count/目標count/失敗理由、eventsとbagにabort_release_*を保存する。手動停止、通信異常、STOP未確認、初期準備未完了では開かない。単独force_stop_probeの動作は引き続きSTOPのみ。
+
+反映はdata_capture_toolsのみ再ビルドし、収集ノードを再起動してiをやり直す。ドライバの再起動・追加設定は不要。

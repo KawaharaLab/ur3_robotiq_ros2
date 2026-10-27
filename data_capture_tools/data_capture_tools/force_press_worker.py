@@ -88,6 +88,7 @@ class Collection:
         self._prepared = False
         self.auxiliary_motion_commanded = False
         self.startup_force_wait = None
+        self.abort_release = None
 
     def allows_suspended_driver(self):
         # Manager sets this only after a successful service reply. Port's /proc
@@ -137,7 +138,7 @@ class Collection:
                     start_raw=self.start_raw, minimum_raw=self.minimum_raw,
                     prepared=self._prepared, completed=self.completed,
                     auxiliary_motion_commanded=self.auxiliary_motion_commanded,
-                    startup_force_wait=self.startup_force_wait,
+                    startup_force_wait=self.startup_force_wait, abort_release=self.abort_release,
                     event_publish_errors=self.event_publish_errors, target_confirmation_reset_ratio=.8,
                     note='Width/depth limits use the existing empirical gripper conversion. Force is baseline-relative Fy; hold is position hold, not force regulation.')
 
@@ -203,7 +204,8 @@ class Collection:
         """Bounded preparatory/release move. STOP on all exits, including lost GO ACK."""
         initial = status()
         self.probe.require_ready_status(initial)
-        if abs(initial['g_po']-target) <= 1:
+        tolerance = 0 if stage == 'abort_release' else 1
+        if abs(initial['g_po']-target) <= tolerance:
             event(stage+'_already_at_position', target_raw=target)
             return
         if stage == 'prepare' and target-initial['g_po'] > 40:
@@ -221,7 +223,7 @@ class Collection:
                 value = status()
                 if value['g_flt'] or value['g_act'] != 1 or value['g_sta'] != 3:
                     raise RuntimeError('Gripper fault during '+stage)
-                if value['g_pr']==target and abs(value['g_po']-target)<=1:
+                if value['g_pr']==target and abs(value['g_po']-target)<=tolerance:
                     event(stage+'_position_observed', g_po=value['g_po'])
                     break
                 if value['g_obj'] in (1,2): raise RuntimeError('Hardware contact stop during '+stage)
@@ -392,6 +394,41 @@ class Collection:
                 return
         # The final allowed step is measured before declaring range exhaustion.
         state.request_stop('position_limit_before_target')
+
+    def release_after_hard_limit(self, port, status, event, state, manual_stop, stop_acknowledged):
+        """Unload a failed press, without clearing its trigger or marking success.
+
+        Only the collection worker opts in; standalone probes remain STOP-only.
+        Confirm STOP and healthy telemetry before sending an opening-only GO.
+        """
+        if state.reason != 'force_hard_limit':
+            return
+        result = self.abort_release = dict(attempted=False, completed=False,
+                                           target_raw=self.start_raw, reason=state.reason)
+        try:
+            if not self._prepared:
+                raise RuntimeError('Press preparation incomplete; opening reference not established')
+            if not stop_acknowledged:
+                raise RuntimeError('STOP acknowledgment unavailable')
+            self.check_health(state, manual_stop)
+            value = status()
+            self.probe.require_ready_status(value)
+            if value['g_gto']:
+                raise RuntimeError('STOP echo not confirmed before abort release')
+            if self.start_raw > value['g_po']:
+                raise RuntimeError('Abort release target would close gripper; opening refused')
+            result['start_raw'] = value['g_po']
+            event('abort_release_start', **result)
+            result['attempted'] = True
+            # The original hard-limit reason stays latched. Opening unloads the
+            # sample; freshness, manual stop, serial/fault and timeout guards stay active.
+            self.move(port, status, event, state, manual_stop,
+                      self.start_raw, 'abort_release', False)
+            result['completed'] = True
+            event('abort_release_finished', **result)
+        except BaseException as exc:
+            result['error'] = type(exc).__name__+': '+str(exc)
+            event('abort_release_failed', **result)
 
     def finish(self, port, status, event, state, manual_stop):
         if state.reason != 'force_threshold':
