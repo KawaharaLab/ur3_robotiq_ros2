@@ -2709,8 +2709,11 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         self._bag_stdout = stdout_path.open("w", encoding="utf-8")
         self._bag_stderr = stderr_path.open("w", encoding="utf-8")
         self.get_logger().info(f"Launching rosbag2: {' '.join(cmd)}")
+        # rosbag's keyboard handler must not read or change the manager's TTY.
+        # Keep Enter exclusively available to the collection pause handler.
         self._bag_process = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=self._bag_stdout,
             stderr=self._bag_stderr,
             env=os.environ.copy(),

@@ -90,3 +90,14 @@ STOP-on-cancelは通常ドライバにも適用される。通常の順次動作
 output_root/task_name/automatic_jobs/<jobID>.jsonに全条件・seed・位置・init参照・試行状態・全attemptをatomic/fsync保存する。セッションは<jobID>_<位置>_<UUID>で重複上書きせず、最大10試行ごとのbag。従来のcollection_provenance/initコピー/trial_conditionsに加えautomatic_plan.jsonに試行開始時のジョブを保存する。最新進捗はautomatic_jobsのJSONが正本。
 
 試行はAction成功と待機/開放完了後もawaiting_bag。bag終了後、metadata.yamlに必須topicの正の件数があること、プロセス終了コード、ログのERROR/損失報告を確認してcompleteにする。手動確認なしで正常データを完全保証するものではない。全サンプルの欠損・header対応、露光/ADC時刻の同期、接触の物理的妥当性は別のQAが必要。収集時情報は元bag/acquisition_timingに保存し、自動時間補正しない。MMS101は1000Hz設定のまま。
+
+## Enter中断とbagの端末入力
+
+bag記録プロセスの標準入力はDEVNULLに接続し、収集ノードの端末を継承させない。
+rosbagのキーボードハンドラによるEnterの読み取り競合・端末モード変更を避ける。
+収集ターミナルのEnterはac/arの保持・移動待機中にも監視する。
+bag自体へのスペースキーによる一時停止は使用せず、記録終了は従来どおりSIGINTで行う。
+この変更はdata_capture_manager_10の共通bag起動処理に適用するため、同ノードのap等にも適用される。
+トピック、圧縮、動作条件、保存先は変更しない。
+実機では柔らかい試料・検証条件で保持中にEnterを1回押し、停止・メニュー復帰後、
+arで同じ位置のinitを再利用して中断試行を再実行できることを確認する。
