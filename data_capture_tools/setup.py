@@ -14,7 +14,7 @@ setup(
         ),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/diagnostics', ['../utils/diagnostics/force_stop_probe.py']),
-        ('share/' + package_name + '/docs', ['docs/force_press_collection.md', 'docs/init_recording.md']),
+        ('share/' + package_name + '/docs', ['docs/force_press_collection.md', 'docs/init_recording.md', 'docs/object_automation.md']),
         (
             'share/' + package_name + '/config',
             glob('config/*.yaml') + glob('config/*.json'),

@@ -77,6 +77,9 @@ public:
    */
   void set_gripper_position(uint8_t pos) override;
 
+  /** Clear rGTO without resetting/activating; throws if STOP cannot be confirmed. */
+  void stop_motion();
+
   /**
    * @brief Return the current position of the gripper.
    * @throw serial::IOException on failure to successfully communicate with gripper port

@@ -162,6 +162,8 @@ class InitRecordingMixin:
             report = json.loads(msg.data)
             if not isinstance(report.get('stream_id'), str):
                 return
+            if hasattr(self, '_auto_note_stream'):
+                self._auto_note_stream(name, report['stream_id'])
             fields = ('schema_version','kind','stream_id','node','port','frame_id','image_topic',
                       'clock_type','use_sim_time','host_monotonic_clock','configured_interval_us',
                       'force_scale','torque_scale','backend','opencv_version')
@@ -187,6 +189,9 @@ class InitRecordingMixin:
         self._init_observe('force_'+side,
                            header_ns=msg.header.stamp.sec*10**9+msg.header.stamp.nanosec,
                            wrench=[w.force.x,w.force.y,w.force.z,w.torque.x,w.torque.y,w.torque.z])
+        if hasattr(self, '_auto_note_force'):
+            self._auto_note_force(side,[w.force.x,w.force.y,w.force.z,w.torque.x,w.torque.y,w.torque.z],
+                                  msg.header.stamp.sec*10**9+msg.header.stamp.nanosec)
 
     def _init_status_callback(self, msg):
         self._init_observe('gripper_status',
@@ -313,7 +318,8 @@ class InitRecordingMixin:
             self._init_latest.pop('centering_geometry', None)
             self._init_driver_changed = False
             startup = self._init_startup
-            metadata = dict(measurements=measurements, runtime=provenance,
+            metadata = dict(automatic_position=getattr(self, "_auto_init_offset", None),
+                            measurements=measurements, runtime=provenance,
                             sensor_metadata=self._sensor_metadata_snapshot(),
                             conversion=legacy_conversion_description(),
                             node_run_id=self._init_node_run_id, reference_id=self._init_reference_id,

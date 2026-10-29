@@ -225,7 +225,10 @@ class ForceSensorMonitor:
             return False, "🔴 ERROR (Right のみ通信が途絶)"
 
 
-class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
+from .object_automation import ObjectAutomationMixin
+
+
+class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressCollectionMixin, Node):
     """Coordinates rosbag2 recording and dataset conversion."""
 
     def __init__(self) -> None:
@@ -270,6 +273,7 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         self._aux_processes: list[subprocess.Popen] = []
         self._viewer_subscriptions: list = []
         self._viewer_frames: dict[str, object] = {}
+        self._viewer_timer = None
         self._bridge = CvBridge()
         self._convert_after_record: bool = (
             self.declare_parameter("convert_after_record", False).value
@@ -314,6 +318,7 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         self._calibrated_target_m = None  # ★キャリブレーション済みの目標押し込み幅
         self._effective_object_width_m = None
         self._init_force_press()
+        self._setup_object_automation()
         
         
         # --- 追加: 左右のGelSight監視用変数 ---
@@ -419,6 +424,10 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
         self._init_observe('width', estimated_width_mm=float(msg.data))
             
     def _calculate_target_pose(self, init = True, lateral_offset=0.0, vertical_offset=0.0, speed = 0.3):
+        offset = getattr(self, "_auto_init_offset", None)
+        if init and offset:
+            lateral_offset += offset["lateral_m"]
+            vertical_offset += offset["vertical_m"]
         w_obj = self.config.target_diameter
         dist = w_obj / 2.0 + self.config.arm_offset
         if not init:
@@ -470,6 +479,9 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
             print("-" * 40)
             print(" [i]: Init Arm (Move to start pose manually)")
             print(" [s]: Start Single Trial (Record & Run)")
+            print(" [ac]: Automatic whole-object collection (4 positions)")
+            print(" [ar]: Resume paused object collection")
+            print(" [ai]: Initialize current planned position manually")
             print(" [ae]: Execute Standard Suite")
             print(" [ap]: Auto Repeat Loop (Record & Run multiple times)")
             print(" [af]: Force-triggered press and position hold (experimental)")
@@ -490,7 +502,13 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
 
             if not self._force_press_normal_control_ready(line):
                 continue
-            if line == 'i':
+            if line == 'ac':
+                self._execute_object_auto()
+            elif line == 'ar':
+                self._execute_object_auto(resume=True)
+            elif line == 'ai':
+                self._execute_planned_init()
+            elif line == 'i':
                 # 手動でのみ実行
                 self._run_init_sequence()
             elif line == 's':
@@ -1649,6 +1667,8 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
             accumulated_pos = 0.0
             
             while rclpy.ok():
+                if getattr(self, "_auto_in_init", False) and self._auto_abort_reason:
+                    raise RuntimeError(self._auto_abort_reason)
                 f_l = self._force_monitor.get_calibrated_left()
                 f_r = self._force_monitor.get_calibrated_right()
                 f_target = f_r if target_side == "right" else f_l
@@ -2445,10 +2465,12 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
     def _gelsight_left_callback(self, msg: CompressedImage) -> None:
         """左GelSightの画像を受信した時刻を更新"""
         self._last_gelsight_left_time = time.time()
+        self._auto_note_image('left', msg)
 
     def _gelsight_right_callback(self, msg: CompressedImage) -> None:
         """右GelSightの画像を受信した時刻を更新"""
         self._last_gelsight_right_time = time.time()
+        self._auto_note_image('right', msg)
 
     def _check_sensors_health(self) -> bool:
         """GelSight（左右）と力覚センサ（左右）の両方が正常に稼働しているかチェック"""
@@ -2630,6 +2652,14 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
     def _finalize_all(self) -> None:
         """ノード終了時のクリーンアップ."""
         self._stop_event.set()
+        if getattr(self, '_auto_active', False):
+            # Keep processing action cancel responses while the control thread saves its checkpoint.
+            deadline = time.monotonic() + 55.0
+            while self._auto_active and time.monotonic() < deadline:
+                if rclpy.ok():
+                    rclpy.spin_once(self, timeout_sec=0.05)
+                else:
+                    time.sleep(0.05)
         self._stop_force_press_worker()
         self._stop_viewers() #
         self._stop_aux_processes() #
@@ -3021,10 +3051,15 @@ class DataCaptureNode(InitRecordingMixin, ForcePressCollectionMixin, Node):
 
 
 def main() -> None:
-    rclpy.init()
+    # Preserve ROS transport long enough for Ctrl+C cleanup/cancel and bag closure.
+    from rclpy.signals import SignalHandlerOptions
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = DataCaptureNode()
     try:
         node.run()
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

@@ -183,6 +183,22 @@ void DefaultDriver::set_gripper_position(uint8_t pos)
   }
 }
 
+void DefaultDriver::stop_motion()
+{
+  const auto request = create_write_command(kActionRequestRegister,
+      {0x0100, uint16_t(status_registers_.g_po),
+       uint16_t(commanded_gripper_speed_ << 8 | commanded_gripper_force_)});
+  if (send(request, kWriteResponseSize).empty())
+    throw DriverException{"Failed to acknowledge STOP"};
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+  do {
+    read_status();
+    if (action_status_ == ActionStatus::STOPPED) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  throw DriverException{"STOP echo not confirmed"};
+}
+
 uint8_t DefaultDriver::get_gripper_position()
 {
   update_status();

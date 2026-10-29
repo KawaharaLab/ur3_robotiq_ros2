@@ -192,3 +192,27 @@ topics:
 #   rx: 1.199
 #   ry: 2.919
 #   rz: -0.030
+
+
+# Whole-object collection: ac starts, ar resumes, ai performs a planned manual init.
+# REQUIRED: choose depths/speeds after representative-object checks; null blocks all motion.
+automatic_collection:
+  depths_mm: null             # nominal per-side depths, e.g. your selected shallow/middle/deep
+  loading_speeds: null        # normalized register requests [0,1], not measured mm/s
+  repeats: 2
+  offset_m: 0.010             # base / front / back / up; existing 45-degree tangent and world Z
+  hold_s: 4.0
+  release_speed: 0.3
+  release_speeds: []          # optional aur conditions, at middle depth/loading speed
+  knead_conditions: []       # optional: shallow_mm, deep_mm, cycles, loading/unloading_speed, deep/shallow_hold_s
+  hard_limit_n: 20.0          # max of abs(Fy - per-trial open baseline), raw single sample
+  rest_s: 0.8
+  completion_settle_s: 1.5
+  seed: 20261028
+  batch_size: 10
+  force_timeout_s: 0.25
+  image_timeout_s: 0.5
+  min_free_gib: 5.0
+  require_timing: true
+  auto_init: true
+  auto_play: true             # Dashboard play only; never load/unlock/reset a robot program

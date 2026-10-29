@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <array>
 #include <algorithm>
 #include <chrono>
@@ -128,6 +129,15 @@ public:
 private:
     // 2. コマンド受信部分で文字列をパースする
     void on_command_received(const std_msgs::msg::String::SharedPtr msg) {
+        if (msg->data == "stop") {
+            ++sequence_generation_;
+            if (timer_) timer_->cancel();
+            arm_client_->async_cancel_all_goals();
+            gripper_client_->async_cancel_all_goals();
+            action_in_progress_ = false;
+            auto phase = std_msgs::msg::Int32(); phase.data = -1; phase_pub_->publish(phase);
+            return;
+        }
         if (action_in_progress_) {
             RCLCPP_WARN(
                 this->get_logger(),
@@ -510,6 +520,7 @@ private:
         }
 
         action_in_progress_ = true;
+        const auto generation = sequence_generation_;
         const auto &step = steps_.at(current_step_index_);
         
         auto phase_msg = std_msgs::msg::Int32();
@@ -520,7 +531,8 @@ private:
         if (step.type == StepType::ArmTrajectory) {
             auto opts = rclcpp_action::Client<FollowJointTrajectory>::SendGoalOptions();
             // --- ここに挿入 ---
-            opts.result_callback = [this](const auto & result) {
+            opts.result_callback = [this, generation](const auto & result) {
+                if (generation != sequence_generation_) return;
                 if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
                     this->on_step_completed();
                 } else {
@@ -538,11 +550,22 @@ private:
                 }
             };
             // ----------------
+            opts.goal_response_callback = [this, generation](auto handle) {
+                if (generation != sequence_generation_) {
+                    if (handle) arm_client_->async_cancel_goal(handle);
+                    return;
+                }
+                if (!handle) {
+                    action_in_progress_ = false;
+                    auto p = std_msgs::msg::Int32(); p.data = -1; phase_pub_->publish(p);
+                }
+            };
             arm_client_->async_send_goal(step.arm_goal, opts);
         } else {
             auto opts = rclcpp_action::Client<MoveGripper>::SendGoalOptions();
             // --- グリッパ側も同様に挿入 ---
-            opts.result_callback = [this](const auto & result) {
+            opts.result_callback = [this, generation](const auto & result) {
+                if (generation != sequence_generation_) return;
                 if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
                     this->on_step_completed();
                 } else {
@@ -560,6 +583,16 @@ private:
                 }
             };
             // ----------------
+            opts.goal_response_callback = [this, generation](auto handle) {
+                if (generation != sequence_generation_) {
+                    if (handle) gripper_client_->async_cancel_goal(handle);
+                    return;
+                }
+                if (!handle) {
+                    action_in_progress_ = false;
+                    auto p = std_msgs::msg::Int32(); p.data = -1; phase_pub_->publish(p);
+                }
+            };
             gripper_client_->async_send_goal(step.gripper_goal, opts);
         }
     }
@@ -586,7 +619,9 @@ private:
             send_next_step();
             return;
         }
-        timer_ = this->create_wall_timer(delay, [this, completed_phase]() {
+        const auto generation = sequence_generation_;
+        timer_ = this->create_wall_timer(delay, [this, completed_phase, generation]() {
+            if (generation != sequence_generation_) return;
             this->timer_->cancel();
             if (this->sequence_kind_ == "run" && completed_phase == 2) {
                 const auto & hold_step = this->steps_.at(1);
@@ -600,6 +635,7 @@ private:
     }
 
     // メンバ変数
+    uint64_t sequence_generation_{0};
     std::string controller_action_name_;
     rclcpp_action::Client<FollowJointTrajectory>::SharedPtr arm_client_;
     rclcpp_action::Client<MoveGripper>::SharedPtr gripper_client_;

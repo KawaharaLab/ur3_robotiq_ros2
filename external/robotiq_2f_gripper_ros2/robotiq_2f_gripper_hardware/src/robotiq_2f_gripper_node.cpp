@@ -41,6 +41,7 @@ std::string make_initialization_record(
         << ",\"active_at_start\":" << active_at_start
         << ",\"activation_performed\":" << activated
         << ",\"deactivate_on_shutdown\":" << deactivate_on_shutdown
+        << ",\"cancel_stops_motion\":true"
         << ",\"command_event_topic\":\"/robotiq_2f_gripper/command_event\""
         << ",\"conversion_model\":\"legacy_piecewise_polynomial_v1_uncalibrated\"}";
     return out.str();
@@ -410,6 +411,7 @@ void GripperNode::execute(
             {
                 if (goal_handle->is_canceling())
                 {
+                    driver_->stop_motion();
                     running_ = false;
                     result->success = false;
                     goal_handle->canceled(result);
@@ -427,6 +429,7 @@ void GripperNode::execute(
 
                 if (status.g_flt != 0)
                 {
+                    driver_->stop_motion();
                     running_ = false;
                     result->success = false;
                     goal_handle->abort(result);
@@ -457,6 +460,7 @@ void GripperNode::execute(
                 std::this_thread::sleep_for(poll_period);
             }
 
+            driver_->stop_motion();
             running_ = false;
             result->success = false;
             goal_handle->abort(result);
