@@ -37,6 +37,9 @@ class ObjectAutomationMixin:
         self._auto_action_type=MoveTwoFingerGripper
         self._auto_action=ActionClient(self,MoveTwoFingerGripper,'/robotiq_2f_gripper_action')
         self._auto_play=self.create_client(Trigger,'/dashboard_client/play')
+        from controller_manager_msgs.srv import ListControllers
+        self._auto_controller_list=self.create_client(ListControllers,'/controller_manager/list_controllers')
+        self._auto_arm_controller_states={}
         self._auto_program=None;self._auto_robot_mode=None;self._auto_safety_mode=None
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         program_qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.RELIABLE,durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -96,7 +99,7 @@ class ObjectAutomationMixin:
             sys.stdin.readline();raise Paused('Manual pause requested')
 
     def _auto_health(self,*,check_pose=True,check_force=True,check_bag=False):
-        settings=self._auto_job['plan']['settings'];now=time.monotonic();ros=self.get_clock().now().nanoseconds
+        settings=self._auto_job['plan']['settings']
         self._auto_manual()
         if check_force and self._auto_armed and self._auto_force_fault:raise Paused(self._auto_force_fault)
         if self._auto_abort_reason:raise Paused(self._auto_abort_reason)
@@ -105,25 +108,36 @@ class ObjectAutomationMixin:
         if self._auto_safety_mode not in (1,2):raise Paused('UR safety mode is not NORMAL/REDUCED: '+str(self._auto_safety_mode))
         if shutil.disk_usage(self.config.output_root).free < settings['min_free_gib']*1024**3:
             raise Paused('Insufficient free storage')
-        with self._init_record_lock:latest=copy.deepcopy(self._init_latest)
+        # Snapshot all inputs before sampling 'now': callbacks can replace these
+        # records while disk checks/manual-input checks take time. Reading a new
+        # sample against an older 'now' can falsely report a future Header stamp.
+        with self._init_record_lock:
+            latest=copy.deepcopy({k:self._init_latest.get(k) for k in
+                                  ('force_left','force_right','gripper_status','arm_joint_state')})
+        images=dict(self._auto_images)
+        streams=dict(self._auto_streams)
+        now=time.monotonic();ros=self.get_clock().now().nanoseconds
         for side in ('left','right'):
             row=latest.get('force_'+side)
-            if not row or (now*1e9-row['receive_monotonic_ns'])/1e9>settings['force_timeout_s']:
-                raise Paused('Stale force '+side)
+            receive_age=(now*1e9-row['receive_monotonic_ns'])/1e9 if row else None
+            if receive_age is None or receive_age>settings['force_timeout_s']:
+                raise Paused(f'Stale force {side}: receive_age_ms={receive_age*1000 if receive_age is not None else None}; limit_ms={settings["force_timeout_s"]*1000:.1f}')
             age=(ros-row['header_ns'])/1e9
-            if not -.01<=age<=settings['force_timeout_s']:raise Paused('Invalid force header age '+side)
+            if not -.01<=age<=settings['force_timeout_s']:
+                raise Paused(f'Invalid force header age {side}: header_age_ms={age*1000:.3f}; receive_age_ms={receive_age*1000:.3f}; allowed_ms=[-10,{settings["force_timeout_s"]*1000:.1f}]')
             if not all(math.isfinite(v) for v in row['wrench']):raise Paused('Nonfinite force '+side)
             if check_force and self._auto_armed:
                 offset=getattr(self._force_monitor,'_offset_'+side)
                 if abs(row['wrench'][1]-offset)>=settings['hard_limit_n']:raise Paused('Force hard limit '+side)
-            image=self._auto_images.get(side)
+            image=images.get(side)
             if not image or now-image['at']>settings['image_timeout_s'] or not image['valid']:
                 raise Paused('Missing/stale/undecodable GelSight '+side)
-            if not -.01<=(ros-image['header_ns'])/1e9<=settings['image_timeout_s']:
-                raise Paused('Invalid image header age '+side)
+            image_age=(ros-image['header_ns'])/1e9
+            if not -.01<=image_age<=settings['image_timeout_s']:
+                raise Paused(f'Invalid image header age {side}: header_age_ms={image_age*1000:.3f}; receive_age_ms={(now-image["at"])*1000:.3f}; allowed_ms=[-10,{settings["image_timeout_s"]*1000:.1f}]')
         if settings['require_timing']:
             for name in ('mms_left','mms_right','gelsight_left','gelsight_right'):
-                value=self._auto_streams.get(name)
+                value=streams.get(name)
                 if not value or now-value[1]>.8:raise Paused('Acquisition timing missing '+name)
                 expected=getattr(self,'_auto_expected_streams',{}).get(name)
                 if expected and value[0]!=expected:raise Paused('Sensor stream restarted '+name)
@@ -239,21 +253,51 @@ class ObjectAutomationMixin:
         self._effective_object_width_m=reference['width_m'];self._calibrated_target_m=reference['target_m']
         self._saved_base_joints=list(reference['joints'])
 
+    def _auto_wait_program_controller(self,program_after=None):
+        """Observe actual readiness, without sending another play or switching controllers."""
+        from controller_manager_msgs.srv import ListControllers
+        deadline=time.monotonic()+5.
+        self._auto_arm_controller_states={}
+        while time.monotonic()<deadline:
+            self._auto_health(check_pose=False,check_force=False)
+            running=self._auto_program
+            if running and running[0] and (program_after is None or running[1]>=program_after):
+                if self._auto_controller_list.wait_for_service(timeout_sec=.1):
+                    result=self._auto_future(self._auto_controller_list.call_async(ListControllers.Request()),2.,guard=False)
+                    self._auto_arm_controller_states={c.name:c.state for c in result.controller} if result else {}
+                    running=self._auto_program
+                    if (self._auto_arm_controller_states.get('scaled_joint_trajectory_controller')=='active'
+                            and running and running[0] and (program_after is None or running[1]>=program_after)):
+                        return True
+            time.sleep(.05)
+        return False
+
     def _auto_program_ready(self):
         deadline=time.monotonic()+2.
         while self._auto_program is None and time.monotonic()<deadline:time.sleep(.05)
-        if self._auto_program and self._auto_program[0]:return
+        if self._auto_program and self._auto_program[0]:
+            if self._auto_wait_program_controller():return
+            raise Paused('Robot program running but arm controller readiness not confirmed: '+str(self._auto_arm_controller_states))
         if not self._auto_job['plan']['settings']['auto_play']:raise Paused('Start External Control then resume')
         if not self._auto_play.wait_for_service(timeout_sec=2.):raise Paused('Dashboard play unavailable; start External Control manually')
         from std_srvs.srv import Trigger
-        response=self._auto_future(self._auto_play.call_async(Trigger.Request()),5.,guard=False)
-        if response is None or not response.success:raise Paused('Dashboard play failed; check pendant')
-        deadline=time.monotonic()+5.
-        while time.monotonic()<deadline:
-            self._auto_manual()
-            if self._auto_program and self._auto_program[0]:return
-            time.sleep(.05)
-        raise Paused('External Control running state not confirmed')
+        sent_at=time.monotonic()
+        try:
+            response=self._auto_future(self._auto_play.call_async(Trigger.Request()),5.,guard=False)
+            accepted=bool(response is not None and response.success)
+            detail=str(getattr(response,'message','No response'))
+        except Exception as exc:
+            accepted=False;detail=type(exc).__name__+': '+str(exc)
+        if not accepted:
+            self.get_logger().warning('Dashboard play response: '+detail+'; checking actual program/controller state without replay')
+        # A rejected/timeout response can precede the actual connection by ~0.5s.
+        # Never replay on that basis; require a new running notification and an
+        # active trajectory controller before issuing the init trajectory.
+        if self._auto_wait_program_controller(program_after=sent_at):
+            if not accepted:self.get_logger().info('Robot program and arm controller readiness confirmed after Dashboard response')
+            return
+        raise Paused('Dashboard play/start readiness failed: '+detail+'; program='+str(self._auto_program)
+                     +'; controllers='+str(self._auto_arm_controller_states)+'; inspect UR driver/pendant')
 
     def _auto_init_position(self,position):
         self._auto_reference=None;self._auto_armed=False;self._auto_abort_reason=None
@@ -292,8 +336,9 @@ class ObjectAutomationMixin:
                     return
         watcher=threading.Thread(target=monitor,daemon=True);watcher.start()
         try:
-            if not self._run_init_sequence():raise Paused('Init failed')
+            init_ok=self._run_init_sequence()
             if self._auto_abort_reason:raise Paused(self._auto_abort_reason)
+            if not init_ok:raise Paused('Init failed')
         finally:
             done.set();watcher.join(timeout=1.)
             self._cmd_pub,self._urscript_pub=original_cmd,original_script
@@ -427,7 +472,7 @@ class ObjectAutomationMixin:
             self.get_logger().info('Object collection complete: '+str(self._auto_job_path))
         except BaseException as exc:
             self._auto_cancel();self._auto_job.update(status='paused',pause_reason=type(exc).__name__+': '+str(exc));self._auto_save()
-            self.get_logger().error('Collection paused: '+str(exc)+'; restart sensors if needed, then ar. Progress: '+str(self._auto_job_path))
+            self.get_logger().error('Collection paused: '+str(exc)+'; resolve the reported cause, then ar. Progress: '+str(self._auto_job_path))
         finally:
             self._auto_active=False;self._auto_armed=False;self._auto_init_offset=None
             self._session_id_override=original_override

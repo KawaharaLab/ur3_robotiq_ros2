@@ -137,3 +137,18 @@ ros2 run data_capture_tools acquisition_quality --bag /path/to/session/bag/sessi
 
 CLIの終了コードはok/warningで0、needs_review/not_checkedで1。
 収集ノード内ではこの終了コードで動作を止めない。設定YAMLの追加編集は不要。
+
+## 中断原因の表示と時刻判定順
+
+健康監視ではforce/image/timingの入力を先にスナップショットし、その後に比較用の
+現在時刻を取得する。先に取得した「現在」と後から届いたHeaderを比べることによる
+未来時刻の誤判定を避ける。力覚250ms・画像500ms等の既存閾値、力上限、停止経路は変更しない。
+Header年齢で中断するときはHeaderの年齢・受信からの経過時間・許容範囲も表示する。
+Dashboard play失敗にはTrigger応答messageを表示する。自動再接続・再play・保護停止解除は追加しない。
+Dashboard失敗はセンサ再起動で解決するものではないため、URドライバ側と端末側の状態を確認する。
+
+Dashboard応答が失敗/タイムアウトでも、再playは送らず、要求後の新しいプログラム実行通知と
+`scaled_joint_trajectory_controller`のactive状態を最大5秒確認する。両方が揃えばinitへ進み、
+揃わなければURの応答messageと制御器状態を表示して一時停止する。最初からプログラムが実行中の
+場合も制御器activeを確認する。自動で制御器を切り替えたり保護停止を解除したりしない。
+この確認はロード済みプログラムが普段のExternal Controlであるという運用上の前提を置く。
