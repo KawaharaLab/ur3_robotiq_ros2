@@ -2797,6 +2797,36 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             self._bag_stdout.close()
         if self._bag_stderr:
             self._bag_stderr.close()
+        if not fast and not getattr(self, "_discard_fast", False):
+            self._check_closed_bag_quality()
+
+    def _check_closed_bag_quality(self) -> None:
+        """Post-recording QA is advisory; it never changes motion/resume state."""
+        uri = getattr(self, "_bag_uri", None)
+        process = getattr(self, "_bag_process", None)
+        if uri is None or process is None or process.poll() is None:
+            return
+        if getattr(self, "_quality_checked_bag", None) == str(uri):
+            return
+        self._quality_checked_bag = str(uri)
+        self._last_bag_quality = None
+        session = self._session_dir or Path(uri).parent.parent
+        output = Path(session) / "acquisition_quality.json"
+        try:
+            from .acquisition_quality import check_and_save
+            report = check_and_save(uri, output, Path(session) / "logs", session=session)
+            summary = dict(status=report["status"], report=str(output),
+                           issue_count=len(report.get("issues", [])))
+            self._last_bag_quality = summary
+            message = f"Acquisition quality: {summary['status']}; report: {output}"
+            if report["status"] == "ok":
+                self.get_logger().info(message)
+            else:
+                self.get_logger().warning(message + "; collection is not stopped by quality findings")
+        except Exception as exc:
+            # Even an unwritable report must not cause a new motion/record retry.
+            self._last_bag_quality = dict(status="not_checked", report=str(output), error=str(exc))
+            self.get_logger().warning(f"Quality check/report unavailable: {exc}; review this bag later")
 
     def _start_throttles_and_compressors(self) -> None:
         image_rate = self.config.image_throttle_hz

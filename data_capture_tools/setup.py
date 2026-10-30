@@ -40,6 +40,7 @@ setup(
             'extract_all = data_capture_tools.extract_all:run_as_node', # ここを追加
             'analyze_gripper_status = data_capture_tools.analyze_gripper_status:main',
             'synchronization_qa = data_capture_tools.synchronization_qa:main',
+            'acquisition_quality = data_capture_tools.acquisition_quality:main',
         ],
     },
 )

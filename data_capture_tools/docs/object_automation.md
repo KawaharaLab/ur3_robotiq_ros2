@@ -101,3 +101,39 @@ bag自体へのスペースキーによる一時停止は使用せず、記録�
 トピック、圧縮、動作条件、保存先は変更しない。
 実機では柔らかい試料・検証条件で保持中にEnterを1回押し、停止・メニュー復帰後、
 arで同じ位置のinitを再利用して中断試行を再実行できることを確認する。
+
+## bag終了後の軽量品質チェック
+
+`data_capture_manager_10`の共通bag終了処理で、圧縮・正常終了待ちの後に
+`<session>/acquisition_quality.json`を保存する。ac/arだけでなくap/ad/ak/av等、
+同じノードから記録したbagが対象。中断bagも対象、破棄用fast終了は対象外。
+動作中の監視条件・停止条件は変更しない。静止したbag切替時に同期実行するため、
+次bagの開始まで解析時間が加わる。圧縮ファイルは一時領域に1分割ずつ展開し削除する。
+SQLite3/file-zstdを対象とし、zstdコマンドが必要（従来エクスポートと同じ依存）。
+
+画像はHeaderのみ読み、JPEGの画素解析は行わない。詳細取得時刻とのHeader対応、
+重複・逆行・大きな間隔、連番欠落、Headerからbag受信までの差、試行START/END/ABORT、
+力トピックにないサンプルのraw packet残存を確認する。セッションの実行条件・init参照の保存有無と参照IDの整合も記録する。raw全件の値比較や物理同期、
+露光時刻、接触内容・取り付けの妥当性は検証しない。元bagや時刻を補正しない。
+
+`status`は`ok` / `warning` / `needs_review` / `not_checked`。
+品質警告・要調査・解析失敗は収集を止めず、完了試行をpendingに戻さず、自動再試行しない。
+既存のbag正常終了・必須トピック記録等の成立確認は維持する。
+ac/ar進捗JSONには`quality_reports`と各attemptの`quality_check`として参照を保存する。
+中断試行の区間は完了試行から分け、bag端の不足は完了試行内の不足と区別する。
+
+警告目安は力覚Header間隔20ms、画像250ms、試行内のHeader→bag差p95 250ms／最大1秒、
+逆向き差-10ms。これらは品質調査の目安であり中断条件・物理同期精度ではない。
+少数の欠落も件数は残す。raw packetが残る力サンプル欠落は復元可能な警告として扱う。
+取得時刻情報の欠落など、復元できない試行内の不足は`needs_review`に分類する。
+`ok`は実装した検査範囲で指摘がない意味であり、データの完全性の保証ではない。
+
+既存bagの再チェック:
+
+```bash
+ros2 run data_capture_tools acquisition_quality --bag /path/to/session/bag/session_name \
+  --logs /path/to/session/logs --out ./acquisition_quality_recheck.json
+```
+
+CLIの終了コードはok/warningで0、needs_review/not_checkedで1。
+収集ノード内ではこの終了コードで動作を止めない。設定YAMLの追加編集は不要。

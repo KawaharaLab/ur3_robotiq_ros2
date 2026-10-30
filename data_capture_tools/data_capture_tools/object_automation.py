@@ -405,6 +405,14 @@ class ObjectAutomationMixin:
                     finally:
                         if self._auto_recording:
                             self._stop_rosbag();self._auto_recording=False
+                            # Keep quality separate from execution status, including ABORT attempts.
+                            advisory=getattr(self,'_last_bag_quality',None)
+                            if advisory:
+                                self._auto_job.setdefault('quality_reports',{})[str(self._session_dir)]=dict(advisory)
+                                for item in batch:
+                                    for old_attempt in item.get('attempts',[]):
+                                        if old_attempt.get('session')==str(self._session_dir):
+                                            old_attempt['quality_check']=dict(advisory)
                             try:
                                 quality=self._auto_verify_bag()
                                 for row in finished:
