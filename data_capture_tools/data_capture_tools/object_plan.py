@@ -44,19 +44,31 @@ def build_plan(settings):
     for name in ('require_timing','auto_init','auto_play'):
         s.setdefault(name,True)
         if type(s[name]) is not bool:raise ValueError(name+' must be boolean')
+    # Absent in old saved plans: keep their settings, rows and fingerprints intact.
+    linked=s.get('link_trial_speeds',False)
+    if type(linked) is not bool:raise ValueError('link_trial_speeds must be boolean')
     s.setdefault('release_speed',.3);number(s['release_speed'],'release_speed',0.,1.)
     s.setdefault('release_speeds',[])
     if not isinstance(s['release_speeds'],list):raise ValueError('release_speeds must be a list')
     for v in s['release_speeds']:number(v,'release_speeds',0.,1.)
+    if linked and s['release_speeds']:
+        raise ValueError('link_trial_speeds requires release_speeds: []')
     s.setdefault('knead_conditions',[])
     if not isinstance(s['knead_conditions'],list):raise ValueError('knead_conditions must be a list')
     for k in s['knead_conditions']:
+        if linked and 'loading_speed' in k:
+            k.setdefault('unloading_speed',k['loading_speed'])
         for name in ('shallow_mm','deep_mm'):number(k.get(name),name,.01,10.)
         if k['shallow_mm']>=k['deep_mm']:raise ValueError('knead requires shallow < deep')
         if type(k.get('cycles',5)) is not int or not 1<=k.get('cycles',5)<=50:raise ValueError('Invalid cycles')
         for name,default,hi in [('loading_speed',.1,1.),('unloading_speed',.1,1.),('deep_hold_s',.1,10.),('shallow_hold_s',.1,10.)]:
             k.setdefault(name,default);number(k[name],name,0.,hi)
         k.setdefault('cycles',5)
+        if linked:
+            if k['unloading_speed']!=k['loading_speed']:
+                raise ValueError('link_trial_speeds requires equal knead loading/unloading speeds')
+            if 'release_speed' in k and k['release_speed']!=k['loading_speed']:
+                raise ValueError('link_trial_speeds requires knead release_speed equal to loading_speed')
     positions=[dict(id='base',lateral_m=0.,vertical_m=0.),
                dict(id='front',lateral_m=s['offset_m'],vertical_m=0.),
                dict(id='back',lateral_m=-s['offset_m'],vertical_m=0.),
@@ -70,6 +82,10 @@ def build_plan(settings):
             middle=sorted(depths)[len(depths)//2];speed=speeds[len(speeds)//2]
             round_rows.extend(dict(kind='run',depth_mm=middle,speed=speed,hold_s=s['hold_s'],release_speed=v,variant='aur') for v in s['release_speeds'])
             round_rows.extend(dict(kind='knead',**k) for k in s['knead_conditions'])
+            if linked:
+                for row in round_rows:
+                    trial_speed=row['loading_speed'] if row['kind']=='knead' else row['speed']
+                    row.update(preparation_speed=trial_speed,release_speed=trial_speed)
             rng.shuffle(round_rows)
             for row in round_rows:
                 row.update(id=p['id']+'_'+str(len(rows)+1).zfill(4),repeat=repeat+1,status='pending',attempts=[]);rows.append(row)
@@ -78,11 +94,11 @@ def build_plan(settings):
 
 
 def steps_for_trial(row,width):
-    """Mirror existing run/knead goal values and dwell times, with raw-count logging upstream."""
+    """Use frozen row speeds; old rows retain legacy preparation/release defaults."""
     def step(w,s,f,t,phase):
         if not .001<=w<=.142:raise ValueError('Target width outside 1..142 mm')
         return dict(width_m=w,speed=s,force=f,dwell_s=t,phase=phase)
-    result=[step(.140,.3,.1,1.,1)]
+    result=[step(.140,row.get('preparation_speed',.3),.1,1.,1)]
     if row['kind']=='run':
         result.append(step(width-2*row['depth_mm']/1000,row['speed'],.5,row['hold_s'],2))
     else:

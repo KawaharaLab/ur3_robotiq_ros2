@@ -2,7 +2,7 @@
 
 ## 変更範囲
 
-メニューac（新規）、ar（再開）、ai（計画位置でinitのみ）を追加する。既存i/ap/ad/ak等の動作条件は維持する。acは新しいPython runnerが通常グリッパActionを1つずつ送信し、run/kneadの目標幅・速度・駆動力・待機時間を既存C++と同じ値で実行する。自動runnerのイベント名はauto_*、TrialEvent.modeはauto_depth_speed/auto_aur/auto_knead。従来のphase番号だけで区間を切らず、イベントとautomatic_plan/progressを参照する。準備の全開は0.140mで既存runと同じ。完了後の1.5秒待機と0.8秒の試行間休止も維持し、設定で変更可能。各試行の無荷重tareと監視の追加により、厳密な所要時間は従来と同一ではない。
+メニューac（新規）、ar（再開）、ai（計画位置でinitのみ）を追加する。既存i/ap/ad/ak等の動作条件は維持する。acは新しいPython runnerが通常グリッパActionを1つずつ送信し、run/kneadの目標幅・駆動力・待機時間を既存C++に合わせ、速度は凍結した試行条件に従って実行する。自動runnerのイベント名はauto_*、TrialEvent.modeはauto_depth_speed/auto_aur/auto_knead。従来のphase番号だけで区間を切らず、イベントとautomatic_plan/progressを参照する。準備の全開は0.140mで既存runと同じ。link_trial_speeds:trueでは準備全開・最初の押し込み・揉みの往復・最後の完全開放を各試行の速度要求値に統一する。完了後の1.5秒待機と0.8秒の試行間休止も維持し、設定で変更可能。各試行の無荷重tareと監視の追加により、厳密な所要時間は従来と同一ではない。
 
 Armは従来どおり初期関節移動がROS trajectory、マクロ接近・センタリングがURScript。URScriptがExternal Controlを停止する挙動は変更しない。各init前に/dashboard_client/playを必要時だけ呼び、/io_and_status_controller/robot_program_runningを確認する。ポリスコープにExternal Controlのプログラムをロードしておく。別プログラムのload、保護停止の解除、電源/ブレーキ制御、headless化は行わない。play不可なら中断して手動再生後ar/aiを使う。仕様参考: https://docs.universal-robots.com/Universal_Robots_ROS2_Documentation/doc/ur_robot_driver/ur_robot_driver/doc/usage/script_code.html
 
@@ -12,10 +12,47 @@ Armは従来どおり初期関節移動がROS trajectory、マクロ接近・セ
 
 全てdata_capture.yaml内automatic_collectionで指定。depths_mm/ loading_speedsは未確定のため初期値null。nullでは移動前に拒否する。深さは公称片側mm、速度は0..1の要求値で実速度mm/sではない。
 
-例は条件表の書き方であり、この数値の全物体への適合を保証しない。
+### 試行内の速度統一
+
+配布YAMLの`link_trial_speeds: true`では通常試行の`speed`、揉み試行の`loading_speed`を、その試行の準備全開（tare前）・初期押し込み・往復・最終完全開放に使う。全試行を同一速度にする設定ではなく、条件ごとの速度を試行内で統一する。0.00は最低速度要求で、停止でも実測0 mm/sでもない。等しい要求値でも負荷等により実速度は一致しない。
+
+揉みの`unloading_speed`は省略すると`loading_speed`に一致する。明示した値が違う場合、または独立した`release_speeds`が空でない場合は、移動前に設定エラーにする。共通の`release_speed`はこのモードでは使用しない。通常の設定例では独立したaur条件は使わない。
+
+この変更はac/arの試行に適用する。initの探索、従来メニューap/ak/aur、異常時の停止・安全開放の速度は変更しない。低速で全開するため、収集時間は従来より長くなる場合がある。
+
+過去の進捗JSONでこのキーがない場合は従来動作を保持する。新しいYAMLを古いジョブに適用してarで再開しない。元の設定なら旧計画を検証・再開でき、新しい速度条件はacで別ジョブとして開始する。
+
+例は条件表の書き方であり、この数値の全物体への適合を保証しない。2〜6 mmの本番候補は次の設定。6 mmでの上限到達・底付きは事前確認する。配布YAMLの深さ・速度は引き続きnullであり、この候補を自動で有効にはしない。
 
 ```yaml
 automatic_collection:
+  link_trial_speeds: true
+  depths_mm: [2.0, 3.0, 4.0, 5.0, 6.0]
+  loading_speeds: [0.00, 0.10, 0.20]
+  repeats: 2
+  offset_m: 0.010
+  hold_s: 4.0
+  release_speeds: []
+  knead_conditions:
+    - {shallow_mm: 2.0, deep_mm: 4.0, cycles: 5, loading_speed: 0.0, deep_hold_s: 0.1, shallow_hold_s: 0.1}
+    - {shallow_mm: 2.0, deep_mm: 4.0, cycles: 5, loading_speed: 0.0, deep_hold_s: 0.5, shallow_hold_s: 0.5}
+    - {shallow_mm: 2.0, deep_mm: 4.0, cycles: 5, loading_speed: 0.1, deep_hold_s: 0.1, shallow_hold_s: 0.1}
+    - {shallow_mm: 2.0, deep_mm: 4.0, cycles: 5, loading_speed: 0.1, deep_hold_s: 0.5, shallow_hold_s: 0.5}
+    - {shallow_mm: 2.0, deep_mm: 6.0, cycles: 5, loading_speed: 0.0, deep_hold_s: 0.1, shallow_hold_s: 0.1}
+    - {shallow_mm: 2.0, deep_mm: 6.0, cycles: 5, loading_speed: 0.0, deep_hold_s: 0.5, shallow_hold_s: 0.5}
+    - {shallow_mm: 2.0, deep_mm: 6.0, cycles: 5, loading_speed: 0.1, deep_hold_s: 0.1, shallow_hold_s: 0.1}
+    - {shallow_mm: 2.0, deep_mm: 6.0, cycles: 5, loading_speed: 0.1, deep_hold_s: 0.5, shallow_hold_s: 0.5}
+  hard_limit_n: 20.0
+```
+
+4位置×2反復×(5深さ×3速度+揉み8条件)=184試行。省略した監視・記録設定は既定値を使う。実際には既存automatic_collectionブロックの該当項目を更新し、ブロックを二重に定義しない。
+
+
+以下は`link_trial_speeds: false`による従来の独立速度条件の例。
+
+```yaml
+automatic_collection:
+  link_trial_speeds: false
   depths_mm: [1.0, 2.0, 3.0]  # 実験者が決めた値に置き換える
   loading_speeds: [0.02, 0.10, 0.20]
   repeats: 2

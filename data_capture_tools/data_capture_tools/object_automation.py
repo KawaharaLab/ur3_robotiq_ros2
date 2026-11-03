@@ -2,6 +2,7 @@
 
 Legacy i/ap/ad/ak paths are unchanged. This runner mirrors their goal values but
 owns one gripper action at a time so cancellation cannot launch a queued phase.
+New plans can link all trial movement speeds, including preparation and release.
 """
 import copy
 import json
@@ -380,15 +381,17 @@ class ObjectAutomationMixin:
 
     def _auto_execute_trial(self,row,attempt):
         # Open before tare. A sensor restart may have changed its zero but not geometry.
+        steps=steps_for_trial(row,self._effective_object_width_m)
+        preparation=steps[0]
         self._auto_armed=False
-        self._auto_grip(.140,.3,.1,1);self._auto_wait(1.,check_force=False,check_bag=True)
+        self._auto_grip(preparation['width_m'],preparation['speed'],preparation['force'],preparation['phase'])
+        self._auto_wait(preparation['dwell_s'],check_force=False,check_bag=True)
         self._force_monitor.tare()
         attempt['tare']=dict(left=self._force_monitor._offset_left,right=self._force_monitor._offset_right,
                              ros_ns=self.get_clock().now().nanoseconds)
         self._auto_save();self._auto_force_fault=None;self._auto_force_fault_record=None;self._auto_armed=True
         self._auto_expected_streams={k:v[0] for k,v in self._auto_streams.items()}
         mode='auto_knead' if row['kind']=='knead' else 'auto_'+row.get('variant','depth_speed')
-        steps=steps_for_trial(row,self._effective_object_width_m)
         self._publish_trial_event('START',self._auto_trial_index,mode,steps[-2]['width_m'],steps[1]['speed'])
         # Pre-open above mirrors the first step of legacy run; do not issue it twice.
         for step in steps[1:]:
