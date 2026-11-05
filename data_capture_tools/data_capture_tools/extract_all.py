@@ -130,7 +130,7 @@ def run_batch_process(root_dir: str, config_path: str, max_workers: Optional[int
             except Exception as exc:
                 logger.error(f"Bag session {bag_path.parent.parent.name} generated an exception: {exc}")
 
-def run_as_node():
+def _run_legacy_as_node():
     """
     ros2 run から呼び出されるエントリーポイント
     """
@@ -144,6 +144,12 @@ def run_as_node():
     logger.info("Starting batch extraction process...")
     run_batch_process(DICOMO_DATA_ROOT, CONFIG_PATH, max_workers=MAX_WORKERS)
     logger.info("Batch process finished.")
+
+def run_as_node():
+    # Explicit progress/output selection; preview first, never blindly expand PNG.
+    from .compact_export import main
+    return main()
+
 
 if __name__ == "__main__":
     run_as_node()

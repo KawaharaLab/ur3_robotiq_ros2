@@ -74,17 +74,42 @@ class ObjectAutomationMixin:
                                     count=old.get('count',0)+1)
 
     def _auto_note_force(self,side,wrench,header_ns=None):
-        # Latch each received raw sample, not only the latest at the 20-ms monitor tick.
         if not getattr(self,'_auto_active',False) or not self._auto_armed:return
+        if self._auto_force_fault:return  # Preserve the first trigger and its side.
+        settings=self._auto_job['plan']['settings']
+        baseline=getattr(self._force_monitor,'_offset_'+side)
+        now_ns=time.monotonic_ns()
+        confirm_ms=settings.get('force_limit_confirm_ms',0.)
+        if not hasattr(self,'_auto_force_over'):self._auto_force_over={}
+        record=None
         if not all(math.isfinite(v) for v in wrench):
-            self._auto_force_fault='Nonfinite force '+side
-        elif abs(wrench[1]-getattr(self._force_monitor,'_offset_'+side))>=self._auto_job['plan']['settings']['hard_limit_n']:
-            self._auto_force_fault='Force hard limit '+side
-        if self._auto_force_fault and getattr(self,'_auto_force_fault_record',None) is None:
-            self._auto_force_fault_record=dict(side=side,header_ns=header_ns,
-                receive_monotonic_ns=time.monotonic_ns(),reason=self._auto_force_fault,
-                baseline_n=getattr(self._force_monitor,'_offset_'+side),
-                wrench=[v if math.isfinite(v) else None for v in wrench])
+            reason='Nonfinite force '+side
+        elif abs(wrench[1]-baseline)>=settings['hard_limit_n']:
+            reason='Force hard limit '+side
+            if confirm_ms>0:
+                # Producer headers, not callback arrival spacing: callbacks can be batched.
+                stamp=header_ns
+                if type(stamp) is not int or stamp<=0:
+                    self._auto_force_over.pop(side,None)
+                    return  # Independent header-age/freshness guards still apply.
+                record=self._auto_force_over.get(side)
+                if record is None or not 0<stamp-record['last_header_ns']<=20_000_000:
+                    record=dict(first_header_ns=stamp,last_header_ns=stamp,
+                                first_receive_monotonic_ns=now_ns,samples=1,
+                                peak_relative_n=abs(wrench[1]-baseline))
+                else:
+                    record=dict(record,last_header_ns=stamp,samples=record['samples']+1,
+                                peak_relative_n=max(record['peak_relative_n'],abs(wrench[1]-baseline)))
+                self._auto_force_over[side]=record
+                if stamp-record['first_header_ns']<confirm_ms*1e6:return
+        else:
+            self._auto_force_over.pop(side,None)
+            return
+        self._auto_force_fault=reason
+        self._auto_force_fault_record=dict(side=side,header_ns=header_ns,
+            receive_monotonic_ns=now_ns,reason=reason,baseline_n=baseline,
+            wrench=[v if math.isfinite(v) else None for v in wrench],
+            limit_n=settings['hard_limit_n'],confirm_ms=confirm_ms,confirmation=record)
 
     def _auto_note_stream(self,name,stream_id):
         self._auto_streams[name]=(stream_id,time.monotonic())
@@ -129,7 +154,8 @@ class ObjectAutomationMixin:
             if not all(math.isfinite(v) for v in row['wrench']):raise Paused('Nonfinite force '+side)
             if check_force and self._auto_armed:
                 offset=getattr(self._force_monitor,'_offset_'+side)
-                if abs(row['wrench'][1]-offset)>=settings['hard_limit_n']:raise Paused('Force hard limit '+side)
+                if settings.get('force_limit_confirm_ms',0.)==0 and abs(row['wrench'][1]-offset)>=settings['hard_limit_n']:
+                    raise Paused('Force hard limit '+side)
             image=images.get(side)
             if not image or now-image['at']>settings['image_timeout_s'] or not image['valid']:
                 raise Paused('Missing/stale/undecodable GelSight '+side)
@@ -389,7 +415,7 @@ class ObjectAutomationMixin:
         self._force_monitor.tare()
         attempt['tare']=dict(left=self._force_monitor._offset_left,right=self._force_monitor._offset_right,
                              ros_ns=self.get_clock().now().nanoseconds)
-        self._auto_save();self._auto_force_fault=None;self._auto_force_fault_record=None;self._auto_armed=True
+        self._auto_save();self._auto_force_fault=None;self._auto_force_fault_record=None;self._auto_force_over={};self._auto_armed=True
         self._auto_expected_streams={k:v[0] for k,v in self._auto_streams.items()}
         mode='auto_knead' if row['kind']=='knead' else 'auto_'+row.get('variant','depth_speed')
         self._publish_trial_event('START',self._auto_trial_index,mode,steps[-2]['width_m'],steps[1]['speed'])

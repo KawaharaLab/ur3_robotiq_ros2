@@ -209,3 +209,21 @@ motion abort conditions or automatic retries. Files are never auto-deleted.
 A plain ros2 bag record does not activate local saving; use
 utils/diagnostics/record_gelsight_local_check.py for a passive linked check.
 See the GelSight package README for commands and counter interpretation.
+
+## Force limit confirmation (new jobs)
+
+The configured hard limit now accepts values through 30 N. The acquisition YAML
+sets `hard_limit_n: 30.0` and `force_limit_confirm_ms: 5.0`. The force difference
+is still max(abs(left Fy - trial baseline), abs(right Fy - trial baseline)).
+Each side is checked independently on every received sample. Over-limit values
+must continue for at least 5 ms of producer Header time; an intervening below-limit
+sample, duplicate/backwards header, or gap longer than 20 ms resets evidence.
+Detection is evaluated at sample arrival, then the existing cancellation/release
+path runs. This is not a guarantee of a 5 ms physical stopping time.
+
+Raw sensor messages, bag timestamps and saved forces are not filtered. NaN/Inf
+and the existing stale-stream guards remain immediate. The trigger records the
+confirmation interval, sample count, threshold, peak difference and baseline.
+Old saved plans without force_limit_confirm_ms retain the immediate rule and
+their fingerprints. Do not edit a saved progress JSON or original-job YAML to
+change a running job: start a new ac job for the new rule. AF/AFS are unchanged.

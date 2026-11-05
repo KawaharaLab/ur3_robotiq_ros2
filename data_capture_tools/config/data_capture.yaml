@@ -208,7 +208,8 @@ automatic_collection:
   release_speed: 0.3          # Used only when link_trial_speeds: false.
   release_speeds: []          # Keep empty when link_trial_speeds: true.
   knead_conditions: []       # optional: shallow_mm, deep_mm, cycles, loading/unloading_speed, deep/shallow_hold_s
-  hard_limit_n: 20.0          # max of abs(Fy - per-trial open baseline), raw single sample
+  hard_limit_n: 30.0          # max of abs(Fy - per-trial open baseline)
+  force_limit_confirm_ms: 5.0 # Consecutive over-limit producer timestamps; raw data unchanged
   rest_s: 0.8
   completion_settle_s: 1.5
   seed: 20261028

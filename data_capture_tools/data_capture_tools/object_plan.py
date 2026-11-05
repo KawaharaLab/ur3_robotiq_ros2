@@ -37,10 +37,12 @@ def build_plan(settings):
         if type(s[name]) is not int or s[name]<1:raise ValueError('Invalid '+name)
     if s['repeats']>100 or s['batch_size']>10:raise ValueError('Too many repeats or bag batch size >10')
     for name,default,lo,hi in [('hold_s',4.,0.,10.),('rest_s',.8,.1,30.),('completion_settle_s',1.5,0.,5.),
-                              ('hard_limit_n',20.,.1,20.),('offset_m',.01,0.,.02),
+                              ('hard_limit_n',20.,.1,30.),('offset_m',.01,0.,.02),
                               ('force_timeout_s',.25,.05,1.),('image_timeout_s',.5,.15,2.),
                               ('min_free_gib',5.,.1,1000.)]:
         s.setdefault(name,default);number(s[name],name,lo,hi)
+    # Absent in saved jobs means legacy immediate detection; do not change fingerprints.
+    number(s.get('force_limit_confirm_ms',0.),'force_limit_confirm_ms',0.,20.)
     for name in ('require_timing','auto_init','auto_play'):
         s.setdefault(name,True)
         if type(s[name]) is not bool:raise ValueError(name+' must be boolean')
