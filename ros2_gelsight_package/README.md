@@ -65,105 +65,100 @@ Special thanks to the developers and contributors of the GelSight Mini and ROS 2
 
 ## Optional local acquisition-record copy
 
-`acquisition_record_dir` is empty by default. Set both options below to enable a
-local copy on the workstation. This does not change camera properties, image
-headers, image topics, ROS timing payloads, or robot motion. The output contains
-metadata only, not a second copy of JPEG pixels.
+With `acquisition_records:=true`, local metadata now defaults to **bag-linked**
+mode (`acquisition_record_mode:=bag`). Camera publication and the existing ROS
+acquisition_timing messages continue while idle; local files are created only
+when a compatible collector requests recording. No JPEG pixels are duplicated.
+Image headers, ROS timing payloads, camera settings and motion are unchanged.
+
+### Normal collection
+
+Build both packages, source the workspace, and restart the GelSight publishers
+and data_capture_manager_10. Other drivers do not need restarting for this change.
 
 ```bash
 cd /home/tsumura/my_robotiq_ws
 source /opt/ros/humble/setup.bash
-colcon build --packages-select ros2_gelsight_package
+colcon build --packages-select ros2_gelsight_package data_capture_tools
 source install/setup.bash
-ros2 launch ros2_gelsight_package gelsight_publisher.launch.py \
-  acquisition_records:=true \
-  acquisition_record_dir:=/home/tsumura/my_robotiq_ws/gelsight_acquisition_records
+ros2 launch ros2_gelsight_package gelsight_publisher.launch.py acquisition_records:=true
 ```
 
-Restart only the GelSight launch process to load the new code. Never run two
-camera publishers against the same devices. The log must print `Local acquisition
-copy: ...` for each camera. A directory without `acquisition_records:=true` is a
-configuration error. An unwritable path fails at startup instead of pretending
-that local recording is available. Existing setup without the directory option
-has no writer thread or files.
+Both cameras must log `Local acquisition copy: bag-linked standby; no files until
+a collector starts recording`. Never run duplicate publishers on the devices.
+The manager defaults to `gelsight_local_records: true`, including custom YAML
+files where that key is absent. Set it to false to disable control requests.
+Normal ac/ar/ap/af recording through manager_10 needs no extra save commands.
 
-### Files and timing meanings
+For each recording session, the manager creates:
 
-Each node/startup stream creates `<node>_<stream_id>.jsonl` plus
-`<node>_<stream_id>.status.json` in that directory, without overwriting an old log.
-The JSONL begins with `kind:start` metadata. Each frame then has:
+- `gelsight_acquisition_records/<node>_<stream_id>.jsonl` and `.status.json`;
+- `gelsight_local_recording.json`, recording the requests and node acknowledgments.
 
-- `kind:frame`: the exact JSON object also sent on acquisition_timing, plus an
-  `enqueue_clock` sampled immediately before its local queue submission, before
-  the ROS publish call. The serialized ROS payload itself is reused unchanged.
-- `kind:publish_result`: that frame's header/sequence and host clocks bracketing
-  construction/publish of the ROS String message, with success/failure. These
-  clocks are not physical exposure timestamps or DDS delivery acknowledgements.
-- `writer_monotonic_ns`: when the worker formats the local line, not a sensor
-  timestamp. Clock samples use `[monotonic_before_ns, ros_ns, monotonic_after_ns]`.
+These paths are inside the existing session directory alongside bag/logs, not
+inside every trial export. A new bag session gets a new directory. The writer
+starts before rosbag launches and stops after the recorder exits, so boundary
+records outside the bag interval are expected. Recorder startup/shutdown can
+wait up to 2.5 seconds each for acknowledgments. Missing local acknowledgments
+are warnings; they do not stop or retry the primary collection or motion.
 
-The capture thread submits immutable text to a bounded queue of 256 envelopes
-with put_nowait. It never waits for queue space or performs disk writes. The
-worker writes batches of up to 32 envelopes, buffers file output, flushes about
-once per second, and updates the small status JSON atomically. It fsyncs the data
-on normal shutdown, not for every frame. A queue overflow drops the local record
-and increments counters; a disk failure disables local acceptance and is logged.
-Neither condition intentionally stops image acquisition. Python scheduling/GIL,
-shared CPU/disk use, and clock calls still add some overhead; zero effect is not
-guaranteed. A forced kill/power loss can lose buffered data and leave stale status.
+The collector renews a 10-second lease every second while its recorder process
+is alive. A normal stop closes the local writers. If the collector crashes or
+communication ceases, capture stops adding local records at lease expiry even
+if the ROS control timer is delayed. The camera keeps publishing. Both collector
+and GelSight nodes must run on the same workstation. No files are auto-deleted;
+previously captured files remain, but idle nodes do not keep appending in bag mode.
 
-Check `error:null`, `dropped_records:0`, `rejected_records:0`, and after normal
-shutdown `closed:true`, `clean_close:true`, `capture_thread_stopped:true`,
-`close_timed_out:false`, `pending_records:0`, with accepted/written/flushed counts
-matching. Counts include both frame and publish_result envelopes. During recording,
-flushed counts may lag by up to one interval; startup metadata is not counted.
-Closing the writer waits at most five seconds; a blocked disk can still prevent
-all final records from being saved and is reported as an incomplete close.
+A bare `ros2 bag record` does **not** send these control requests. Use the passive
+helper below for manual checks. The old `acquisition_record_dir` option alone no
+longer enables continuous saving: that requires explicit
+`acquisition_record_mode:=continuous` plus an absolute directory and
+`acquisition_records:=true`. Continuous mode writes throughout node lifetime;
+`acquisition_record_mode:=off` disables only the local copy.
 
-Local logging covers a whole node lifetime, not one bag. Match via stream_id,
-header_ns and frame_seq; preserve the matching JSONL/status files together with
-research bags. Nothing automatically copies these files into per-trial folders
-or repairs/replaces bag messages. No files are silently cleaned up.
+### Files, overhead and timing meanings
+
+Each JSONL starts with startup metadata. `kind:frame` holds the exact JSON sent
+on acquisition_timing plus clocks immediately before local queue submission.
+`kind:publish_result` records host clocks around ROS message construction/publish
+and success/failure. These are not exposure times or DDS delivery acknowledgments.
+`writer_monotonic_ns` is the worker's formatting time. Clock tuples use
+`[monotonic_before_ns, ros_ns, monotonic_after_ns]`. Match records by stream_id,
+header_ns and frame_seq; local data does not repair or replace bag messages.
+
+Capture only submits immutable text with put_nowait to a 256-envelope queue.
+File opening/draining occurs on the control callback, and a separate writer
+batches up to 32 envelopes, flushes/status-updates about once per second, and
+fsyncs on close. Queue overflow drops local records with counters; disk failure
+disables local acceptance. Neither intentionally stops image acquisition, though
+CPU/GIL/disk use still adds overhead and must be checked on the workstation.
+Control close waits at most two seconds; a stuck writer blocks new local writers
+until drained. A forced kill/power loss can lose buffered data.
+
+After normal bag stop, check error:null, closed:true, clean_close:true,
+close_timed_out:false, pending_records:0, dropped_records:0, rejected_records:0,
+and matching accepted/written/flushed counts. For bag-linked stop,
+capture_source_detached:true is expected; capture_thread_stopped:false is normal
+because the camera remains active. Clean close alone does not prove no drops.
 
 ### Passive validation without robot motion
 
-With the GelSight nodes and the normal MMS101 publishers running, record a static
-40-second bag from another sourced workstation terminal. UR/gripper/action nodes
-and init/ac are not required for this test.
+Keep the GelSight and MMS101 publishers running with acquisition_records:=true.
+UR/gripper/action nodes and init/ac are not required. In a separate sourced
+workstation terminal, run:
 
 ```bash
 cd /home/tsumura/my_robotiq_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-timeout --signal=INT 40s ros2 bag record \
-  -s sqlite3 --compression-mode file --compression-format zstd \
-  -o ./gs_local_check_20261105_run1 \
-  /gelsight/left/image_raw/compressed /gelsight/right/image_raw/compressed \
-  /gelsight_mini_publisher_1/acquisition_timing \
-  /gelsight_mini_publisher_2/acquisition_timing \
-  /force_torque/left /force_torque/right \
-  /mms101_driver_1/acquisition_timing /mms101_driver_2/acquisition_timing \
-  </dev/null > ./gs_local_check_20261105_run1.log 2>&1
+/usr/bin/python3 src/ur3_robotiq_ros2/utils/diagnostics/record_gelsight_local_check.py \
+  --seconds 40 --out ./gs_local_link_check_20261105_run1
 ```
 
-Exit code 124 from timeout is expected. Wait for compression/normal exit. For this
-validation, stop the GelSight launch with Ctrl+C afterwards to flush and finalize
-its local status. Do not rebuild or change motion conditions for this test.
-Then compare existing records without ROS subscriptions or robot commands:
-
-```bash
-/usr/bin/python3 src/ur3_robotiq_ros2/utils/diagnostics/compare_gelsight_local_bag.py \
-  --bag ./gs_local_check_20261105_run1 \
-  --local-dir ./gelsight_acquisition_records \
-  --out ./gs_local_check_20261105_comparison.json
-```
-
-The script supports SQLite db3 and file-compressed db3.zstd via the existing
-read-only QA reader. It uses Python YAML and zstd installed in the normal
-workstation environment; no ROS Python imports. It refuses to overwrite output.
-Share the comparison JSON first. It includes the matching filenames and status,
-image FPS, local queue-before-publish/header timing, bag delivery timing, and ROS
-publish-call duration. Missing bag metadata with local metadata present supports
-a post-generation delivery/recording problem; it does not identify which DDS or
-rosbag component failed. If both are missing, inspect local drop/error counters
-before blaming generation. No physical synchronization guarantee is implied.
+The helper waits for both local writers, records the eight GelSight/MMS101 image,
+force and timing topics, stops both recording paths, and compares them. It sends
+no robot commands. If startup acknowledgments are missing it fails before bag
+recording and reports why. All files are under the specified output directory;
+share its `comparison.json`. Do not manually mkdir a missing local directory,
+and do not stop GelSight to finalize this test. Choose a new output name for each
+run. Keep JSONL/status files if more detailed investigation is needed.

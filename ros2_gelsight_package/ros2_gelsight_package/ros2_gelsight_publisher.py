@@ -22,6 +22,7 @@ from .config import GSConfig, ConfigModel
 from .utilities.gelsightmini import GelSightMini
 from .timing_diagnostics import TimingWindow
 from .local_acquisition_records import LocalAcquisitionWriter
+from .local_recording_control import RecordingLeaseController, CONTROL_TOPIC
 
 
 class GelSightMiniPublisher(Node):
@@ -38,11 +39,18 @@ class GelSightMiniPublisher(Node):
         timing_diagnostics: bool = False,
         acquisition_records: bool = False,
         acquisition_record_dir: str = "",
+        acquisition_record_mode: str = "bag",
     ) -> None:
         super().__init__("gelsight_mini_publisher")
         if acquisition_record_dir and not acquisition_records:
             raise ValueError("acquisition_record_dir requires acquisition_records:=true")
+        if acquisition_record_mode not in ("bag", "continuous", "off"):
+            raise ValueError("Invalid acquisition_record_mode")
+        if acquisition_record_mode == "continuous" and not acquisition_record_dir:
+            raise ValueError("continuous local recording requires acquisition_record_dir")
         self._local_acquisition_writer = None
+        self._local_recording_controller = None
+        self._local_recording_status_pub = None
         self._bridge = CvBridge()
         self._topic_name = topic_name
         self._frame_id = frame_id
@@ -84,15 +92,11 @@ class GelSightMiniPublisher(Node):
             except Exception:
                 pass
 
-        if acquisition_record_dir:
+        if acquisition_records and acquisition_record_mode == "continuous":
             try:
                 self._local_acquisition_writer = LocalAcquisitionWriter(
                     acquisition_record_dir,
-                    metadata=dict(stream_id=self._acquisition_stream_id, node=self.get_name(),
-                        image_topic=topic_name, frame_id=frame_id,
-                        opencv_version=cv2.__version__, backend=self._acquisition_backend,
-                        clock_sample_layout=["monotonic_before_ns", "ros_ns", "monotonic_after_ns"],
-                        startup_clock=self._acquisition_clock()),
+                    metadata=self._local_recording_metadata(),
                     on_error=lambda text: self.get_logger().error(text))
             except BaseException:
                 if self._cam_stream.camera is not None:
@@ -100,6 +104,17 @@ class GelSightMiniPublisher(Node):
                 raise
             self.get_logger().info(
                 "Local acquisition copy: " + str(self._local_acquisition_writer.path))
+
+        elif acquisition_records and acquisition_record_mode == "bag":
+            self._local_recording_controller = RecordingLeaseController(
+                self._local_recording_metadata, on_error=lambda text: self.get_logger().error(text))
+            self._local_recording_status_pub = self.create_publisher(String, "~/local_recording_status", 10)
+            self._local_recording_control_sub = self.create_subscription(
+                String, CONTROL_TOPIC, self._local_recording_control_callback, 10)
+            self._local_recording_timer = self.create_timer(.5, self._local_recording_tick)
+            self.get_logger().info("Local acquisition copy: bag-linked standby; no files until a collector starts recording")
+            if acquisition_record_dir:
+                self.get_logger().warning("acquisition_record_dir is ignored in bag mode; files use the collector's session directory")
 
         self._publisher = self.create_publisher(Image, topic_name, 10)
         self._compressed_publisher: Optional[rclpy.publisher.Publisher] = None
@@ -112,6 +127,34 @@ class GelSightMiniPublisher(Node):
         self._running = True
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
+
+    def _local_recording_metadata(self):
+        return dict(stream_id=self._acquisition_stream_id, node=self.get_name(),
+            image_topic=self._topic_name, frame_id=self._frame_id,
+            opencv_version=cv2.__version__, backend=self._acquisition_backend,
+            clock_sample_layout=["monotonic_before_ns", "ros_ns", "monotonic_after_ns"],
+            startup_clock=self._acquisition_clock())
+
+    def _get_local_acquisition_writer(self):
+        controller = getattr(self, "_local_recording_controller", None)
+        return controller.writer() if controller is not None else getattr(self, "_local_acquisition_writer", None)
+
+    def _local_recording_control_callback(self, msg):
+        try:
+            message = json.loads(msg.data)
+            if not isinstance(message, dict):raise ValueError("Control must be a JSON object")
+            status = self._local_recording_controller.handle(message)
+            self._local_recording_status_pub.publish(String(data=json.dumps(status)))
+        except Exception as exc:
+            self.get_logger().error("Local recording control failed: " + str(exc), throttle_duration_sec=2.)
+
+    def _local_recording_tick(self):
+        try:
+            self._local_recording_controller.tick()
+            status = self._local_recording_controller.status()
+            self._local_recording_status_pub.publish(String(data=json.dumps(status)))
+        except Exception as exc:
+            self.get_logger().error("Local recording status failed: " + str(exc), throttle_duration_sec=2.)
 
     def _capture_loop(self) -> None:
         period = 1.0 / self._publish_rate_hz
@@ -222,7 +265,7 @@ class GelSightMiniPublisher(Node):
             "compressed_published": compressed_published,
             "record_publish_errors_total": self._acquisition_publish_errors,
         }
-        local = getattr(self, "_local_acquisition_writer", None)
+        local = self._get_local_acquisition_writer()
         publish_start = None
         success = False
         try:
@@ -237,7 +280,7 @@ class GelSightMiniPublisher(Node):
             self._acquisition_publish_errors += 1
             self.get_logger().error(f"Acquisition timing publish failed: {exc}", throttle_duration_sec=2.0)
         finally:
-            if local is not None and publish_start is not None:
+            if local is not None and publish_start is not None and local is self._get_local_acquisition_writer():
                 try:
                     publish_end = self._acquisition_clock()
                     result = dict(stream_id=self._acquisition_stream_id, frame_seq=record["frame_seq"],
@@ -263,6 +306,9 @@ class GelSightMiniPublisher(Node):
         if hasattr(self, "_capture_thread") and self._capture_thread is not None:
             self._capture_thread.join(timeout=1.0)
             
+        controller = getattr(self, "_local_recording_controller", None)
+        if controller is not None:
+            controller.close(capture_thread_stopped=not self._capture_thread.is_alive())
         local = getattr(self, "_local_acquisition_writer", None)
         if local is not None:
             stopped = not self._capture_thread.is_alive()
@@ -343,7 +389,11 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--acquisition-record-dir", type=str, default="",
-        help="Optional local JSONL copy directory; requires --acquisition-records true.",
+        help="Directory for continuous mode; bag mode uses the collector session directory.",
+    )
+    parser.add_argument(
+        "--acquisition-record-mode", choices=("bag", "continuous", "off"), default="bag",
+        help="Local copy: leased collector-controlled bag mode, explicit continuous mode, or off.",
     )
     return parser.parse_known_args()
 
@@ -365,6 +415,7 @@ def main() -> None:
         timing_diagnostics=args.timing_diagnostics,
         acquisition_records=args.acquisition_records,
         acquisition_record_dir=args.acquisition_record_dir,
+        acquisition_record_mode=args.acquisition_record_mode,
     )
 
     try:

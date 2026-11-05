@@ -68,6 +68,8 @@ image_throttle_hz: 0
 other_throttle_hz: 0
 enable_image_compression: true
 stop_key: q
+# Local GelSight metadata follows manager-owned bag recording; failures are advisory.
+gelsight_local_records: true
 bag_record:
   storage: sqlite3
   compression_mode: file

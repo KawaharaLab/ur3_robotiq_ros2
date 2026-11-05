@@ -189,3 +189,23 @@ Dashboard応答が失敗/タイムアウトでも、再playは送らず、要求
 揃わなければURの応答messageと制御器状態を表示して一時停止する。最初からプログラムが実行中の
 場合も制御器activeを確認する。自動で制御器を切り替えたり保護停止を解除したりしない。
 この確認はロード済みプログラムが普段のExternal Controlであるという運用上の前提を置く。
+
+## Bag-linked GelSight local timing copy
+
+`data_capture_manager_10` now requests the optional local timing copy for each
+recorder session when `gelsight_local_records` is true (the default even if absent
+from a custom config). Rebuild both data_capture_tools and ros2_gelsight_package,
+restart the manager and both GelSight publishers with acquisition_records:=true.
+No other drivers or per-trial actions need changing. Normal ac/ar/ap recording
+automatically saves JSONL/status files in the session's
+`gelsight_acquisition_records/`, with control results in
+`gelsight_local_recording.json`. The image and force headers are unchanged.
+
+The camera nodes default to bag mode: no local file growth while idle. A normal
+recorder stop closes the writers; a collector crash stops new local submissions
+after a 10-second renewable lease expires. Collector and camera nodes must run
+on the same workstation. Optional logging failures only warn; they do not add
+motion abort conditions or automatic retries. Files are never auto-deleted.
+A plain ros2 bag record does not activate local saving; use
+utils/diagnostics/record_gelsight_local_check.py for a passive linked check.
+See the GelSight package README for commands and counter interpretation.

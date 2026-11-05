@@ -12,7 +12,8 @@ def generate_launch_description():
     default_config = os.path.join(package_share, 'config', 'default_config.json')
 
     args = [
-        DeclareLaunchArgument('acquisition_record_dir', default_value='', description='Optional local JSONL directory; empty disables local copy'),
+        DeclareLaunchArgument('acquisition_record_mode', default_value='bag', description='Local copy mode: bag (collector-linked), continuous, or off'),
+        DeclareLaunchArgument('acquisition_record_dir', default_value='', description='Directory for explicit continuous mode; bag mode uses collector session'),
         DeclareLaunchArgument('acquisition_records', default_value='false', description='Per-image acquisition timing records'),
         DeclareLaunchArgument('timing_diagnostics', default_value='false', description='Optional host-side timing summaries'),
         DeclareLaunchArgument('gs_config', default_value=default_config, description='Path to GelSight config JSON'),
@@ -43,6 +44,7 @@ def generate_launch_description():
         '--timing-diagnostics', LaunchConfiguration('timing_diagnostics'),
         '--acquisition-records', LaunchConfiguration('acquisition_records'),
         '--acquisition-record-dir', LaunchConfiguration('acquisition_record_dir'),
+        '--acquisition-record-mode', LaunchConfiguration('acquisition_record_mode'),
     ]
 
     node2_args = [
@@ -57,6 +59,7 @@ def generate_launch_description():
         '--timing-diagnostics', LaunchConfiguration('timing_diagnostics'),
         '--acquisition-records', LaunchConfiguration('acquisition_records'),
         '--acquisition-record-dir', LaunchConfiguration('acquisition_record_dir'),
+        '--acquisition-record-mode', LaunchConfiguration('acquisition_record_mode'),
     ]
 
     nodes = [

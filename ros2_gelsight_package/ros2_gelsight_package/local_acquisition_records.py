@@ -38,7 +38,7 @@ class LocalAcquisitionWriter:
             attempted_records=0, accepted_records=0, written_records=0,
             flushed_records=0, dropped_records=0, rejected_records=0,
             queue_high_watermark=0, error=None, accepting=True, closed=False,
-            close_timed_out=False, clean_close=False, capture_thread_stopped=None,
+            close_timed_out=False, clean_close=False, capture_thread_stopped=None, capture_source_detached=False,
             note='Counters cover frame and publish_result envelopes; data fsync only on clean close.')
         try:
             self._file.write(json.dumps(dict(local_schema_version=1, kind='start',
@@ -161,10 +161,11 @@ class LocalAcquisitionWriter:
                     self._state['error'] = self._state['error'] or repr(exc)
                 self._notify('Could not save local acquisition status: ' + str(exc))
 
-    def close(self, timeout=5.0, capture_thread_stopped=True):
+    def close(self, timeout=5.0, capture_thread_stopped=True, capture_source_detached=False):
         with self._lock:
             self._state['accepting'] = False
             self._state['capture_thread_stopped'] = bool(capture_thread_stopped)
+            self._state['capture_source_detached'] = bool(capture_source_detached)
         self._stop.set()
         self._thread.join(timeout=max(0., timeout))
         if self._thread.is_alive():

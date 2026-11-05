@@ -246,6 +246,13 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             .string_value
         )
         self.config: CaptureConfig = load_capture_config(config_path)
+        from .gelsight_local_recording import GelsightLocalRecordingClient
+        local_enabled = self.config.raw.get("gelsight_local_records", True)
+        if type(local_enabled) is not bool:
+            raise ValueError("gelsight_local_records must be boolean")
+        self._gelsight_local_client = GelsightLocalRecordingClient(self) if local_enabled else None
+        if local_enabled:
+            self.get_logger().info("GelSight local copy linkage enabled; standby until bag start (10 s lease)")
 
         # --- C++ノード連携用の設定 ---
         self._cmd_pub = self.create_publisher(String, "/robot_cmd", 10)
@@ -2660,6 +2667,10 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
                     rclpy.spin_once(self, timeout_sec=0.05)
                 else:
                     time.sleep(0.05)
+        local = getattr(self, "_gelsight_local_client", None)
+        if local is not None:
+            try:local.stop(wait=False)
+            except Exception:pass
         self._stop_force_press_worker()
         self._stop_viewers() #
         self._stop_aux_processes() #
@@ -2711,13 +2722,28 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         self.get_logger().info(f"Launching rosbag2: {' '.join(cmd)}")
         # rosbag's keyboard handler must not read or change the manager's TTY.
         # Keep Enter exclusively available to the collection pause handler.
-        self._bag_process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=self._bag_stdout,
-            stderr=self._bag_stderr,
-            env=os.environ.copy(),
-        )
+        local = getattr(self, "_gelsight_local_client", None)
+        if local is not None:
+            try:local.start(self._session_dir)
+            except Exception as exc:
+                self.get_logger().warning("Local recording start failed; primary bag continues: " + str(exc))
+        try:
+            self._bag_process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=self._bag_stdout,
+                stderr=self._bag_stderr,
+                env=os.environ.copy(),
+            )
+        except BaseException:
+            if local is not None:
+                try:local.stop()
+                except Exception:pass
+            raise
+        if local is not None:
+            try:local.attach_process(self._bag_process)
+            except Exception as exc:
+                self.get_logger().warning("Local recording process tracking failed: " + str(exc))
 
     
     def _finalize(self) -> None:
@@ -2793,6 +2819,11 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
                     )
                     self._bag_process.kill()
                     self._bag_process.wait(timeout=5)
+        local = getattr(self, "_gelsight_local_client", None)
+        if local is not None:
+            try:local.stop()
+            except Exception as exc:
+                self.get_logger().warning("Local recording stop failed; its lease expires automatically: " + str(exc))
         if self._bag_stdout:
             self._bag_stdout.close()
         if self._bag_stderr:
