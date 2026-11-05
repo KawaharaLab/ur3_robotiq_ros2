@@ -1,21 +1,21 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/afterDICOMO/controlled_experiment
-task_name: object11_ctrl
+output_root: /mnt/nvme1/tsumura/masters_thesis/data
+task_name: object1
 # Optional observations. specimen_id defaults to task_name; no second JSON needed.
 # These values are recorded only and never change target_diameter or motion.
 # Unknown values stay null. Imperfect mounting/reused samples are permitted.
 specimen_metadata:
-  specimen_width_mm: null       # Measured sample width (mm)
-  width_measurement_state: null # e.g. before clamping, unloaded
-  clamp_gap_mm: null            # Measured clamp gap (mm), independent of sample width
+  specimen_width_mm: 21       # Measured sample width (mm)
+  width_measurement_state: before clamping # e.g. before clamping, unloaded
+  clamp_gap_mm: 21           # Measured clamp gap (mm), independent of sample width
   notes: ""                    # Optional mounting/state changes; exact use count not required
   # Low-frequency optional hardware labels; update only when known/changed.
   finger_id: null
   force_sensor_left_id: null
-  force_sensor_right_id: null
+  force_sensor_right_id: 3J2001
 
 prompt: ""
-label: "ぷりぷり, puri-puri" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
+label: "" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # 基本姿勢
 # 低い方
@@ -39,9 +39,9 @@ base_tcp_pose:
 #   rz: -0.010
 
 # 実験パラメータ
-target_diameter: 0.010 # 動作計画用の幅 (m)。初期位置に合わせて調整可能。実測幅とは独立。
+target_diameter: 0.023 # 動作計画用の幅 (m)。初期位置に合わせて調整可能。実測幅とは独立。
 gripper_offset: 0.000 # デバイス誤差 (m)
-arm_offset: 0.003 # アームの位置誤差 (m)
+arm_offset: 0.000 # アームの位置誤差 (m)
 push_depth: 0.004 # 固定深さ動作の既定値 (m)。ad等の各試行条件とは区別する。
 
 # Loading speed policy. Use "fixed" for repeatability pilots; "random" keeps
@@ -199,23 +199,114 @@ topics:
 # Whole-object collection: ac starts, ar resumes, ai performs a planned manual init.
 # REQUIRED: choose depths/speeds after representative-object checks; null blocks all motion.
 automatic_collection:
-  link_trial_speeds: true     # Same trial speed for pre-open, first press, kneading and final release.
-  depths_mm: null             # nominal per-side depths, e.g. your selected shallow/middle/deep
-  loading_speeds: null        # normalized register requests [0,1], not measured mm/s
+  # 準備全開・初期押し込み・揉み往復・完全開放を
+  # 各試行の速度条件に統一する。
+  link_trial_speeds: true
+
+  # initで定めた基準に対する片側の公称押し込み量。
+  # グリッパ全幅の閉じ量は、この値の2倍。
+  depths_mm: [2.0, 3.0, 4.0, 5.0, 6.0]
+
+  # 正規化された速度指令。mm/sではない。
+  # 0.0は停止ではなく最低速度。
+  loading_speeds: [0.0, 0.1, 0.2]
+
   repeats: 2
-  offset_m: 0.010             # base / front / back / up; existing 45-degree tangent and world Z
   hold_s: 4.0
-  release_speed: 0.3          # Used only when link_trial_speeds: false.
-  release_speeds: []          # Keep empty when link_trial_speeds: true.
-  knead_conditions: []       # optional: shallow_mm, deep_mm, cycles, loading/unloading_speed, deep/shallow_hold_s
-  hard_limit_n: 20.0          # max of abs(Fy - per-trial open baseline), raw single sample
+
+  # 基準点・前・後・上の4位置。移動量10 mm。
+  offset_m: 0.010
+
+  # 個別の開放速度条件は追加しない。
+  release_speeds: []
+
+  # link_trial_speeds:trueでは使われない互換用設定。
+  release_speed: 0.3
+
+  # 揉み8条件。各条件をrepeats回、各位置で実行。
+  # deep_hold_s / shallow_hold_sは各折り返し位置での保持時間。
+  knead_conditions:
+    - shallow_mm: 2.0
+      deep_mm: 4.0
+      cycles: 5
+      loading_speed: 0.0
+      unloading_speed: 0.0
+      deep_hold_s: 0.1
+      shallow_hold_s: 0.1
+
+    - shallow_mm: 2.0
+      deep_mm: 4.0
+      cycles: 5
+      loading_speed: 0.1
+      unloading_speed: 0.1
+      deep_hold_s: 0.1
+      shallow_hold_s: 0.1
+
+    - shallow_mm: 2.0
+      deep_mm: 4.0
+      cycles: 5
+      loading_speed: 0.0
+      unloading_speed: 0.0
+      deep_hold_s: 0.5
+      shallow_hold_s: 0.5
+
+    - shallow_mm: 2.0
+      deep_mm: 4.0
+      cycles: 5
+      loading_speed: 0.1
+      unloading_speed: 0.1
+      deep_hold_s: 0.5
+      shallow_hold_s: 0.5
+
+    - shallow_mm: 2.0
+      deep_mm: 6.0
+      cycles: 5
+      loading_speed: 0.0
+      unloading_speed: 0.0
+      deep_hold_s: 0.1
+      shallow_hold_s: 0.1
+
+    - shallow_mm: 2.0
+      deep_mm: 6.0
+      cycles: 5
+      loading_speed: 0.1
+      unloading_speed: 0.1
+      deep_hold_s: 0.1
+      shallow_hold_s: 0.1
+
+    - shallow_mm: 2.0
+      deep_mm: 6.0
+      cycles: 5
+      loading_speed: 0.0
+      unloading_speed: 0.0
+      deep_hold_s: 0.5
+      shallow_hold_s: 0.5
+
+    - shallow_mm: 2.0
+      deep_mm: 6.0
+      cycles: 5
+      loading_speed: 0.1
+      unloading_speed: 0.1
+      deep_hold_s: 0.5
+      shallow_hold_s: 0.5
+
+  # 各試行の無荷重基準に対する左右Fy変化の絶対値。
+  # 大きい側が30 Nに達した場合に中断。
+  hard_limit_n: 30.0
+
   rest_s: 0.8
   completion_settle_s: 1.5
+
+  # 条件順序の再現用
   seed: 20261028
+
+  # 最大10試行ごとにbagを切り替える。
   batch_size: 10
+
+  # 現在検証済みの監視・再生設定を維持。
   force_timeout_s: 0.25
   image_timeout_s: 0.5
   min_free_gib: 5.0
   require_timing: true
   auto_init: true
-  auto_play: true             # Dashboard play only; never load/unlock/reset a robot program
+  auto_play: true
