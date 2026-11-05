@@ -21,6 +21,7 @@ from cv_bridge import CvBridge
 from .config import GSConfig, ConfigModel
 from .utilities.gelsightmini import GelSightMini
 from .timing_diagnostics import TimingWindow
+from .local_acquisition_records import LocalAcquisitionWriter
 
 
 class GelSightMiniPublisher(Node):
@@ -36,8 +37,12 @@ class GelSightMiniPublisher(Node):
         compressed_quality: int = 90,
         timing_diagnostics: bool = False,
         acquisition_records: bool = False,
+        acquisition_record_dir: str = "",
     ) -> None:
         super().__init__("gelsight_mini_publisher")
+        if acquisition_record_dir and not acquisition_records:
+            raise ValueError("acquisition_record_dir requires acquisition_records:=true")
+        self._local_acquisition_writer = None
         self._bridge = CvBridge()
         self._topic_name = topic_name
         self._frame_id = frame_id
@@ -78,6 +83,23 @@ class GelSightMiniPublisher(Node):
                 self._acquisition_backend = self._cam_stream.camera.cap.getBackendName()
             except Exception:
                 pass
+
+        if acquisition_record_dir:
+            try:
+                self._local_acquisition_writer = LocalAcquisitionWriter(
+                    acquisition_record_dir,
+                    metadata=dict(stream_id=self._acquisition_stream_id, node=self.get_name(),
+                        image_topic=topic_name, frame_id=frame_id,
+                        opencv_version=cv2.__version__, backend=self._acquisition_backend,
+                        clock_sample_layout=["monotonic_before_ns", "ros_ns", "monotonic_after_ns"],
+                        startup_clock=self._acquisition_clock()),
+                    on_error=lambda text: self.get_logger().error(text))
+            except BaseException:
+                if self._cam_stream.camera is not None:
+                    self._cam_stream.camera.release()
+                raise
+            self.get_logger().info(
+                "Local acquisition copy: " + str(self._local_acquisition_writer.path))
 
         self._publisher = self.create_publisher(Image, topic_name, 10)
         self._compressed_publisher: Optional[rclpy.publisher.Publisher] = None
@@ -200,11 +222,30 @@ class GelSightMiniPublisher(Node):
             "compressed_published": compressed_published,
             "record_publish_errors_total": self._acquisition_publish_errors,
         }
+        local = getattr(self, "_local_acquisition_writer", None)
+        publish_start = None
+        success = False
         try:
-            self._acquisition_publisher.publish(String(data=json.dumps(record, allow_nan=False)))
+            payload = json.dumps(record, allow_nan=False)
+            if local is not None:
+                publish_start = self._acquisition_clock()
+                local.submit("frame", payload, publish_start)
+                publish_start = self._acquisition_clock()
+            self._acquisition_publisher.publish(String(data=payload))
+            success = True
         except Exception as exc:  # additional metadata must not stop image acquisition
             self._acquisition_publish_errors += 1
             self.get_logger().error(f"Acquisition timing publish failed: {exc}", throttle_duration_sec=2.0)
+        finally:
+            if local is not None and publish_start is not None:
+                try:
+                    publish_end = self._acquisition_clock()
+                    result = dict(stream_id=self._acquisition_stream_id, frame_seq=record["frame_seq"],
+                        header_ns=record["header_ns"], publish_start=publish_start,
+                        publish_end=publish_end, success=success)
+                    local.submit("publish_result", json.dumps(result, allow_nan=False), publish_end)
+                except Exception as exc:
+                    self.get_logger().error(f"Local publish diagnostic failed: {exc}", throttle_duration_sec=2.0)
 
     def _report_timing(self) -> None:
         report = self._timing.snapshot()
@@ -222,6 +263,14 @@ class GelSightMiniPublisher(Node):
         if hasattr(self, "_capture_thread") and self._capture_thread is not None:
             self._capture_thread.join(timeout=1.0)
             
+        local = getattr(self, "_local_acquisition_writer", None)
+        if local is not None:
+            stopped = not self._capture_thread.is_alive()
+            status = local.close(timeout=5.0, capture_thread_stopped=stopped)
+            if status["error"] or status["dropped_records"] or status["rejected_records"] or not stopped or status["close_timed_out"]:
+                self.get_logger().error("Local acquisition copy incomplete: " + json.dumps(status))
+            else:
+                self.get_logger().info("Local acquisition copy closed: " + str(local.path))
         if self._cam_stream and self._cam_stream.camera:
             self._cam_stream.camera.release()
         super().destroy_node()
@@ -292,6 +341,10 @@ def parse_arguments() -> tuple[argparse.Namespace, list[str]]:
         "--acquisition-records", type=_str2bool, default=False,
         help="Publish per-image acquisition timing, separate from the original image header.",
     )
+    parser.add_argument(
+        "--acquisition-record-dir", type=str, default="",
+        help="Optional local JSONL copy directory; requires --acquisition-records true.",
+    )
     return parser.parse_known_args()
 
 
@@ -311,6 +364,7 @@ def main() -> None:
         compressed_quality=args.compressed_quality,
         timing_diagnostics=args.timing_diagnostics,
         acquisition_records=args.acquisition_records,
+        acquisition_record_dir=args.acquisition_record_dir,
     )
 
     try:
