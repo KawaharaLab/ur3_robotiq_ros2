@@ -71,6 +71,18 @@ def build_plan(settings):
                 raise ValueError('link_trial_speeds requires equal knead loading/unloading speeds')
             if 'release_speed' in k and k['release_speed']!=k['loading_speed']:
                 raise ValueError('link_trial_speeds requires knead release_speed equal to loading_speed')
+    selected_positions = s.get('positions', ['base', 'front', 'back', 'up'])
+    if (not isinstance(selected_positions, list) or not selected_positions
+            or any(p not in ('base', 'front', 'back', 'up') for p in selected_positions)
+            or len(set(selected_positions)) != len(selected_positions)):
+        raise ValueError('positions must be a nonempty list of distinct base/front/back/up values')
+    if type(s.get('quality_check_after_bag', True)) is not bool:
+        raise ValueError('quality_check_after_bag must be boolean')
+    open_clearance_mm = s.get('trial_open_clearance_mm')
+    if open_clearance_mm is not None:
+        number(open_clearance_mm, 'trial_open_clearance_mm', 1., 140.)
+
+
     positions=[dict(id='base',lateral_m=0.,vertical_m=0.),
                dict(id='front',lateral_m=s['offset_m'],vertical_m=0.),
                dict(id='back',lateral_m=-s['offset_m'],vertical_m=0.),
@@ -90,17 +102,26 @@ def build_plan(settings):
                     row.update(preparation_speed=trial_speed,release_speed=trial_speed)
             rng.shuffle(round_rows)
             for row in round_rows:
+                if open_clearance_mm is not None:
+                    row['trial_open_clearance_mm'] = open_clearance_mm
                 row.update(id=p['id']+'_'+str(len(rows)+1).zfill(4),repeat=repeat+1,status='pending',attempts=[]);rows.append(row)
-        result.append(dict(**p,reference=None,trials=rows))
+        if p['id'] in selected_positions:
+            result.append(dict(**p,reference=None,trials=rows))
     return dict(schema_version=1,settings=s,positions=result,plan_id=digest(dict(settings=s,positions=result)))
 
 
 def steps_for_trial(row,width):
-    """Use frozen row speeds; old rows retain legacy preparation/release defaults."""
+    """Use frozen row settings and the calibrated contact width."""
     def step(w,s,f,t,phase):
         if not .001<=w<=.142:raise ValueError('Target width outside 1..142 mm')
         return dict(width_m=w,speed=s,force=f,dwell_s=t,phase=phase)
-    result=[step(.140,row.get('preparation_speed',.3),.1,1.,1)]
+    clearance_mm = row.get('trial_open_clearance_mm')
+    open_width = .140
+    if clearance_mm is not None:
+        open_width = width + clearance_mm / 1000.
+        if not width < open_width <= .142:
+            raise ValueError('Calibrated width plus trial_open_clearance_mm exceeds gripper range or is invalid')
+    result=[step(open_width,row.get('preparation_speed',.3),.1,1.,1)]
     if row['kind']=='run':
         result.append(step(width-2*row['depth_mm']/1000,row['speed'],.5,row['hold_s'],2))
     else:
@@ -109,7 +130,7 @@ def steps_for_trial(row,width):
         for i in range(row['cycles']):
             result.extend([step(deep,row['loading_speed'],.5,row['deep_hold_s'],200+2*i),
                            step(shallow,row['unloading_speed'],.5,row['shallow_hold_s'],201+2*i)])
-    result.append(step(.140,row.get('release_speed',.3),.1,1.,3))
+    result.append(step(open_width,row.get('release_speed',.3),.1,1.,3))
     return result
 
 

@@ -504,9 +504,16 @@ class ObjectAutomationMixin:
                     except BaseException as exc:failed=exc;self._auto_cancel()
                     finally:
                         if self._auto_recording:
-                            self._stop_rosbag();self._auto_recording=False
+                            if self._auto_job['plan']['settings'].get('quality_check_after_bag', True):
+                                self._stop_rosbag()
+                                advisory = getattr(self, '_last_bag_quality', None)
+                            else:
+                                self._stop_rosbag(fast=True)
+                                advisory = dict(status='deferred',
+                                                report=str(self._session_dir/'acquisition_quality.json'),
+                                                issue_count=0)
+                            self._auto_recording = False
                             # Keep quality separate from execution status, including ABORT attempts.
-                            advisory=getattr(self,'_last_bag_quality',None)
                             if advisory:
                                 self._auto_job.setdefault('quality_reports',{})[str(self._session_dir)]=dict(advisory)
                                 for item in batch:
@@ -555,7 +562,8 @@ class ObjectAutomationMixin:
                 self._auto_reference=None
             total=sum(len(p['trials']) for p in self._auto_job['plan']['positions'])
             completed=sum(t['status']=='complete' for p in self._auto_job['plan']['positions'] for t in p['trials'])
-            print(f'Object={self.config.task_name}; trials={total}; complete={completed}; progress={self._auto_job_path}')
+            positions = ', '.join(p['id'] for p in self._auto_job['plan']['positions'])
+            print(f'Object={self.config.task_name}; positions={positions}; trials={total}; complete={completed}; progress={self._auto_job_path}')
             print('Confirm specimen, arm and sensor mounting unchanged for resume. Type GO: ',end='',flush=True)
             if sys.stdin.readline().strip()!='GO':return
             self._auto_save();self._auto_run()

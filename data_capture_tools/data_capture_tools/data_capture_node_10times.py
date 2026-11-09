@@ -486,7 +486,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             print("-" * 40)
             print(" [i]: Init Arm (Move to start pose manually)")
             print(" [s]: Start Single Trial (Record & Run)")
-            print(" [ac]: Automatic whole-object collection (4 positions)")
+            print(" [ac]: Automatic collection (configured positions)")
             print(" [ar]: Resume paused object collection")
             print(" [ai]: Initialize current planned position manually")
             print(" [ae]: Execute Standard Suite")
