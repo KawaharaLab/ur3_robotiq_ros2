@@ -1,6 +1,6 @@
 # Example configuration for data_capture_tools
-output_root: /mnt/nvme1/tsumura/masters_thesis/data
-task_name: object1
+output_root: /mnt/nvme1/tsumura/masters_thesis/test
+task_name: bag_integrity_smoke
 # Optional observations. specimen_id defaults to task_name; no second JSON needed.
 # These values are recorded only and never change target_diameter or motion.
 # Unknown values stay null. Imperfect mounting/reused samples are permitted.
@@ -198,115 +198,9 @@ topics:
 # Whole-object collection: ac starts, ar resumes, ai performs a planned manual init.
 # REQUIRED: choose depths/speeds after representative-object checks; null blocks all motion.
 automatic_collection:
-  # 準備全開・初期押し込み・揉み往復・完全開放を
-  # 各試行の速度条件に統一する。
-  link_trial_speeds: true
-
-  # initで定めた基準に対する片側の公称押し込み量。
-  # グリッパ全幅の閉じ量は、この値の2倍。
-  depths_mm: [2.0, 3.0, 4.0, 5.0, 6.0]
-
-  # 正規化された速度指令。mm/sではない。
-  # 0.0は停止ではなく最低速度。
-  loading_speeds: [0.0, 0.1, 0.2]
-
-  repeats: 2
-  hold_s: 4.0
-
-  # 基準点・前・後・上の4位置。移動量10 mm。
-  offset_m: 0.010
-
-  # 個別の開放速度条件は追加しない。
+  depths_mm: [2.0]
+  loading_speeds: [0.0]
+  repeats: 1
+  knead_conditions: []
   release_speeds: []
-
-  # link_trial_speeds:trueでは使われない互換用設定。
-  release_speed: 0.3
-
-  # 揉み8条件。各条件をrepeats回、各位置で実行。
-  # deep_hold_s / shallow_hold_sは各折り返し位置での保持時間。
-  knead_conditions:
-    - shallow_mm: 2.0
-      deep_mm: 4.0
-      cycles: 5
-      loading_speed: 0.0
-      unloading_speed: 0.0
-      deep_hold_s: 0.1
-      shallow_hold_s: 0.1
-
-    - shallow_mm: 2.0
-      deep_mm: 4.0
-      cycles: 5
-      loading_speed: 0.1
-      unloading_speed: 0.1
-      deep_hold_s: 0.1
-      shallow_hold_s: 0.1
-
-    - shallow_mm: 2.0
-      deep_mm: 4.0
-      cycles: 5
-      loading_speed: 0.0
-      unloading_speed: 0.0
-      deep_hold_s: 0.5
-      shallow_hold_s: 0.5
-
-    - shallow_mm: 2.0
-      deep_mm: 4.0
-      cycles: 5
-      loading_speed: 0.1
-      unloading_speed: 0.1
-      deep_hold_s: 0.5
-      shallow_hold_s: 0.5
-
-    - shallow_mm: 2.0
-      deep_mm: 6.0
-      cycles: 5
-      loading_speed: 0.0
-      unloading_speed: 0.0
-      deep_hold_s: 0.1
-      shallow_hold_s: 0.1
-
-    - shallow_mm: 2.0
-      deep_mm: 6.0
-      cycles: 5
-      loading_speed: 0.1
-      unloading_speed: 0.1
-      deep_hold_s: 0.1
-      shallow_hold_s: 0.1
-
-    - shallow_mm: 2.0
-      deep_mm: 6.0
-      cycles: 5
-      loading_speed: 0.0
-      unloading_speed: 0.0
-      deep_hold_s: 0.5
-      shallow_hold_s: 0.5
-
-    - shallow_mm: 2.0
-      deep_mm: 6.0
-      cycles: 5
-      loading_speed: 0.1
-      unloading_speed: 0.1
-      deep_hold_s: 0.5
-      shallow_hold_s: 0.5
-
-  # 各試行の無荷重基準に対する左右Fy変化の絶対値。
-  # 大きい側が30 N以上の状態が5 ms続いた場合に中断。
-  hard_limit_n: 30.0
-  force_limit_confirm_ms: 5.0
-
-  rest_s: 0.8
-  completion_settle_s: 1.5
-
-  # 条件順序の再現用
-  seed: 20261028
-
-  # 最大10試行ごとにbagを切り替える。
-  batch_size: 10
-
-  # 現在検証済みの監視・再生設定を維持。
-  force_timeout_s: 0.25
-  image_timeout_s: 0.5
-  min_free_gib: 5.0
-  require_timing: true
-  auto_init: true
-  auto_play: true
+  batch_size: 1
