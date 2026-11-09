@@ -72,8 +72,7 @@ stop_key: q
 gelsight_local_records: true
 bag_record:
   storage: sqlite3
-  compression_mode: file
-  compression_format: zstd
+  # Keep the closed SQLite source available for verification.
 topics:
   # Raw commanded register targets; return events are not physical completion.
   - name: /robotiq_2f_gripper/command_event

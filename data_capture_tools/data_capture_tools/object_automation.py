@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 import select
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -391,7 +392,32 @@ class ObjectAutomationMixin:
         if missing:raise Paused('Bag has no messages: '+', '.join(missing))
         logs='\n'.join(p.read_text(errors='replace') for p in (self._session_dir/'logs').glob('rosbag_*.log'))
         if '[ERROR]' in logs or 'Messages lost' in logs:raise Paused('Bag recorder reported errors/loss; review logs')
-        return dict(topic_counts=counts,note='Aggregate bag counts plus live health checks; not proof of zero losses or physical synchronization')
+        from .acquisition_quality import databases
+        import sqlite3
+        from collections import Counter
+        from contextlib import closing
+
+        actual_counts = Counter()
+        checked_files = 0
+        try:
+            with databases(self._bag_uri) as paths:
+                for path in paths:
+                    uri = path.resolve().as_uri() + '?mode=ro'
+                    with closing(sqlite3.connect(uri, uri=True)) as connection:
+                        if connection.execute('PRAGMA quick_check(1)').fetchall() != [('ok',)]:
+                            raise ValueError(f'SQLite quick_check failed: {path.name}')
+                        rows = connection.execute(
+                            'SELECT t.name, COUNT(*) FROM messages m '
+                            'LEFT JOIN topics t ON m.topic_id = t.id GROUP BY t.name'
+                        )
+                        actual_counts.update(dict(rows))
+                    checked_files += 1
+        except (OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
+            raise Paused(f'Bag unreadable after recording: {exc}') from exc
+        if not checked_files or actual_counts != Counter({t: n for t, n in counts.items() if n}):
+            raise Paused('Bag message counts differ from metadata; review saved recording')
+        return dict(topic_counts=counts, integrity_checked_files=checked_files,
+                    note='SQLite quick_check and message counts verified; sensor quality is reported separately')
 
     def _auto_start_bag(self,position):
         configured={t.name for t in self.config.topics}
