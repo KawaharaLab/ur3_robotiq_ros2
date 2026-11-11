@@ -1,5 +1,7 @@
 """Snapshot warm-up, optional-failure and process ownership regressions. No hardware."""
 import importlib.util
+import io
+from contextlib import redirect_stderr, redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -30,7 +32,10 @@ def load(name, path):
 
 
 snapshot = load('data_capture_tools.context_snapshot', OVERLAY/'data_capture_tools/data_capture_tools/context_snapshot.py')
-automation = load('data_capture_tools._snapshot_automation_test', OVERLAY/'data_capture_tools/data_capture_tools/object_automation.py')
+automation_path = OVERLAY/'data_capture_tools/data_capture_tools/object_automation.py'
+if not automation_path.exists():
+    automation_path = REPO/'data_capture_tools/data_capture_tools/object_automation.py'
+automation = load('data_capture_tools._snapshot_automation_test', automation_path)
 
 
 class Process:
@@ -74,16 +79,24 @@ class CaptureTests(unittest.TestCase):
         if cv2 is None or np is None:
             self.skipTest('OpenCV/NumPy needed')
         callbacks = {}
+        cleanup = []
         node = NS(create_subscription=lambda typ,topic,cb,qos: callbacks.setdefault(topic, cb),
-                  destroy_node=lambda: None)
-        context = NS(ok=lambda: True, shutdown=lambda: None)
+                  destroy_node=lambda: cleanup.append('node'))
+        context = NS(ok=lambda: True, shutdown=lambda: cleanup.append('context'))
         message = NS(header=NS(stamp=NS(sec=42,nanosec=123),frame_id='wrist'))
         process = Process()
         ticks = iter(n*.5 for n in range(100))
-        def spin(node, timeout_sec):
+        def spin(timeout_sec):
             callback = next(cb for topic,cb in callbacks.items() if topic.endswith('image_raw'))
             callback(message)
-        modules = {'rclpy': NS(init=lambda **kwargs: None, create_node=lambda *a,**kw: node, spin_once=spin),
+        def executor_factory(*, context):
+            self.assertIs(context, expected_context)
+            return NS(add_node=lambda value: self.assertIs(value, node), spin_once=spin,
+                      shutdown=lambda **kw: cleanup.append('executor'))
+        expected_context = context
+        modules = {'rclpy': NS(init=lambda **kwargs: None, create_node=lambda *a,**kw: node,
+                              spin_once=lambda **kw: self.fail('Global spin must not be used')),
+            'rclpy.executors': NS(SingleThreadedExecutor=executor_factory),
             'rclpy.context': NS(Context=lambda: context),
             'rclpy.signals': NS(SignalHandlerOptions=NS(NO=0)),
             'rclpy.qos': NS(qos_profile_sensor_data=None),
@@ -101,7 +114,16 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(result['discarded_frames'], 2)
             self.assertTrue(result['camera_stop_confirmed'])
             self.assertEqual(process.returncode, 0)
+            self.assertEqual(cleanup, ['executor', 'node', 'context'])
             self.assertIsNotNone(cv2.imread(str(Path(tmp)/'snapshot/wrist.jpg')))
+    def test_cli_prints_original_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            error_output = io.StringIO()
+            with patch.object(snapshot, 'capture', return_value=dict(status='failed',error='RuntimeError: original failure')), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(error_output):
+                result = snapshot.main(['--out', str(Path(tmp)/'snapshot')])
+            self.assertEqual(result, 1)
+            self.assertIn('RuntimeError: original failure', error_output.getvalue())
     def test_existing_image_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp);(path/'wrist.jpg').write_bytes(b'original')

@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
+import traceback
 import time
 
 from .object_plan import atomic_json
@@ -52,13 +54,14 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
                   purpose='Object/mounting reference image before automatic collection',
                   snapshot_stage='Stationary arm pose before automatic run begins or resumes',
                   camera_stop_confirmed=False)
-    process = node = context = None
+    process = node = context = executor = None
     try:
         import cv2
         import rclpy
         from ament_index_python.packages import get_package_prefix
         from cv_bridge import CvBridge
         from rclpy.context import Context
+        from rclpy.executors import SingleThreadedExecutor
         from rclpy.signals import SignalHandlerOptions
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CameraInfo, Image
@@ -72,6 +75,8 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
         context = Context()
         rclpy.init(args=[], context=context, signal_handler_options=SignalHandlerOptions.NO)
         node = rclpy.create_node('context_snapshot_receiver', context=context)
+        executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
         bridge = CvBridge()
         received = dict(first_at=None, frames=0, image=None, camera_info=None)
 
@@ -111,7 +116,7 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError('No warmed-up wrist image before timeout; see camera.log')
-                rclpy.spin_once(node, timeout_sec=min(.1, remaining))
+                executor.spin_once(timeout_sec=min(.1, remaining))
             success, jpeg = cv2.imencode('.jpg', received['image'], [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not success:
                 raise ValueError('JPEG encoding failed')
@@ -120,7 +125,8 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
             report.update(status='saved', image='wrist.jpg', jpeg_quality=95,
                           camera_info=received['camera_info'])
     except (Exception, KeyboardInterrupt) as exc:
-        report.update(status='failed', error=type(exc).__name__ + ': ' + str(exc))
+        report.update(status='failed', error=type(exc).__name__ + ': ' + str(exc),
+                      traceback=traceback.format_exc())
     finally:
         try:
             report['camera_exit_code'] = stop_camera(process)
@@ -128,12 +134,20 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
         except Exception as exc:
             report.update(status='failed', cleanup_error=str(exc))
         try:
+            if executor is not None:
+                executor.shutdown(timeout_sec=2.)
+        except Exception as exc:
+            report.update(status='failed', executor_cleanup_error=str(exc))
+        try:
             if node is not None:
                 node.destroy_node()
+        except Exception as exc:
+            report.update(status='failed', receiver_cleanup_error=str(exc))
+        try:
             if context is not None and context.ok():
                 context.shutdown()
         except Exception as exc:
-            report.update(status='failed', receiver_cleanup_error=str(exc))
+            report.update(status='failed', context_cleanup_error=str(exc))
         report['finished_time_ns'] = time.time_ns()
         atomic_json(directory / 'metadata.json', report)
     return report
@@ -160,6 +174,10 @@ def main(argv=None):
     finally:
         signal.signal(signal.SIGTERM, previous)
     print('Context snapshot ' + report['status'] + ': ' + str(args.out.resolve()), flush=True)
+    for key in ('error', 'cleanup_error', 'executor_cleanup_error',
+                'receiver_cleanup_error', 'context_cleanup_error'):
+        if report.get(key):
+            print(key + ': ' + report[key], file=sys.stderr, flush=True)
     return 0 if report['status'] == 'saved' else 1
 
 
