@@ -53,6 +53,7 @@ class CaptureTests(unittest.TestCase):
         command = snapshot.camera_command('/driver', 'ac_context_123', '143122066280')
         self.assertIn('serial_no:=_143122066280', command)
         self.assertIn('enable_depth:=false', command)
+        self.assertIn('rgb_camera.color_profile:=640x480x15', command)
         self.assertIn('__ns:=/ac_context_123', command)
         self.assertNotIn('/camera_wrist', ' '.join(command))
     def test_missing_dependencies_yields_failure_metadata(self):
@@ -112,6 +113,7 @@ class CaptureTests(unittest.TestCase):
                 result = snapshot.capture(Path(tmp)/'snapshot', snapshot.DEFAULT_SERIAL)
             self.assertEqual(result['status'], 'saved', result)
             self.assertEqual(result['discarded_frames'], 2)
+            self.assertEqual(result['received_frames'], 3)
             self.assertTrue(result['camera_stop_confirmed'])
             self.assertEqual(process.returncode, 0)
             self.assertEqual(cleanup, ['executor', 'node', 'context'])

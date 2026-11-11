@@ -39,7 +39,7 @@ def camera_command(executable, namespace, serial_no):
             '-p', 'enable_color:=true', '-p', 'enable_depth:=false',
             '-p', 'enable_infra1:=false', '-p', 'enable_infra2:=false',
             '-p', 'enable_gyro:=false', '-p', 'enable_accel:=false',
-            '-p', 'rgb_camera.color_profile:=640x360x15']
+            '-p', 'rgb_camera.color_profile:=640x480x15']
 
 
 def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
@@ -49,12 +49,13 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
     if (directory / 'metadata.json').exists() or (directory / 'wrist.jpg').exists():
         raise FileExistsError('Snapshot output exists; choose a new directory')
     report = dict(schema_version=1, status='failed', serial_no=serial_no,
-                  requested_color_profile='640x360x15', warmup_s=warmup_s,
+                  requested_color_profile='640x480x15', warmup_s=warmup_s,
                   timeout_s=timeout_s, started_time_ns=time.time_ns(),
                   purpose='Object/mounting reference image before automatic collection',
                   snapshot_stage='Stationary arm pose before automatic run begins or resumes',
                   camera_stop_confirmed=False)
     process = node = context = executor = None
+    received = dict(first_at=None, frames=0, image=None, camera_info=None)
     try:
         import cv2
         import rclpy
@@ -78,7 +79,6 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
         executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
         bridge = CvBridge()
-        received = dict(first_at=None, frames=0, image=None, camera_info=None)
 
         def image_callback(message):
             now = time.monotonic()
@@ -115,6 +115,13 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
                     raise RuntimeError('Temporary RealSense driver exited; see camera.log')
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    try:
+                        report['image_publishers'] = node.count_publishers(topic)
+                        report['observed_camera_topics'] = [dict(name=name, types=types)
+                            for name, types in node.get_topic_names_and_types()
+                            if name.startswith('/' + namespace + '/')]
+                    except Exception as exc:
+                        report['graph_inspection_error'] = str(exc)
                     raise TimeoutError('No warmed-up wrist image before timeout; see camera.log')
                 executor.spin_once(timeout_sec=min(.1, remaining))
             success, jpeg = cv2.imencode('.jpg', received['image'], [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -148,6 +155,7 @@ def capture(directory, serial_no, warmup_s=2., timeout_s=20.):
                 context.shutdown()
         except Exception as exc:
             report.update(status='failed', context_cleanup_error=str(exc))
+        report['received_frames'] = received['frames']
         report['finished_time_ns'] = time.time_ns()
         atomic_json(directory / 'metadata.json', report)
     return report
