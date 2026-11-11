@@ -7,6 +7,8 @@ New plans can link all trial movement speeds, including preparation and release.
 import copy
 import json
 import math
+import os
+import signal
 from pathlib import Path
 import select
 import shutil
@@ -539,6 +541,79 @@ class ObjectAutomationMixin:
             self._auto_active=False;self._auto_armed=False;self._auto_init_offset=None
             self._session_id_override=original_override
 
+    def _auto_capture_context(self):
+        """Optional single photo, before motion/bag; a saved photo survives resume."""
+        from .context_snapshot import DEFAULT_SERIAL
+        previous = self._auto_job.get('context_snapshot', {})
+        if previous.get('status') == 'saved' and Path(previous.get('image_path', '')).is_file():
+            return
+        settings = self.config.raw.get('context_snapshot', {})
+        if not isinstance(settings, dict):
+            self.get_logger().warn('Context snapshot skipped: context_snapshot must be a mapping')
+            return
+        if type(settings.get('enabled', True)) is not bool:
+            self.get_logger().warn('Context snapshot skipped: enabled must be true/false')
+            return
+        if not settings.get('enabled', True):
+            return
+        serial = str(settings.get('serial_no', DEFAULT_SERIAL))
+        root = self._auto_job_path.with_name(self._auto_job_path.stem + '_context')
+        directory = root / ('capture_' + uuid.uuid4().hex[:8])
+        process = None
+        result = dict(status='failed', directory=str(directory), serial_no=serial)
+        self.get_logger().info('Capturing one wrist RealSense reference image before collection...')
+        try:
+            directory.mkdir(parents=True)
+            command = [sys.executable, '-m', 'data_capture_tools.context_snapshot',
+                       '--out', str(directory), '--serial', serial]
+            with (directory / 'capture.log').open('x') as log:
+                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, start_new_session=True)
+                deadline = time.monotonic() + 30.
+                while process.poll() is None:
+                    self._auto_manual()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('Wrist snapshot exceeded 30 seconds')
+                    time.sleep(.05)
+            metadata = json.loads((directory / 'metadata.json').read_text())
+            if (process.returncode != 0 or metadata.get('status') != 'saved'
+                    or not metadata.get('camera_stop_confirmed')
+                    or not (directory / 'wrist.jpg').is_file()):
+                raise RuntimeError(metadata.get('error') or metadata.get('cleanup_error')
+                                   or 'Wrist snapshot failed; see camera.log/capture.log')
+            result.update(status='saved', image_path=str(directory / 'wrist.jpg'),
+                          metadata_path=str(directory / 'metadata.json'))
+            self.get_logger().info('Wrist reference image saved: ' + result['image_path'])
+        except Paused:
+            result['error'] = 'Snapshot interrupted by user'
+            raise
+        except Exception as exc:
+            result['error'] = type(exc).__name__ + ': ' + str(exc)
+            self.get_logger().warn('Reference photo unavailable; collection will continue: ' + str(exc))
+        finally:
+            if process is not None:
+                # The helper and its temporary native camera share this owned group.
+                # Send to the group even if the helper exited unexpectedly.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=3.)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=2.)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self._auto_job.setdefault('context_snapshot_attempts', []).append(result)
+            self._auto_job['context_snapshot'] = result
+            self._auto_save()
+
     def _execute_object_auto(self,resume=False):
         from robotiq_2f_gripper_msgs.msg import RobotActionEvent
         self._auto_event_pub=self.create_publisher(RobotActionEvent,'/robot_action_event',100)
@@ -566,7 +641,9 @@ class ObjectAutomationMixin:
             print(f'Object={self.config.task_name}; positions={positions}; trials={total}; complete={completed}; progress={self._auto_job_path}')
             print('Confirm specimen, arm and sensor mounting unchanged for resume. Type GO: ',end='',flush=True)
             if sys.stdin.readline().strip()!='GO':return
-            self._auto_save();self._auto_run()
+            self._auto_save()
+            self._auto_capture_context()
+            self._auto_run()
         except Exception as exc:self.get_logger().error('Automatic collection not started: '+str(exc))
 
     def _execute_planned_init(self):
