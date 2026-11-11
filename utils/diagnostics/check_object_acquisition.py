@@ -360,7 +360,8 @@ def audit_session(session, selected, target, job_settings, decode_images):
                    and w['start_ns'] == window['start_ns'] and w['end_ns'] == window['end_ns']]
         # Only the number of steps is needed; no calibrated width is inferred here.
         condition = window['conditions']
-        expected = 3 if condition['kind'] == 'run' else 3 + 2 * condition['cycles']
+        # Preparation runs before START; only steps[1:] belong to this window.
+        expected = 2 if condition['kind'] == 'run' else 2 + 2 * condition['cycles']
         actions = matches[0].get('action_event_counts', {}) if len(matches) == 1 else {}
         if actions.get('auto_goal_sent') != expected or actions.get('auto_action_succeeded') != expected:
             finding(issues, 'REVIEW', 'planned_action_count_mismatch', trial_id=window['trial_id'],

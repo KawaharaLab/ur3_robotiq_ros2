@@ -85,7 +85,8 @@ def fixture(root, change=None):
             rows.append([checker.qa.TIMING[side+2],h+200_000,string_record(r)])
     lo,hi=1_100_000_000,2_900_000_000
     rows.extend([[checker.qa.TRIAL,lo,event(lo,'START')],[checker.qa.TRIAL,hi,event(hi,'END')]])
-    for n in range(3):
+    # The preparation action is outside the START/END trial window.
+    for n in range(2):
         for j,name in enumerate(['auto_goal_sent','auto_action_succeeded','auto_dwell_start','auto_dwell_end']):
             h=lo+10_000_000+n*100_000_000+j*10_000_000
             rows.append([checker.qa.ACTION,h,event(h,name,True)])
@@ -140,6 +141,19 @@ class StrictTests(unittest.TestCase):
             return code,summary
     def test_clean_pass(self):
         code,r=self.run_case();self.assertEqual(code,0,r);self.assertEqual(r['status'],'PASS')
+    def test_missing_in_window_action_is_review(self):
+        def change(rows):
+            removed = False
+            result = []
+            for row in rows:
+                if row[0] == checker.qa.ACTION and not removed:
+                    removed = True
+                    continue
+                result.append(row)
+            return result
+        code,r=self.run_case(change)
+        self.assertEqual(code,1,r)
+        self.assertTrue(any(i['code']=='planned_action_count_mismatch' for i in r['sessions'][0]['issues']))
     def test_local_repairs_missing_and_delayed_timing(self):
         def change(rows):return [[t,h+(5_000_000_000 if t==checker.qa.TIMING[0] else 0),p]
             for t,h,p in rows if not (t==checker.qa.TIMING[1] and h==1_533_333_330+200_000)]
