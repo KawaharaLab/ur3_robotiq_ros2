@@ -64,7 +64,7 @@ class PlanTests(unittest.TestCase):
 
 class FakeRunner(ObjectAutomationMixin):
     def __init__(self,root):
-        self.config=NS(output_root=root,raw={});self._auto_job_path=root/'progress.json'
+        self.config=NS(output_root=root,raw={'automatic_retry':{'enabled':False}});self._auto_job_path=root/'progress.json'
         s=settings();s.update(depths_mm=[1.],loading_speeds=[.1],repeats=2,batch_size=2)
         self._auto_job=dict(job_id='test',plan=build_plan(s));self._auto_reference=None
         self._session_id_override='';self._auto_action=NS(wait_for_server=lambda **k:True)
@@ -118,6 +118,7 @@ class RecoveryTests(unittest.TestCase):
 class HealthTests(unittest.TestCase):
     def node(self,root):
         n=FakeRunner(root);n._auto_job['plan']['settings']['require_timing']=False
+        n._auto_job['plan']['settings']['hard_limit_n']=20.
         n._auto_robot_mode=7;n._auto_safety_mode=1
         n._auto_armed=True;n._auto_force_fault=None;n._auto_abort_reason=None;n._auto_manual=lambda:None
         n._auto_reference={'joints':[0.]*6,'driver_id':'driver'};n._current_joints=[0.]*6

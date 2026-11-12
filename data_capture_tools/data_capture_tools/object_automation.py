@@ -459,7 +459,130 @@ class ObjectAutomationMixin:
         attempt.update(status='awaiting_bag',end_ros_ns=self.get_clock().now().nanoseconds)
         row['status']='awaiting_bag';self._auto_save()
 
+    def _auto_retry_policy(self):
+        policy = dict(enabled=True, max_per_trial=3, max_per_run=20,
+                      wait_timeout_s=30., stable_s=2., minimum_wait_s=2.)
+        configured = self.config.raw.get('automatic_retry', {})
+        if not isinstance(configured, dict):
+            raise ValueError('automatic_retry must be a mapping')
+        unknown = set(configured) - set(policy)
+        if unknown:
+            raise ValueError('Unknown automatic_retry settings: ' + str(sorted(unknown)))
+        policy.update(configured)
+        if type(policy['enabled']) is not bool:
+            raise ValueError('automatic_retry.enabled must be boolean')
+        for name in ('max_per_trial', 'max_per_run'):
+            if type(policy[name]) is not int or not 0 <= policy[name] <= 100:
+                raise ValueError('Invalid automatic_retry.' + name)
+        for name in ('wait_timeout_s', 'stable_s', 'minimum_wait_s'):
+            value = policy[name]
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 300:
+                raise ValueError('Invalid automatic_retry.' + name)
+        if policy['wait_timeout_s'] < max(policy['stable_s'], policy['minimum_wait_s']):
+            raise ValueError('automatic_retry.wait_timeout_s is too short')
+        return policy
+
+    @staticmethod
+    def _auto_retryable_reason(exc):
+        if not isinstance(exc, Paused):
+            return False
+        reason = str(exc)
+        return reason.startswith((
+            'Missing/stale/undecodable GelSight ',
+            'Invalid image header age ', 'Stale force ',
+            'Invalid force header age ', 'Acquisition timing missing ',
+            'Recorder subscription not discovered: ',
+        ))
+
+    def _auto_retry_wait(self, policy, record):
+        """No motion while waiting. Freshness/pose/fault guards remain active."""
+        started = time.monotonic()
+        stable = None
+        last = record['reason']
+        self._auto_active = True  # Monitoring callbacks must continue during the wait.
+        self._auto_armed = getattr(self, '_auto_retry_force_armed', False)
+        self._auto_recording = False
+        try:
+            while time.monotonic() - started < policy['wait_timeout_s']:
+                self._auto_manual()
+                # A force-limit trigger can coexist with the original image fault.
+                if self._auto_force_fault:
+                    raise Paused(self._auto_force_fault)
+                if self._auto_goal is not None or self._auto_uncertain_goal:
+                    raise Paused('Unconfirmed gripper goal; automatic retry blocked')
+                try:
+                    self._auto_health(check_force=True)
+                    if stable is None:
+                        stable = time.monotonic()
+                    now = time.monotonic()
+                    if (now - stable >= policy['stable_s']
+                            and now - started >= policy['minimum_wait_s']):
+                        return
+                except Paused as exc:
+                    if not self._auto_retryable_reason(exc):
+                        raise
+                    stable = None
+                    last = str(exc)
+                time.sleep(.05)
+            raise Paused('Automatic retry recovery timeout: ' + last)
+        finally:
+            self._auto_active = False
+            self._auto_armed = False
+
     def _auto_run(self):
+        try:
+            policy = self._auto_retry_policy()
+        except ValueError as exc:
+            self.get_logger().error(str(exc))
+            return
+        counts = {}
+        total = 0
+        while True:
+            exc = self._auto_run_once()
+            if exc is None:
+                return
+            if (not policy['enabled'] or not self._auto_retryable_reason(exc)
+                    or getattr(self, '_auto_retry_blocked', False)
+                    or getattr(self, '_auto_uncertain_goal', False)
+                    or getattr(self, '_auto_recording', False)
+                    or getattr(self, '_auto_goal', None) is not None
+                    or getattr(self, '_auto_force_fault', None)):
+                return
+            pending = [(p['id'], r['id']) for p in self._auto_job['plan']['positions']
+                       for r in p['trials'] if r['status'] != 'complete']
+            if not pending:
+                return
+            key = pending[0]
+            if counts.get(key, 0) >= policy['max_per_trial'] or total >= policy['max_per_run']:
+                self._auto_job['automatic_retry_stop']=dict(reason='retry_limit', trial_id=key[1], total=total, ros_ns=self.get_clock().now().nanoseconds)
+                self._auto_save()
+                self.get_logger().warn('Automatic retry limit reached; use ar after inspection.')
+                return
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+            record = dict(position_id=key[0], trial_id=key[1], reason=str(exc),
+                          retry_for_trial=counts[key], retry_in_run=total,
+                          requested_ros_ns=self.get_clock().now().nanoseconds,
+                          policy=dict(policy), status='waiting')
+            self._auto_job.setdefault('automatic_retries', []).append(record)
+            self._auto_save()
+            self.get_logger().warn('Automatic retry: waiting for stable sensors, no motion; '
+                                   + key[1] + ', attempt ' + str(counts[key]))
+            try:
+                self._auto_retry_wait(policy, record)
+            except BaseException as recovery_error:
+                record.update(status='manual_required', reason_after_wait=str(recovery_error),
+                              finished_ros_ns=self.get_clock().now().nanoseconds)
+                self._auto_job.update(status='paused', pause_reason=str(recovery_error))
+                self._auto_save()
+                self.get_logger().error('Automatic retry stopped: ' + str(recovery_error) + '; use ar after recovery.')
+                return
+            record.update(status='recovered', finished_ros_ns=self.get_clock().now().nanoseconds)
+            self._auto_save()
+            self.get_logger().info('Sensors stable; retrying unfinished trial from preparation, without repeating saved init.')
+
+    def _auto_run_once(self):
+        self._auto_retry_blocked=False
         self._auto_active=True;self._auto_armed=False;self._auto_recording=False;self._auto_force_fault=None
         self._auto_abort_reason=None;self._auto_expected_streams={}
         original_override=self._session_id_override
@@ -473,7 +596,11 @@ class ObjectAutomationMixin:
             for position in self._auto_job['plan']['positions']:
                 pending=[t for t in position['trials'] if t['status']!='complete']
                 if not pending:continue
-                if position['reference'] is None:self._auto_init_position(position)
+                if position['reference'] is None:
+                    try:self._auto_init_position(position)
+                    except BaseException:
+                        self._auto_retry_blocked=True
+                        raise
                 self._auto_check_reference(position['reference'])
                 # Every position's candidate widths are checked before trial motion.
                 for row in pending:steps_for_trial(row,self._effective_object_width_m)
@@ -492,6 +619,7 @@ class ObjectAutomationMixin:
                             try:self._auto_execute_trial(row,attempt);finished.append(row)
                             except BaseException as exc:
                                 stopped=self._auto_cancel()
+                                if not stopped:self._auto_retry_blocked=True
                                 if str(exc).startswith('Force hard limit') and stopped:
                                     try:
                                         self._auto_armed=False
@@ -527,6 +655,7 @@ class ObjectAutomationMixin:
                                 for row in finished:
                                     row['status']='complete';row['attempts'][-1].update(status='complete',bag_quality=quality)
                             except BaseException as exc:
+                                self._auto_retry_blocked=True
                                 for row in finished:row['status']='pending';row['attempts'][-1].update(status='recording_unverified',reason=str(exc))
                                 if failed is None:failed=exc
                             self._auto_save()
@@ -535,9 +664,12 @@ class ObjectAutomationMixin:
             self._auto_job['status']='complete';self._auto_save()
             self.get_logger().info('Object collection complete: '+str(self._auto_job_path))
         except BaseException as exc:
-            self._auto_cancel();self._auto_job.update(status='paused',pause_reason=type(exc).__name__+': '+str(exc));self._auto_save()
+            if not self._auto_cancel():self._auto_retry_blocked=True
+            self._auto_job.update(status='paused',pause_reason=type(exc).__name__+': '+str(exc));self._auto_save()
             self.get_logger().error('Collection paused: '+str(exc)+'; resolve the reported cause, then ar. Progress: '+str(self._auto_job_path))
+            return exc
         finally:
+            self._auto_retry_force_armed=self._auto_armed
             self._auto_active=False;self._auto_armed=False;self._auto_init_offset=None
             self._session_id_override=original_override
 
