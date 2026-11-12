@@ -605,6 +605,11 @@ def main(argv=None):
     )
     parser.add_argument("--max-trials", type=int)
     parser.add_argument("--absolute-force", action="store_true")
+    parser.add_argument(
+        "--compact-layout",
+        action="store_true",
+        help="Keep trial and comparison PNGs one level below --out",
+    )
     args = parser.parse_args(argv)
     if args.out.exists():
         parser.error("--out exists; choose a new directory")
@@ -697,6 +702,8 @@ def main(argv=None):
                     directory = (
                         output / "trials" / safe_name(object_id) / kind / identity
                     )
+                    if args.compact_layout:
+                        directory = output / "trials"
                     directory.mkdir(parents=True, exist_ok=True)
                     path = directory / (
                         safe_name(job_id)
@@ -770,8 +777,21 @@ def main(argv=None):
             directory = (
                 output / "comparisons" / safe_name(object_id) / safe_name(job_id) / kind
             )
+            if args.compact_layout:
+                directory = output / "comparisons"
             directory.mkdir(parents=True, exist_ok=True)
-            path = directory / (identity + ".png")
+            filename = (
+                safe_name(object_id)
+                + "__"
+                + safe_name(job_id)
+                + "__"
+                + kind
+                + "__"
+                + identity
+                if args.compact_layout
+                else identity
+            )
+            path = directory / (filename + ".png")
             draw_comparison(
                 traces, path, object_id + " | " + label, args.absolute_force
             )
