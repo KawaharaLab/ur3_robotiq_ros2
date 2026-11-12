@@ -93,3 +93,16 @@ The same CLI is available via `/usr/bin/python3 -m data_capture_tools.compact_ex
 No additional extraction YAML is needed for this default GelSight/force view.
 The original JPEG and acquisition coordinates are retained so future processing
 can choose crops, masks, temporal windows and sample rates without recollection.
+
+
+## 波形確認用の補助CSV
+
+新しいextract_allでは、各エクスポート済みセッションへ次の3ファイルを追加する。
+
+- `robot_action_event.csv` に、記録された指令・成功・保持の時刻、phase、目標幅・速度。
+- `gripper_width.csv` に、ドライバが出力した幅mmとbag受信時刻。元メッセージにHeaderがないため、source_stamp_nsは空欄。
+- `gripper_status.csv` に、Header時刻、raw入力レジスタ、読み取り時間。
+
+補助CSVはSTART直前最大0.5秒からENDまで。JPEG・力覚CSV本体のSTART〜ENDという範囲と元の値は維持する。プレビュー時のCSV容量見積もりにも補助CSVを含める。
+
+すでに展開した旧出力も `plot_object_acquisition.py --export-dir <出力先>` で利用できる。補助CSVがない場合は、対応するパネル・動作時刻の表示を省く。新しい補助CSVを得るための再エクスポートは、必要になったときだけ行う。

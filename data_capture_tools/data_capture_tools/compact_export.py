@@ -21,6 +21,16 @@ from .object_plan import atomic_json
 GS = ('/gelsight/left/image_raw/compressed', '/gelsight/right/image_raw/compressed')
 FORCE = ('/force_torque/left', '/force_torque/right')
 EVENT = '/trial_event'
+ACTION = '/robot_action_event'
+WIDTH = '/robotiq_2f_gripper/finger_distance_mm'
+STATUS = '/robotiq_2f_gripper/status'
+AUXILIARY_FIELDS = {
+    'robot_action_event.csv': ['trial_id','source_stamp_ns','bag_receive_ns','frame_id',
+        'event','trial_index','phase_id','action_type','target_position','target_speed','success'],
+    'gripper_width.csv': ['trial_id','source_stamp_ns','bag_receive_ns','frame_id','width_mm'],
+    'gripper_status.csv': ['trial_id','source_stamp_ns','bag_receive_ns','frame_id',
+        'g_obj','g_flt','g_pr','g_po','g_cu','read_duration_ms'],
+}
 IMAGE_FIELDS = ['trial_id','topic','source_stamp_ns','bag_receive_ns','frame_id','database_index',
                 'message_id','format','jpeg_bytes','artifact_path']
 FORCE_FIELDS = ['trial_id','source_stamp_ns','bag_receive_ns','frame_id','database_index','message_id',
@@ -103,6 +113,32 @@ def image_payload(reader):
     return fmt,value
 
 
+def auxiliary_payload(topic, typ, reader, received):
+    """Export actual events/status. Headerless jaw width keeps bag time explicit."""
+    if topic == WIDTH:
+        formats = {'std_msgs/msg/Float32': ('f', 4), 'std_msgs/msg/Float64': ('d', 8)}
+        if typ not in formats:
+            raise ValueError('Unexpected jaw-width type')
+        return 'gripper_width.csv', received, dict(source_stamp_ns='', frame_id='',
+                                                   width_mm=reader.number(*formats[typ]))
+    header, frame_id = sensor_header(reader)
+    values = dict(source_stamp_ns=header, frame_id=frame_id)
+    if topic == ACTION:
+        if typ != 'robotiq_2f_gripper_msgs/msg/RobotActionEvent':
+            raise ValueError('Unexpected action event type')
+        values.update(event=reader.string(), trial_index=reader.number('i', 4),
+                      phase_id=reader.number('i', 4), action_type=reader.string(),
+                      target_position=reader.number('d', 8), target_speed=reader.number('d', 8),
+                      success=bool(reader.number('B', 1)))
+        return 'robot_action_event.csv', header, values
+    if typ != 'robotiq_2f_gripper_msgs/msg/GripperStatus':
+        raise ValueError('Unexpected gripper status type')
+    for field in ('g_obj', 'g_flt', 'g_pr', 'g_po', 'g_cu'):
+        values[field] = reader.number('B', 1)
+    values['read_duration_ms'] = reader.number('f', 4)
+    return 'gripper_status.csv', header, values
+
+
 def copy_sidecars(session,target,write):
     size=0;found=[]
     for name in SIDECARS:
@@ -123,6 +159,7 @@ def export_session(session,selected,target,write=False):
     metas=list((session/'bag').rglob('metadata.yaml'))
     if len(metas)!=1:raise ValueError('Expected one bag metadata.yaml in '+str(session))
     bag=metas[0].parent;events=[];counts=Counter();nonfinite=Counter();jpeg_bytes=0
+    auxiliary_counts = Counter()
     # One split database is decompressed at a time. No JPEG decoding or resampling.
     with databases(bag) as files:
         # Keep paths, not open cursors: decompressed split files are removed when advancing.
@@ -136,20 +173,35 @@ def export_session(session,selected,target,write=False):
     class ByteCounter:
         def __init__(self):self.bytes=0
         def write(self,value):self.bytes+=len(value.encode('utf-8'));return len(value)
-    estimates={key:ByteCounter() for key in ('image_index.csv','force_left.csv','force_right.csv')}
+    csv_fields = {'image_index.csv': IMAGE_FIELDS, 'force_left.csv': FORCE_FIELDS,
+                  'force_right.csv': FORCE_FIELDS}
+    csv_fields.update(AUXILIARY_FIELDS)
+    estimates = {key: ByteCounter() for key in csv_fields}
     if write:
         target.mkdir(parents=True,exist_ok=False)
         atomic_json(target/'manifest.json',dict(status='in_progress',source_bag=str(bag)))
     with ExitStack() as stack:
-        for key,fields in [('image_index.csv',IMAGE_FIELDS),('force_left.csv',FORCE_FIELDS),('force_right.csv',FORCE_FIELDS)]:
+        for key, fields in csv_fields.items():
             stream=stack.enter_context((target/key).open('x',newline='')) if write else estimates[key]
             writers[key]=csv.writer(stream);writers[key].writerow(fields)
         with databases(bag) as files:
             for dbindex,db in enumerate(files):
                 con=sqlite3.connect(db.as_uri()+'?mode=ro',uri=True)
                 try:
-                    query='SELECT m.id,m.timestamp,t.name,t.type,m.data FROM messages m JOIN topics t ON m.topic_id=t.id WHERE t.name IN (?,?,?,?) ORDER BY m.timestamp,m.id'
-                    for mid,bt,topic,typ,payload in con.execute(query,GS+FORCE):
+                    selected_topics = GS + FORCE + (ACTION, WIDTH, STATUS)
+                    query = ('SELECT m.id,m.timestamp,t.name,t.type,m.data FROM messages m '
+                             'JOIN topics t ON m.topic_id=t.id WHERE t.name IN ('
+                             + ','.join('?' for _ in selected_topics) + ') ORDER BY m.timestamp,m.id')
+                    for mid,bt,topic,typ,payload in con.execute(query,selected_topics):
+                        if topic in (ACTION, WIDTH, STATUS):
+                            key, header, values = auxiliary_payload(topic, typ, CDR(payload), bt)
+                            window = next((w for w in windows if max(w['attempt']['start_ros_ns'],
+                                w['start_ns']-500_000_000) <= header <= w['end_ns']), None)
+                            if window is not None:
+                                values.update(trial_id=window['trial_id'], bag_receive_ns=bt)
+                                writers[key].writerow([values[field] for field in csv_fields[key]])
+                                auxiliary_counts[window['trial_id']+'|'+topic] += 1
+                            continue
                         expected='sensor_msgs/msg/CompressedImage' if topic in GS else 'geometry_msgs/msg/WrenchStamped'
                         if typ!=expected:raise ValueError('Unexpected type: '+topic)
                         reader=CDR(payload);h,frame_id=sensor_header(reader)
@@ -178,6 +230,9 @@ def export_session(session,selected,target,write=False):
         source_metadata_sha256=fingerprint(metas[0]),exporter_sha256=fingerprint(__file__),
         selection='Final complete attempts; TrialEvent START/END publisher headers; no contact inference or padding',
         windows=windows,message_counts=dict(counts),missing_trial_topics=missing,nonfinite_force_samples=dict(nonfinite),
+        auxiliary_schema_version=1, auxiliary_csvs=list(AUXILIARY_FIELDS),
+        auxiliary_message_counts=dict(auxiliary_counts),
+        auxiliary_window_basis='Up to 0.5 seconds before START, bounded by attempt start, through END',
         original_jpeg_bytes=jpeg_bytes,session_sidecar_bytes=sidecar_bytes,sidecars=sidecars,
         csv_bytes=sum((target/k).stat().st_size for k in estimates) if write else sum(v.bytes for v in estimates.values()),
         image_policy='Exact JPEG payload; no decoding, resizing, transcoding or downsampling',

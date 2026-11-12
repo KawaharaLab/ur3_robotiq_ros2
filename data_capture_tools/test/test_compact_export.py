@@ -116,4 +116,43 @@ class CompactTests(unittest.TestCase):
         self.assertEqual((self.root/'copied/session_records/gelsight_acquisition_records/left.jsonl').read_text(),'original timing\n')
         self.assertEqual(r['session_sidecar_bytes'],len('original timing\n'))
 
+    def test_auxiliary_csvs_preserve_real_values_and_time_bases(self):
+        connection = sqlite3.connect(self.bag/'source.db3')
+        topics = [(module.ACTION, 'robotiq_2f_gripper_msgs/msg/RobotActionEvent'),
+                  (module.WIDTH, 'std_msgs/msg/Float32'),
+                  (module.STATUS, 'robotiq_2f_gripper_msgs/msg/GripperStatus')]
+        for index, (topic, typ) in enumerate(topics, 6):
+            connection.execute('INSERT INTO topics VALUES(?,?,?)', (index, topic, typ))
+        action = (Encoder().header(195).string('auto_goal_sent').number('i',4,1)
+                  .number('i',4,1).string('gripper').number('d',8,.04)
+                  .number('d',8,.1).number('B',1,1))
+        width = Encoder().number('f',4,23.5)
+        status = Encoder().header(230)
+        for value in (0, 0, 180, 175, 5):
+            status.number('B',1,value)
+        status.number('f',4,6.5)
+        connection.executemany('INSERT INTO messages(topic_id,timestamp,data) VALUES(?,?,?)',
+                               [(6,1195,action.finish()), (7,250,width.finish()), (8,1230,status.finish())])
+        connection.commit();connection.close()
+        preview = module.export_session(self.session,self.selected,self.root/'unused',False)
+        output = self.root/'auxiliary'
+        result = module.export_session(self.session,self.selected,output,True)
+        self.assertEqual(result['csv_bytes'],preview['csv_bytes'])
+        with (output/'robot_action_event.csv').open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row['source_stamp_ns'],'195')
+        self.assertEqual(row['event'],'auto_goal_sent')
+        self.assertEqual(row['trial_id'],'base_0001')
+        with (output/'gripper_width.csv').open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row['source_stamp_ns'],'')
+        self.assertEqual(row['bag_receive_ns'],'250')
+        self.assertEqual(float(row['width_mm']),23.5)
+        with (output/'gripper_status.csv').open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row['source_stamp_ns'],'230')
+        self.assertEqual(row['g_po'],'175')
+        self.assertEqual(float(row['read_duration_ms']),6.5)
+        self.assertEqual(len(list(output.rglob('*.jpg'))),6)
+
 if __name__=='__main__':unittest.main()
