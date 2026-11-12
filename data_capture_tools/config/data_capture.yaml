@@ -289,9 +289,9 @@ automatic_collection:
       shallow_hold_s: 0.5
 
   # 各試行の無荷重基準に対する左右Fy変化の絶対値。
-  # 大きい側が30 N以上の状態が5 ms続いた場合に中断。
+  # 大きい側が30 N以上の状態が10 ms続いた場合に中断。
   hard_limit_n: 30.0
-  force_limit_confirm_ms: 5.0
+  force_limit_confirm_ms: 10.0
 
   trial_open_clearance_mm: 15.0
   completion_settle_s: 1.5
