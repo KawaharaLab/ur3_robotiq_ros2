@@ -535,18 +535,35 @@ class ObjectAutomationMixin:
         except ValueError as exc:
             self.get_logger().error(str(exc))
             return
+        runtime = dict(pid=os.getpid(), source_file=__file__, diagnostic_version=1,
+                       started_ros_ns=self.get_clock().now().nanoseconds, policy=dict(policy))
+        previous_stop = self._auto_job.pop('automatic_retry_stop', None)
+        if previous_stop:self._auto_job['last_automatic_retry_stop'] = previous_stop
+        self._auto_job['automatic_retry_runtime'] = runtime
+        self._auto_save()
+        self.get_logger().info('Automatic retry policy active: ' + json.dumps(runtime, ensure_ascii=False))
         counts = {}
         total = 0
         while True:
             exc = self._auto_run_once()
             if exc is None:
                 return
-            if (not policy['enabled'] or not self._auto_retryable_reason(exc)
-                    or getattr(self, '_auto_retry_blocked', False)
-                    or getattr(self, '_auto_uncertain_goal', False)
-                    or getattr(self, '_auto_recording', False)
-                    or getattr(self, '_auto_goal', None) is not None
-                    or getattr(self, '_auto_force_fault', None)):
+            blocked = []
+            if not policy['enabled']:blocked.append('disabled_by_configuration')
+            if not self._auto_retryable_reason(exc):blocked.append('reason_not_retryable')
+            if getattr(self, '_auto_retry_blocked', False):
+                blocked.append(getattr(self, '_auto_retry_block_reason', None) or 'stop_init_or_bag_verification_failed')
+            if getattr(self, '_auto_uncertain_goal', False):blocked.append('unconfirmed_gripper_goal')
+            if getattr(self, '_auto_recording', False):blocked.append('recorder_not_closed')
+            if getattr(self, '_auto_goal', None) is not None:blocked.append('gripper_goal_still_present')
+            if getattr(self, '_auto_force_fault', None):blocked.append('latched_force_fault: ' + self._auto_force_fault)
+            if blocked:
+                record = dict(reason='blocked', causes=blocked, original_pause_reason=str(exc),
+                              ros_ns=self.get_clock().now().nanoseconds, runtime=runtime)
+                self._auto_job['automatic_retry_stop'] = record
+                self._auto_job.setdefault('automatic_retry_decisions', []).append(record)
+                self._auto_save()
+                self.get_logger().warn('Automatic retry skipped: ' + '; '.join(blocked))
                 return
             pending = [(p['id'], r['id']) for p in self._auto_job['plan']['positions']
                        for r in p['trials'] if r['status'] != 'complete']
@@ -582,7 +599,7 @@ class ObjectAutomationMixin:
             self.get_logger().info('Sensors stable; retrying unfinished trial from preparation, without repeating saved init.')
 
     def _auto_run_once(self):
-        self._auto_retry_blocked=False
+        self._auto_retry_blocked=False;self._auto_retry_block_reason=None
         self._auto_active=True;self._auto_armed=False;self._auto_recording=False;self._auto_force_fault=None
         self._auto_abort_reason=None;self._auto_expected_streams={}
         original_override=self._session_id_override
@@ -592,6 +609,8 @@ class ObjectAutomationMixin:
             self._auto_await_ready()
             if not self._init_startup or not self._init_startup.get('cancel_stops_motion',False):raise Paused('Rebuild/restart updated gripper driver before automated motion')
             if self._init_startup.get('fake_hardware',False):raise Paused('Real gripper hardware required')
+            old_reason=self._auto_job.pop('pause_reason',None)
+            if old_reason:self._auto_job['last_pause_reason']=old_reason
             self._auto_job['status']='running';self._auto_save()
             for position in self._auto_job['plan']['positions']:
                 pending=[t for t in position['trials'] if t['status']!='complete']
@@ -599,7 +618,7 @@ class ObjectAutomationMixin:
                 if position['reference'] is None:
                     try:self._auto_init_position(position)
                     except BaseException:
-                        self._auto_retry_blocked=True
+                        self._auto_retry_blocked=True;self._auto_retry_block_reason='init_failed'
                         raise
                 self._auto_check_reference(position['reference'])
                 # Every position's candidate widths are checked before trial motion.
@@ -619,7 +638,8 @@ class ObjectAutomationMixin:
                             try:self._auto_execute_trial(row,attempt);finished.append(row)
                             except BaseException as exc:
                                 stopped=self._auto_cancel()
-                                if not stopped:self._auto_retry_blocked=True
+                                if not stopped:
+                                    self._auto_retry_blocked=True;self._auto_retry_block_reason='stop_unconfirmed'
                                 if str(exc).startswith('Force hard limit') and stopped:
                                     try:
                                         self._auto_armed=False
@@ -655,7 +675,7 @@ class ObjectAutomationMixin:
                                 for row in finished:
                                     row['status']='complete';row['attempts'][-1].update(status='complete',bag_quality=quality)
                             except BaseException as exc:
-                                self._auto_retry_blocked=True
+                                self._auto_retry_blocked=True;self._auto_retry_block_reason='bag_verification_failed: '+str(exc)
                                 for row in finished:row['status']='pending';row['attempts'][-1].update(status='recording_unverified',reason=str(exc))
                                 if failed is None:failed=exc
                             self._auto_save()
@@ -664,7 +684,8 @@ class ObjectAutomationMixin:
             self._auto_job['status']='complete';self._auto_save()
             self.get_logger().info('Object collection complete: '+str(self._auto_job_path))
         except BaseException as exc:
-            if not self._auto_cancel():self._auto_retry_blocked=True
+            if not self._auto_cancel():
+                self._auto_retry_blocked=True;self._auto_retry_block_reason='stop_unconfirmed'
             self._auto_job.update(status='paused',pause_reason=type(exc).__name__+': '+str(exc));self._auto_save()
             self.get_logger().error('Collection paused: '+str(exc)+'; resolve the reported cause, then ar. Progress: '+str(self._auto_job_path))
             return exc

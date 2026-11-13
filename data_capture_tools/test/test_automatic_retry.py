@@ -112,6 +112,37 @@ class RetryTests(unittest.TestCase):
                 self.assertEqual(n.waits, [])
                 self.assertEqual(n._auto_job["status"], "paused")
 
+    def test_blocked_retry_reason_is_saved_and_live_runtime_is_identified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = self.runner(Path(tmp))
+            n.fail_once = True
+
+            def cancel():
+                n._auto_uncertain_goal = True
+                return False
+
+            n._auto_cancel = cancel
+            n._auto_run()
+            self.assertIn(
+                "unconfirmed_gripper_goal",
+                n._auto_job["automatic_retry_stop"]["causes"],
+            )
+            self.assertIn(
+                "stop_unconfirmed", n._auto_job["automatic_retry_stop"]["causes"]
+            )
+            self.assertEqual(
+                n._auto_job["automatic_retry_runtime"]["diagnostic_version"], 1
+            )
+            self.assertEqual(len(n._auto_job["automatic_retry_decisions"]), 1)
+
+    def test_old_pause_reason_is_not_shown_as_current_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n = self.runner(Path(tmp))
+            n._auto_job["pause_reason"] = "old transient fault"
+            n._auto_run()
+            self.assertNotIn("pause_reason", n._auto_job)
+            self.assertEqual(n._auto_job["last_pause_reason"], "old transient fault")
+
     def test_init_failure_never_retries(self):
         with tempfile.TemporaryDirectory() as tmp:
             n = self.runner(Path(tmp))
