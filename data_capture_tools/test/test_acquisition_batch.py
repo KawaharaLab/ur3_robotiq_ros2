@@ -357,6 +357,117 @@ class BatchTests(unittest.TestCase):
                 module.reusable_export(export_path, module.file_hash(progress), job)
             )
 
+    def test_last_order_finishes_all_objects_plots_before_any_quality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            entries = [
+                dict(object_id=name, job_id="job", status="pending", stages={})
+                for name in ("object1", "object2")
+            ]
+            calls = []
+
+            def process(entry, *args):
+                calls.extend(
+                    [(entry["object_id"], "export"), (entry["object_id"], "plot")]
+                )
+                entry.update(
+                    status="done",
+                    stages=dict(
+                        export=dict(result="complete"),
+                        plot=dict(result="plots_generated"),
+                    ),
+                )
+
+            def quality(entry, *args):
+                calls.append((entry["object_id"], "quality"))
+                entry["stages"]["quality"] = dict(result="REVIEW")
+
+            with patch.object(module, "discover", return_value=entries), patch.object(
+                module, "process_object", side_effect=process
+            ), patch.object(
+                module, "process_deferred_quality", side_effect=quality
+            ), redirect_stdout(
+                io.StringIO()
+            ):
+                self.assertEqual(
+                    module.main(
+                        [
+                            "--data-root",
+                            str(root / "data"),
+                            "--exports-root",
+                            str(root / "exports"),
+                            "--quality-order",
+                            "last",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                calls,
+                [
+                    ("object1", "export"),
+                    ("object1", "plot"),
+                    ("object2", "export"),
+                    ("object2", "plot"),
+                    ("object1", "quality"),
+                    ("object2", "quality"),
+                ],
+            )
+
+    def test_real_last_order_and_resume_use_identical_stage_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data, progress, job = prepare_dataset(root)
+            args = [
+                "--data-root",
+                str(data),
+                "--exports-root",
+                str(root / "exports"),
+                "--out",
+                str(root / "batch"),
+                "--quality-order",
+                "last",
+            ]
+            calls = []
+            original = module.run_child
+
+            def run(command, *rest):
+                calls.append(
+                    "export"
+                    if "-m" in command
+                    else "plot" if "plot_object" in command[1] else "quality"
+                )
+                return original(command, *rest)
+
+            with patch.object(module, "run_child", side_effect=run), redirect_stdout(
+                io.StringIO()
+            ):
+                self.assertEqual(module.main(args), 0)
+            self.assertEqual(calls, ["export", "plot", "quality"])
+            saved = module.read_json(root / "batch/batch_state.json")
+            self.assertFalse(saved["objects"][0]["quality_pending"])
+            self.assertEqual(
+                saved["objects"][0]["stages"]["quality"]["result"], "REVIEW"
+            )
+            with patch.object(
+                module,
+                "run_child",
+                side_effect=AssertionError("No stage should repeat"),
+            ), redirect_stdout(io.StringIO()):
+                self.assertEqual(module.main(args + ["--resume"]), 0)
+
+    def test_deferred_quality_rejects_changed_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            p = root / "progress.json"
+            p.write_text("{}")
+            entry = dict(
+                status="done", snapshot=str(p), progress=str(p), progress_sha256="old"
+            )
+            with self.assertRaisesRegex(ValueError, "Progress changed"):
+                module.process_deferred_quality(entry, root, {}, lambda: None)
+
     def test_reexport_flag_still_reuses_its_own_completed_export_on_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

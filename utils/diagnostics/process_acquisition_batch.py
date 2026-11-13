@@ -599,6 +599,8 @@ def save_summary(state, root):
     overview = (
         "<p>状態　"
         + html.escape(state["status"])
+        + "　工程　"
+        + html.escape(state.get("phase", ""))
         + "　物体数　"
         + str(len(state["objects"]))
         + "　経過　"
@@ -719,6 +721,24 @@ def execute_stage(
     return stage
 
 
+def processing_inputs(job):
+    sources = source_signature(job)
+    code_files = [
+        REPO / "data_capture_tools/data_capture_tools" / name
+        for name in ("object_plan.py", "compact_export.py", "acquisition_quality.py")
+    ]
+    code_files += [
+        REPO / "utils/diagnostics" / name
+        for name in (
+            "check_object_acquisition.py",
+            "compare_gelsight_local_bag.py",
+            "verify_acquisition_timing.py",
+        )
+    ]
+    hashes = {str(p.relative_to(REPO)): file_hash(p) for p in code_files}
+    return sources, hashes
+
+
 def process_object(entry, root, config, persist):
     if entry["status"] in ("input_error", "skipped_incomplete"):
         return
@@ -740,21 +760,8 @@ def process_object(entry, root, config, persist):
     if not snapshot.exists():
         snapshot.write_bytes(progress.read_bytes())
     entry.update(snapshot=str(snapshot), status="running")
-    sources = source_signature(job)
-    code_files = [
-        REPO / "data_capture_tools/data_capture_tools" / name
-        for name in ("object_plan.py", "compact_export.py", "acquisition_quality.py")
-    ]
-    code_files += [
-        REPO / "utils/diagnostics" / name
-        for name in (
-            "check_object_acquisition.py",
-            "compare_gelsight_local_bag.py",
-            "verify_acquisition_timing.py",
-        )
-    ]
-    hashes = {str(p.relative_to(REPO)): file_hash(p) for p in code_files}
-    if config["quality"]:
+    sources, hashes = processing_inputs(job)
+    if config["quality"] and config.get("quality_order", "first") == "first":
         execute_stage(
             "quality",
             entry,
@@ -765,6 +772,10 @@ def process_object(entry, root, config, persist):
             persist,
             result_root=config["quality_root"],
         )
+    elif config["quality"]:
+        entry["quality_pending"] = True
+        entry["stages"].setdefault("quality", dict(status="deferred", result="後回し"))
+        persist()
     else:
         entry["stages"]["quality"] = dict(status="skipped", result="省略")
         persist()
@@ -881,6 +892,7 @@ def process_object(entry, root, config, persist):
                 }
             ),
         )
+    entry["processing_source_signature"] = sources
     if source_signature(job) != sources:
         entry["error"] = "Source files changed during postprocessing"
     entry["status"] = (
@@ -892,6 +904,35 @@ def process_object(entry, root, config, persist):
         )
         else "processing_error"
     )
+    persist()
+
+
+def process_deferred_quality(entry, root, config, persist):
+    if entry["status"] in ("input_error", "skipped_incomplete") or not entry.get(
+        "snapshot"
+    ):
+        return
+    progress = Path(entry["progress"])
+    if file_hash(progress) != entry["progress_sha256"]:
+        raise ValueError("Progress changed before deferred quality check")
+    snapshot = Path(entry["snapshot"])
+    if file_hash(snapshot) != entry["progress_sha256"]:
+        raise ValueError("Saved progress snapshot changed")
+    job = read_json(snapshot)
+    sources, hashes = processing_inputs(job)
+    if entry.get("processing_source_signature") != sources:
+        raise ValueError("Source files changed between plotting and quality check")
+    execute_stage(
+        "quality",
+        entry,
+        root,
+        snapshot,
+        hashes,
+        sources,
+        persist,
+        result_root=config["quality_root"],
+    )
+    entry["quality_pending"] = False
     persist()
 
 
@@ -909,6 +950,12 @@ def main(argv=None):
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-quality", action="store_true")
+    parser.add_argument(
+        "--quality-order",
+        choices=("first", "last"),
+        default="first",
+        help="last: finish export/plots for all objects before strict quality checks",
+    )
     parser.add_argument(
         "--reexport",
         action="store_true",
@@ -958,6 +1005,7 @@ def main(argv=None):
         exports_root=str(args.exports_root.resolve()),
         objects=sorted(set(args.objects)) if args.objects else [],
         quality=not args.skip_quality,
+        quality_order=args.quality_order,
         reexport=args.reexport,
     )
     if not args.data_root.is_dir():
@@ -988,6 +1036,9 @@ def main(argv=None):
             # Preserve earlier layout when resuming an existing batch.
             for key in ("plots_root", "quality_root"):
                 state["configuration"].setdefault(key, config[key])
+            state["configuration"].setdefault("quality_order", "first")
+            # Ordering affects scheduling, not the frozen data or processing rules.
+            state["configuration"]["quality_order"] = config["quality_order"]
             if state["configuration"] != config:
                 parser.error("Resume arguments differ from the saved configuration")
         else:
@@ -1019,6 +1070,11 @@ def main(argv=None):
 
         previous = signal.signal(signal.SIGTERM, stop)
         state["status"] = "running"
+        state["phase"] = (
+            "export_plot"
+            if config["quality_order"] == "last"
+            else "quality_export_plot"
+        )
         persist()
         try:
             for index, entry in enumerate(state["objects"], 1):
@@ -1036,6 +1092,29 @@ def main(argv=None):
                         error=type(exc).__name__ + ": " + str(exc),
                     )
                     persist()
+            if config["quality"] and config["quality_order"] == "last":
+                state["phase"] = "quality"
+                persist()
+                print(
+                    "Export/plot pass finished. Starting deferred strict quality checks.",
+                    flush=True,
+                )
+                for index, entry in enumerate(state["objects"], 1):
+                    print(
+                        f"[quality {index}/{len(state['objects'])}] {entry['object_id']}",
+                        flush=True,
+                    )
+                    try:
+                        process_deferred_quality(entry, root, config, persist)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        entry["stages"]["quality"] = dict(
+                            status="error",
+                            result="実行エラー",
+                            error=type(exc).__name__ + ": " + str(exc),
+                        )
+                        persist()
             failures = any(
                 e["status"] in ("processing_error", "input_error")
                 or e["stages"].get("quality", {}).get("result")

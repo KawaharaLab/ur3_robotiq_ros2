@@ -1,6 +1,6 @@
 # 収集済みデータの一括処理と実行履歴
 
-`utils/diagnostics/process_acquisition_batch.py`は、物体ごとに厳密チェック → extract_allと同じ処理による展開 → 比較プロットを順番に実行します。ロボット操作は行いません。元bag・進捗JSON・既存出力は変更しません。
+`utils/diagnostics/process_acquisition_batch.py`は、物体ごとに処理します。`--quality-order last`なら全物体の展開・プロットを先に進め、その後で厳密チェックを行います。省略時は従来どおり物体ごとにチェック → 展開 → プロットの順です。ロボット操作は行いません。元bag・進捗JSON・既存出力は変更しません。
 
 ## 保存場所の役割
 
@@ -43,6 +43,7 @@ POSTPROCESS_LOG="./postprocess_$(date +%Y%m%d_%H%M%S).log"
 nohup /usr/bin/python3 src/ur3_robotiq_ros2/utils/diagnostics/process_acquisition_batch.py \
   --data-root /mnt/nvme1/tsumura/masters_thesis/data \
   --exports-root /mnt/nvme1/tsumura/masters_thesis/exports \
+  --quality-order last \
   > "$POSTPROCESS_LOG" 2>&1 < /dev/null &
 echo "$POSTPROCESS_LOG"
 ```
@@ -105,8 +106,21 @@ POSTPROCESS_LOG="./postprocess_resume_$(date +%Y%m%d_%H%M%S).log"
 nohup /usr/bin/python3 src/ur3_robotiq_ros2/utils/diagnostics/process_acquisition_batch.py \
   --data-root /mnt/nvme1/tsumura/masters_thesis/data \
   --exports-root /mnt/nvme1/tsumura/masters_thesis/exports \
+  --quality-order last \
   --out /mnt/nvme1/tsumura/masters_thesis/postprocess/20261112_220000_a1b2c3 \
   --resume > "$POSTPROCESS_LOG" 2>&1 < /dev/null &
 ```
 
 完了工程は条件が一致すれば再利用します。失敗した展開・プロットは別出力先で工程単位でやり直すため、途中出力が残る場合があります。再開はbag内の途中メッセージ単位ではありません。変更検出は完全な全ファイル内容ハッシュではなく、同サイズ・同更新時刻の意図的な改変まで検出する保証はありません。元bagとローカル時刻記録は展開後も保管してください。
+
+## プロットを優先して確認する
+
+`--quality-order last`は、object1の展開・プロット → object2の展開・プロット → … → 全物体の厳密チェック、という順序です。一つの物体のチェックに後続物体の描画が足止めされることを避けます。処理条件やチェック閾値、出力配置は変わりません。既存の展開・プロット・チェック結果も通常の条件で再利用します。
+
+プロットが完成した物体から`plots/物体名`で確認できます。チェック未実行はsummary上で「後回し」として扱い、プロットの完成を品質合格とは扱いません。summaryの工程欄で展開・プロット段階か、チェック段階かを確認できます。展開・描画自体にも処理時間はかかります。
+
+厳密チェックを今回は行わない場合は`--skip-quality`を指定してください。後日、同じ通常コマンドで`--skip-quality`を外して新規実行すれば、条件が一致する展開・図を再利用してチェックできます。`--skip-quality`を変更して同一実行をresumeすることはできません。
+
+既存の中断した実行でも`--out 元の実行フォルダ --resume --quality-order last`で残りの順序を変更できます。処理が動いている最中に同じ履歴先で別の一括処理は起動できません。先に正常な中断・終了を確認してください。再開では対象物体は再検索しません。追加データを含める回は新規実行します。
+
+出力先を明示する場合は、未使用の`--out`を指定します。省略すれば日時別に新しく作られます。起動ログは`postprocess/launch_logs`に日時付きで保存することを推奨します。既存の`run_20261113`を新規実行で上書きすることはありません。
