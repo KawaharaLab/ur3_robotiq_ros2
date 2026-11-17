@@ -1,14 +1,14 @@
 # Example configuration for data_capture_tools
 output_root: /mnt/nvme1/tsumura/masters_thesis/data
-task_name: object4
+task_name: object52
 # Optional observations. specimen_id defaults to task_name; no second JSON needed.
 # These values are recorded only and never change target_diameter or motion.
 # Unknown values stay null. Imperfect mounting/reused samples are permitted.
 specimen_metadata:
-  specimen_width_mm: 30.2 # Measured sample width (mm)
+  specimen_width_mm: 42.0 # Measured sample width (mm)
   width_measurement_state: before clamping # e.g. before clamping, unloaded
-  clamp_gap_mm: 28 # Measured clamp gap (mm), independent of sample width
-  notes: "" # Optional mounting/state changes; exact use count not required
+  clamp_gap_mm: 42.2 # Measured clamp gap (mm), independent of sample width
+  notes: "左の基板・配線を交換。USB基板シリアル D20192LJ → DP04T5CJ。センサ本体は変更なし。ゲル両面テープで固定（安定した固定のため）" # Optional mounting/state changes; exact use count not required
   # Low-frequency optional hardware labels; update only when known/changed.
   finger_id: null
   force_sensor_left_id: null
@@ -19,14 +19,14 @@ label: "" #"ふかふか, fuka-fuka", "かちかち, kachi-kachi", "ぷにぷに
 # "つるつる, tsuru-tsuru", "ぺたぺた, peta-peta", "さらさら, sara-sara", "ざらざら, zara-zara", "すべすべ, sube-sube", "ふさふさ, fusa-fusa", "もこもこ, moko-moko", "べたべた, beta-beta", "ねばねば, neba-neba", "ひんやり, hin-yari", "あつあつ, ats-atsu", "かちかち, kachi-kachi", "ぷにぷに, puni-puni", "ぷりぷり, puri-puri", "ふわふわ, fuwa-fuwa"
 # 基本姿勢
 # 低い方
-initial_arm_pose: [99.25, -80.84, 73.19, -82.27, -90.10, 54.26]
-base_tcp_pose:
-  x: 0.16821
-  y: -0.31254
-  z: -0.06169
-  rx: 1.193
-  ry: 2.916
-  rz: -0.009
+# initial_arm_pose: [99.25, -80.84, 73.19, -82.27, -90.10, 54.26]
+# base_tcp_pose:
+#   x: 0.16821
+#   y: -0.31254
+#   z: -0.06169
+#   rx: 1.193
+#   ry: 2.916
+#   rz: -0.009
 
 # 高い方
 # initial_arm_pose: [99.25, -79.62, 64.80, -75.11, -90.13, 54.22]
@@ -38,18 +38,28 @@ base_tcp_pose:
 #   ry: 2.916
 #   rz: -0.010
 
+#やや高い
+initial_arm_pose: [99.26, -78.35, 58.67, -70.26, -90.18, 54.19]
+base_tcp_pose:
+  x: 0.16823
+  y: -0.31252
+  z: -0.02002
+  rx: 1.193
+  ry: 2.917
+  rz: -0.010
+
 # より高い
-# initial_arm_pose: [99.26, -77.34, 54.55, -67.14, -90.17, 54.18]
-# base_tcp_pose:
-#   x: 0.16825
-#   y: -0.31252
-#   z: -0.01002
-#   rx: 1.193
-#   ry: 2.916
-#   rz: -0.010
+initial_arm_pose: [99.26, -77.34, 54.55, -67.14, -90.17, 54.18]
+base_tcp_pose:
+  x: 0.16825
+  y: -0.31252
+  z: -0.01002
+  rx: 1.193
+  ry: 2.916
+  rz: -0.010
 
 # 実験パラメータ
-target_diameter: 0.030 # 動作計画用の幅 (m)。初期位置に合わせて調整可能。実測幅とは独立。
+target_diameter: 0.048 # 動作計画用の幅 (m)。初期位置に合わせて調整可能。実測幅とは独立。
 gripper_offset: 0.000 # デバイス誤差 (m)
 arm_offset: 0.000 # アームの位置誤差 (m)
 push_depth: 0.004 # 固定深さ動作の既定値 (m)。ad等の各試行条件とは区別する。
