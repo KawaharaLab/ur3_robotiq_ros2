@@ -60,3 +60,16 @@ Hampel候補の既定値は中心21サンプル窓、局所中央値から6×1.4
 ## 結果の共有
 
 まずsummary.txt、report.json、trial_metrics.csv、group_differences.csvを共有してください。PNGは気になる条件を数枚で構いません。これにより「通常の力応答は揃ってノイズだけ減ったか」「保持指標の比較に旧イベントが必要か」を判断できます。
+
+## 旧エクスポートの動作イベントだけを補う
+
+`Trials without event-based hold metrics`に旧試行が出る場合、`--recover-missing-actions`を付け、新しい出力先で比較を再実行できます。元のエクスポートにrobot_action_event.csvが存在しないセッションだけ、manifestに記載された元bagの/robot_action_eventを読み取り専用で検索します。展開済みJPEG・力覚CSVは再生成せず、元エクスポートも変更しません。存在するが内容が不完全なイベントCSVを自動置換する機能ではありません。
+
+補助CSVと出所情報は今回の比較出力の`recovered_actions/old/セッション名/`等へ保存します。元bagのmetadataハッシュがエクスポート時と異なる場合は拒否します。元bagにイベントがなければ指標は引き続き空欄です。bagがファイル圧縮されている場合はDB全体の一時解凍が必要ですが、JPEGファイルとしての全画像展開は行いません。
+
+```bash
+cd /home/tsumura/my_robotiq_ws
+/usr/bin/python3 src/ur3_robotiq_ros2/utils/diagnostics/compare_force_hardware.py   --old-export /mnt/nvme1/tsumura/masters_thesis/exports/object46   --old-job 20261111_185936_5f3edfd4   --new-export /mnt/nvme1/tsumura/masters_thesis/hardware_validation/board_cable_20261113/exports/object46   --new-job 20261113_153717_39022b4e   --recover-missing-actions   --out /mnt/nvme1/tsumura/masters_thesis/hardware_validation/board_cable_20261113/comparison_object46_run2
+```
+
+今回は実機の取り直しを行わず、欠けていたイベント由来の保持・緩和指標を追加するための機能です。構成差の自動合否判定は追加していません。

@@ -356,7 +356,7 @@ class ObjectAutomationMixin:
             from std_msgs.msg import String
             while not done.wait(.05):
                 try:
-                    if time.monotonic()-begin>180.:raise Paused('Init time limit')
+                    if time.monotonic()-begin>(360. if getattr(self, '_two_stage_settings', {}).get('mode') == 'two_stage' else 180.):raise Paused('Init time limit')
                     self._auto_health(check_pose=False,check_force=False)
                 except BaseException as exc:
                     self._auto_abort_reason=str(exc)
@@ -768,6 +768,9 @@ class ObjectAutomationMixin:
             self._auto_save()
 
     def _execute_object_auto(self,resume=False):
+        if getattr(self, "_two_stage_settings", {}).get("test_only"):
+            self.get_logger().error("Collection disabled in two-stage test_only mode")
+            return
         from robotiq_2f_gripper_msgs.msg import RobotActionEvent
         self._auto_event_pub=self.create_publisher(RobotActionEvent,'/robot_action_event',100)
         try:

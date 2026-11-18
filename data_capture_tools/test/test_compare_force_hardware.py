@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import sqlite3
+import struct
 from types import SimpleNamespace as NS
 import unittest
 import numpy as np
@@ -208,6 +210,109 @@ class ComparisonTests(unittest.TestCase):
             with (out / "group_differences.csv").open() as stream:
                 diffs = list(csv.DictReader(stream))
             self.assertTrue(all(not r["new_minus_old"] for r in diffs))
+
+    def test_missing_action_sidecar_is_recovered_without_reexporting_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = fixture(root / "old", "old", 1, 6.0, events=False)
+            new = fixture(root / "new", "new", 1, 8.0)
+            bag = root / "original_bag"
+            bag.mkdir()
+            db = bag / "record.db3"
+            connection = sqlite3.connect(db)
+            connection.executescript(
+                "CREATE TABLE topics(id INTEGER,name TEXT,type TEXT);CREATE TABLE messages(id INTEGER,topic_id INTEGER,timestamp INTEGER,data BLOB);"
+            )
+            connection.execute(
+                "INSERT INTO topics VALUES(1,?,?)",
+                ("/robot_action_event", "robotiq_2f_gripper_msgs/msg/RobotActionEvent"),
+            )
+            connection.execute(
+                "INSERT INTO topics VALUES(2,?,?)",
+                (
+                    "/gelsight/left/image_raw/compressed",
+                    "sensor_msgs/msg/CompressedImage",
+                ),
+            )
+            epoch = 1_700_000_000_000_000_000
+            for index, (name, dt) in enumerate(
+                [("auto_dwell_start", 500_000_000), ("auto_dwell_end", 1_500_000_000)],
+                1,
+            ):
+                raw = bytearray()
+
+                def number(fmt, value, alignment):
+                    raw.extend(b"\0" * ((-len(raw)) % alignment))
+                    raw.extend(struct.pack("<" + fmt, value))
+
+                def string(value):
+                    value = value.encode() + b"\0"
+                    number("I", len(value), 4)
+                    raw.extend(value)
+
+                stamp = epoch + dt
+                number("i", stamp // 10**9, 4)
+                number("I", stamp % 10**9, 4)
+                string("sensor")
+                string(name)
+                number("i", 1, 4)
+                number("i", 2, 4)
+                string("gripper")
+                number("d", 0.03, 8)
+                number("d", 0.0, 8)
+                number("B", 1, 1)
+                connection.execute(
+                    "INSERT INTO messages VALUES(?,?,?,?)",
+                    (index, 1, stamp, b"\0\1\0\0" + raw),
+                )
+            # Invalid JPEG would fail if the implementation scanned image payloads.
+            connection.execute(
+                "INSERT INTO messages VALUES(3,2,?,?)", (epoch, b"not a valid JPEG")
+            )
+            connection.commit()
+            connection.close()
+            (bag / "metadata.yaml").write_text(
+                json.dumps(
+                    dict(
+                        rosbag2_bagfile_information=dict(
+                            storage_identifier="sqlite3",
+                            relative_file_paths=["record.db3"],
+                        )
+                    )
+                )
+            )
+            manifest = old / "session/manifest.json"
+            data = json.loads(manifest.read_text())
+            data["source_bag"] = str(bag)
+            data["source_metadata_sha256"] = m.fingerprint(bag / "metadata.yaml")
+            manifest.write_text(json.dumps(data))
+            before = m.fingerprint(old / "session/force_left.csv")
+            out = root / "out"
+            self.assertEqual(
+                m.main(
+                    [
+                        "--old-export",
+                        str(old),
+                        "--new-export",
+                        str(new),
+                        "--out",
+                        str(out),
+                        "--recover-missing-actions",
+                    ]
+                ),
+                0,
+            )
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["trials_without_hold_events"], [])
+            self.assertEqual(len(report["recovered_action_csvs"]), 1)
+            self.assertFalse((old / "session/robot_action_event.csv").exists())
+            self.assertEqual(m.fingerprint(old / "session/force_left.csv"), before)
+            with (out / "group_differences.csv").open() as stream:
+                diffs = list(csv.DictReader(stream))
+            late = [r for r in diffs if r["metric"] == "late_Fy_n"]
+            self.assertTrue(
+                all(abs(float(r["new_minus_old"]) + 2.0) < 1e-9 for r in late)
+            )
 
     def test_no_matching_conditions_fail_without_creating_output(self):
         with tempfile.TemporaryDirectory() as tmp:

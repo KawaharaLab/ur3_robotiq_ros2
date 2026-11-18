@@ -6,6 +6,8 @@ import csv
 import hashlib
 import json
 import math
+import sqlite3
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -192,13 +194,90 @@ def hampel(times, values, window, multiplier, floor_n, gap_s):
     return mask, medians, thresholds
 
 
-def read_samples(descriptors, sources):
+def recover_actions(descriptors, output, sources):
+    """Read only action messages, preserving original exports; no image extraction."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data_capture_tools"))
+    from data_capture_tools.compact_export import (
+        ACTION,
+        AUXILIARY_FIELDS,
+        auxiliary_payload,
+    )
+    from data_capture_tools.acquisition_quality import CDR, databases
+
+    manifest = load(descriptors[0]["manifest"])
+    bag = Path(manifest["source_bag"])
+    metadata = bag / "metadata.yaml"
+    if not metadata.is_file():
+        raise FileNotFoundError("Original bag metadata not found: " + str(metadata))
+    observed = fingerprint(metadata)
+    if (
+        manifest.get("source_metadata_sha256")
+        and observed != manifest["source_metadata_sha256"]
+    ):
+        raise ValueError("Original bag metadata changed since export: " + str(metadata))
+    sources[str(metadata)] = observed
+    output.mkdir(parents=True)
+    target = output / "robot_action_event.csv"
+    counts = defaultdict(int)
+    with target.open("x", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=AUXILIARY_FIELDS["robot_action_event.csv"]
+        )
+        writer.writeheader()
+        with databases(bag) as paths:
+            for database in paths:
+                connection = sqlite3.connect(
+                    database.resolve().as_uri() + "?mode=ro", uri=True
+                )
+                try:
+                    query = "SELECT m.timestamp,m.data,t.type FROM messages m JOIN topics t ON m.topic_id=t.id WHERE t.name=? ORDER BY m.timestamp,m.id"
+                    for received, payload, typ in connection.execute(query, (ACTION,)):
+                        _, header, values = auxiliary_payload(
+                            ACTION, typ, CDR(payload), received
+                        )
+                        for descriptor in descriptors:
+                            window = descriptor["window"]
+                            if window["start_ns"] <= header <= window["end_ns"] and (
+                                "trial_index" not in window
+                                or values["trial_index"] == window["trial_index"]
+                            ):
+                                writer.writerow(
+                                    dict(
+                                        trial_id=window["trial_id"],
+                                        bag_receive_ns=received,
+                                        **values,
+                                    )
+                                )
+                                counts[window["trial_id"]] += 1
+                finally:
+                    connection.close()
+    (output / "provenance.json").write_text(
+        json.dumps(
+            dict(
+                source_bag=str(bag),
+                metadata_sha256=observed,
+                selected_topic=ACTION,
+                counts=dict(counts),
+                original_export_unchanged=True,
+            ),
+            indent=2,
+        )
+    )
+    sources[str(target)] = fingerprint(target)
+    return target
+
+
+def read_samples(descriptors, sources, recover_root=None):
     by_session = defaultdict(dict)
     for descriptor in descriptors:
         by_session[descriptor["session"]][descriptor["window"]["trial_id"]] = descriptor
     for session, wanted in by_session.items():
         actions = defaultdict(list)
         action_path = session / "robot_action_event.csv"
+        if not action_path.is_file() and recover_root is not None:
+            action_path = recover_actions(
+                list(wanted.values()), recover_root / session.name, sources
+            )
         if action_path.is_file():
             sources[str(action_path)] = fingerprint(action_path)
             with action_path.open(newline="") as stream:
@@ -579,6 +658,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-export", type=Path, required=True)
     parser.add_argument("--new-export", type=Path, required=True)
+    parser.add_argument(
+        "--recover-missing-actions",
+        action="store_true",
+        help="Explicitly read missing action CSVs from original bags into output sidecars; no JPEG export",
+    )
     parser.add_argument("--old-job")
     parser.add_argument("--new-job")
     parser.add_argument("--out", type=Path, required=True)
@@ -622,10 +706,20 @@ def main(argv=None):
                 d["group"] = hashlib.sha256(d["key"].encode()).hexdigest()[:12]
                 for p in (d["manifest"], d["progress"]):
                     sources[str(p)] = fingerprint(p)
-            read_samples(descriptors, sources)
+            if args.recover_missing_actions:
+                args.out.mkdir(parents=True, exist_ok=True)
+            read_samples(
+                descriptors,
+                sources,
+                (
+                    args.out / "recovered_actions" / dataset
+                    if args.recover_missing_actions
+                    else None
+                ),
+            )
     except (OSError, ValueError, KeyError) as exc:
         parser.error(str(exc))
-    args.out.mkdir(parents=True)
+    args.out.mkdir(parents=True, exist_ok=args.recover_missing_actions)
     candidates, metrics, phases = [], [], []
     groups = defaultdict(list)
     for descriptor in old + new:
@@ -724,6 +818,12 @@ def main(argv=None):
         ],
         input_sha256=sources,
         script_sha256=fingerprint(Path(__file__)),
+        recovered_action_csvs=[
+            path
+            for path in sources
+            if str(args.out / "recovered_actions") in path and path.endswith(".csv")
+        ],
+        original_bags_read_for_actions=args.recover_missing_actions,
         limitations=[
             "No automatic equivalence verdict or significance test.",
             "Hampel flags are candidates, not validated noise labels; long bursts can remain.",
@@ -732,7 +832,7 @@ def main(argv=None):
             "Repeated cycles/samples are not independent trials.",
             "Mounting/init/session differences remain confounded with hardware changes.",
             "Only final complete exported attempts are analyzed; abort counts must be evaluated separately.",
-            "No original bag access or physical force calibration; GelSight contact images not assessed.",
+            "Original bags are accessed only with --recover-missing-actions for missing action events; no physical force calibration or GelSight contact assessment.",
         ],
     )
     (args.out / "report.json").write_text(

@@ -1,0 +1,17 @@
+# 追加ブロック。通常の収集YAMLへルートキーとして追加する。
+# nullは実機の寸法・TCP設定を確認して記入。未記入では動作を開始しない。
+initialization:
+  mode: two_stage
+  test_only: true
+  require_gelsight: false
+
+  rotation_deg: 90.0         # +90 / -90 を変更して逆回転を試す（ベースZ軸周り）
+  clamp_center_width_m: null # クランプ軸方向の物体寸法。半幅の粗い位置補正用 (m)
+  stage1_probe_width_m: null # 元の向きでの探査幅。上の寸法より広くする (m)
+  stage2_probe_width_m: null # 回転後の探査幅。target_diameterより広くする (m)
+
+  pivot_tcp_m: [0, 0, 0]    # 今回はTCPが接触面中央と確認済み。TCP設定が異なる場合は要変更
+  retreat_base_m: null       # 退避ベクトル、ベース座標系 (m)。周囲確認後に指定
+  rotation_duration_s: 10.0
+  max_init_force_n: 5.0      # tare後のFy。acのhard_limit_nとは別
+  tcp_frame: base
