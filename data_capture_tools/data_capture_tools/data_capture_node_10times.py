@@ -30,6 +30,7 @@ from .bag_converter import convert_bag_to_dataset
 from .config import CaptureConfig, load_capture_config
 from .force_press_collection import ForcePressCollectionMixin
 from .init_recording import InitRecordingMixin
+from .two_stage_init import TwoStageInitMixin
 from sensor_msgs.msg import Image, CompressedImage
 
 
@@ -228,7 +229,7 @@ class ForceSensorMonitor:
 from .object_automation import ObjectAutomationMixin
 
 
-class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressCollectionMixin, Node):
+class DataCaptureNode(TwoStageInitMixin, ObjectAutomationMixin, InitRecordingMixin, ForcePressCollectionMixin, Node):
     """Coordinates rosbag2 recording and dataset conversion."""
 
     def __init__(self) -> None:
@@ -326,6 +327,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         self._effective_object_width_m = None
         self._init_force_press()
         self._setup_object_automation()
+        self._setup_two_stage_init()
         
         
         # --- 追加: 左右のGelSight監視用変数 ---
@@ -435,7 +437,8 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         if init and offset:
             lateral_offset += offset["lateral_m"]
             vertical_offset += offset["vertical_m"]
-        w_obj = self.config.target_diameter
+        settings = getattr(self, '_two_stage_settings', {'mode': 'legacy'})
+        w_obj = settings['clamp_center_width_m'] if settings['mode'] == 'two_stage' else self.config.target_diameter
         dist = w_obj / 2.0 + self.config.arm_offset
         if not init:
             dist = 0
@@ -443,7 +446,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         # 接近方向: 135度
         # 垂直方向: 45度 (ここに lateral_offset を適用)
         angle_approach = math.radians(135)
-        angle_perpendicular = math.radians(45)
+        angle_perpendicular = math.radians(45 + (settings['rotation_deg'] if settings['mode'] == 'two_stage' else 0))
 
         dx = dist * math.cos(angle_approach) + (lateral_offset * math.cos(angle_perpendicular))
         dy = dist * math.sin(angle_approach) + (lateral_offset * math.sin(angle_perpendicular))
@@ -507,6 +510,9 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             line = sys.stdin.readline().strip().lower()
             if not line: continue
 
+            if self._two_stage_settings['test_only'] and line not in ('i', 't', 'q'):
+                self.get_logger().error('Two-stage test_only: only i/t/q allowed; collection is disabled.')
+                continue
             if not self._force_press_normal_control_ready(line):
                 continue
             if line == 'ac':
@@ -1413,6 +1419,8 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         self.get_logger().info("Auto slide loop completed.")
 
     def _run_init_motion_sequence(self) -> bool:
+        if getattr(self, "_two_stage_settings", {}).get("mode") == "two_stage":
+            return self._run_two_stage_init_motion_sequence()
         # ★ 開始前にGelSightと力センサの両方が生きているかチェック
         if not self._check_sensors_health():
             self.get_logger().error("センサーの停止を検知したため、初期化を開始できません。")
@@ -1632,7 +1640,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
     #         if max(final_left, final_right) > threshold * 2:
     #             self.get_logger().warning("⚠️ オーバーシュートが大きいです。速度を下げるかステップ制御に戻すことを推奨します。")
     
-    def _execute_active_centering(self) -> Optional[float]:
+    def _execute_active_centering(self, axis_yaw_deg=135.0, probe_width_m=None, nominal_width_m=None, edge_only=False, strict=False) -> Optional[float]:
         """
         対象物の中心と有効幅を自動探査する本番仕様のセンタリングロジック。
         ※ グリッパを固定して左右のエッジをステップ探査し、上限・下限を満たす均等な接触をエッジとする。
@@ -1650,7 +1658,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             """指定距離(m)だけ135度方向に相対移動し、完全に停止するまで待機する"""
             if abs(dist_m) < self.config.centering_min_step_arm: return
             
-            angle = math.radians(135)
+            angle = math.radians(axis_yaw_deg)
             dx = dist_m * math.cos(angle)
             dy = dist_m * math.sin(angle)
             dz = 0.0
@@ -1661,9 +1669,14 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
                      f"  movel(target, a=0.1, v=0.01)\n" \
                      f"end\n"
                      
+            if strict:
+                before_pose = self._two_stage_pose()
             self._urscript_pub.publish(String(data=script))
             # 物理的な移動時間 ＋ センサの遅延・振動が収まるまで長めに待機
-            time.sleep(1.0) 
+            if strict:
+                self._two_stage_wait_translation(before_pose, dx, dy, dz)
+            else:
+                time.sleep(1.0)
 
         # ---------------------------------------------------------
         # ヘルパー関数: 上下限（めり込み防止）を備えたエッジ探査
@@ -1713,6 +1726,8 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
                     # 安全装置: 3cm以上移動したら異常とみなす
                     if abs(accumulated_pos) > 0.03:
                         self.get_logger().error("探索限界距離(30mm)に到達しました。")
+                        if strict:
+                            raise RuntimeError("Centering edge travel exceeds 30 mm")
                         return accumulated_pos
                         
             return accumulated_pos
@@ -1721,7 +1736,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         # 1. プローブ幅の固定とTare
         # =========================================================
         # config のターゲット直径 ＋ 事前アプローチ用余白(safe_margin)をプローブ幅とする
-        probe_w = self.config.target_diameter + self.config.safe_margin
+        probe_w = self.config.target_diameter + self.config.safe_margin if probe_width_m is None else probe_width_m
         
         self.get_logger().info(f"1. グリッパを探査幅({probe_w*1000:.1f}mm)に固定し、ゼロ点をセットします。")
         self._sequence_finished_event.clear()
@@ -1769,6 +1784,17 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         # 探査で得られた実際の接触位置から実測幅を計算
         measured_width = probe_w - (abs(pos_right) + abs(pos_left))
         
+        if strict and not (pos_right <= 0 <= pos_left and pos_right < pos_left):
+            raise RuntimeError("Probe origin is not bracketed by both edges")
+        if strict and not 0 < measured_width < probe_w:
+            raise RuntimeError("Invalid two-stage edge geometry")
+        if edge_only:
+            self._init_observe('two_stage_clamp_center', axis_yaw_deg=axis_yaw_deg,
+                               probe_width_m=probe_w, right_edge_offset_m=pos_right,
+                               left_edge_offset_m=pos_left, center_offset_m=center_pos,
+                               estimated_object_width_m=measured_width)
+            return measured_width
+
         # 潰さないよう数mm手前(例: +5mm)で高速アプローチを止める
         approach_margin = 0.005  
         safe_stop_width = measured_width + approach_margin
@@ -1797,7 +1823,7 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         self._force_monitor.tare()
         
         step_g = self.config.centering_step_grip
-        safe_minimum_width = self.config.target_diameter - 0.010 
+        safe_minimum_width = (self.config.target_diameter if nominal_width_m is None else nominal_width_m) - 0.010
         balance_tol = 0.10  # 左右の力差許容値
         
         # --- ★追加: ループ対策用の変数 ---
@@ -1809,6 +1835,10 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         best_state = {"f_l": 99.0, "f_r": 99.0, "w": 0.0, "pos": 0.0, "diff": 99.0}
         
         while rclpy.ok():
+            if strict:
+                self._two_stage_check()
+                if abs(current_pos) > 0.01:
+                    raise RuntimeError("Final centering travel exceeds 10 mm")
             current_w = self._current_gripper_width_m
             f_l = self._force_monitor.get_calibrated_left()
             f_r = self._force_monitor.get_calibrated_right()
@@ -1817,13 +1847,13 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
             
             self.get_logger().info(f"[DEBUG Final] 幅: {current_w*1000:.1f}mm | L={f_l:.3f}N, R={f_r:.3f}N")
             
-            if f_l >= T_min and f_r >= T_min and force_diff < best_state["diff"]:
+            if f_l >= T_min and f_r >= T_min and force_diff < best_state["diff"] and (not strict or max_f <= T_max):
                 best_state = {"f_l": f_l, "f_r": f_r, "w": current_w, "pos": current_pos, "diff": force_diff}
                 self._mark_init_selection(best_state)
                 self.get_logger().info(f"ベスト更新: グリッパ{current_w*1000:.1f}mm, アーム{current_pos*1000:.1f}mm, 差{force_diff:.3f}N")
             
             # --- 1. 【最優先】両方が接触し、かつバランスが取れている場合（大成功） ---
-            if f_l >= T_min and f_r >= T_min and force_diff <= balance_tol:
+            if f_l >= T_min and f_r >= T_min and force_diff <= balance_tol and (not strict or max_f <= T_max):
                 self.get_logger().info(f"★ 幅の特定完了(均等接触): L={f_l:.3f}N, R={f_r:.3f}N")
                 break
             
@@ -1900,6 +1930,9 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
                 return None
             time.sleep(0.8) 
             
+        if strict and (best_state['w'] <= 0 or best_state['diff'] > balance_tol
+                       or max(best_state['f_l'], best_state['f_r']) > T_max):
+            raise RuntimeError("Two-stage init did not establish balanced low-force contact")
         # --- 確定復帰処理 ---
         self.get_logger().info(f"ベスト状態(グリッパ{best_state['w']*1000:.1f}mm, アーム{best_state['pos']*1000:.1f}mm)へ完全復帰します。")
         
@@ -1920,6 +1953,8 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         f_r = self._force_monitor.get_calibrated_right()
         self.get_logger().info(f"最終確定値: 幅{self._current_gripper_width_m*1000:.1f}mm | L={f_l:.3f}N, R={f_r:.3f}N")
             
+        if strict and not (T_min <= f_l <= T_max and T_min <= f_r <= T_max and abs(f_l-f_r) <= balance_tol):
+            raise RuntimeError('Final contact changed during restore')
         self._init_observe('centering_result', selected_best_state=dict(best_state),
                            final_force_n=dict(left=f_l, right=f_r),
                            final_balanced_contact=(f_l >= T_min and f_r >= T_min and abs(f_l-f_r) <= balance_tol),
@@ -2488,6 +2523,8 @@ class DataCaptureNode(ObjectAutomationMixin, InitRecordingMixin, ForcePressColle
         left_gs_ok = (now - self._last_gelsight_left_time) < self._gelsight_timeout_sec
         right_gs_ok = (now - self._last_gelsight_right_time) < self._gelsight_timeout_sec
         
+        if getattr(self, "_two_stage_running", False) and not self._two_stage_settings["require_gelsight"]:
+            left_gs_ok = right_gs_ok = True
         if not left_gs_ok:
             self.get_logger().error(f"左のGelSight(gelsight1)が停止しています！")
             all_ok = False

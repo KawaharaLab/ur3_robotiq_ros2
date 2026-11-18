@@ -357,6 +357,10 @@ class InitRecordingMixin:
                 result = log.close(success, self._init_contact, error)
                 with self._init_record_lock:
                     result['valid_for_collection'] = bool(valid and not self._init_driver_changed and result['recording_complete'])
+                    result['initialization_mode'] = getattr(self, '_two_stage_settings', {'mode': 'legacy'})
+                    if result['initialization_mode'].get('test_only'):
+                        result['valid_for_collection'] = False
+                        result['test_only_motion_success'] = success
                     result['schema_version'] = 2
                     result['record_quality_valid'] = result['valid_for_collection']
                     result['contact_criteria_met'] = (self._init_contact or {}).get('sources', {}).get('centering_result', {}).get('final_balanced_contact')
@@ -372,11 +376,14 @@ class InitRecordingMixin:
                         self._last_successful_init = log.path
                     else:
                         self._invalidate_init()
-                        self.get_logger().error('Init result not reusable; inspect '+str(log.path/'summary.json'))
+                        if result.get('test_only_motion_success'):
+                            self.get_logger().info('Test init succeeded; intentionally not reusable for collection: '+str(log.path/'summary.json'))
+                        else:
+                            self.get_logger().error('Init result not reusable; inspect '+str(log.path/'summary.json'))
             except Exception as e:
                 self._invalidate_init()
                 self.get_logger().error('Could not finalize init record; run init again: '+repr(e))
-        return success and self._last_successful_init == log.path
+        return success and (self._last_successful_init == log.path or getattr(self, '_two_stage_settings', {}).get('test_only', False))
 
     def _attach_init_record(self, session_dir):
         measurements = read_capture_measurements(self.config, getattr(self, '_specimen_metadata_path', None))
