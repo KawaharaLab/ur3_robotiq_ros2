@@ -26,8 +26,18 @@ def settings_from(raw):
             raise ValueError("test_only requires two_stage")
         return s
     s.setdefault("rotation_deg", 90.0)
-    if s["rotation_deg"] not in (-90, 90):
-        raise ValueError("rotation_deg must be +90 or -90 (base Z axis)")
+    angle = s["rotation_deg"]
+    if (
+        isinstance(angle, bool)
+        or not isinstance(angle, (int, float))
+        or not math.isfinite(angle)
+        or not 0 < abs(angle) <= 90
+    ):
+        raise ValueError("rotation_deg must be finite, nonzero and within -90 to +90")
+    if not s["test_only"] and angle not in (-90, 90):
+        raise ValueError(
+            "Collection requires +90 or -90; small angles require test_only"
+        )
     for key in ("clamp_center_width_m", "stage1_probe_width_m", "stage2_probe_width_m"):
         if not isinstance(s.get(key), (float, int)) or not 0 < s[key] <= 0.135:
             raise ValueError(key + " must be explicitly set within (0, 0.135] m")
@@ -42,6 +52,17 @@ def settings_from(raw):
         raise ValueError("pivot_tcp_m exceeds 0.5 m")
     if not 0.01 <= np.linalg.norm(s["retreat_base_m"]) <= 0.15:
         raise ValueError("retreat_base_m must have length 10 to 150 mm")
+    s.setdefault("post_rotation_z_offset_m", 0.0)
+    dz = s["post_rotation_z_offset_m"]
+    if (
+        isinstance(dz, bool)
+        or not isinstance(dz, (int, float))
+        or not math.isfinite(dz)
+        or abs(dz) > 0.1
+    ):
+        raise ValueError(
+            "post_rotation_z_offset_m must be finite within -0.1 to +0.1 m"
+        )
     s.setdefault("rotation_duration_s", 10.0)
     s.setdefault("max_init_force_n", 5.0)
     if not 5 <= s["rotation_duration_s"] <= 30:
@@ -379,13 +400,41 @@ class TwoStageInitMixin:
                 pivot_tcp_m=s["pivot_tcp_m"],
                 retreat_base_m=s["retreat_base_m"],
                 rotation_deg=s["rotation_deg"],
+                post_rotation_z_offset_m=s["post_rotation_z_offset_m"],
             )
+            height_delta = np.array([0.0, 0.0, s["post_rotation_z_offset_m"]])
             for target, label in zip(targets, ("retreat", "rotate", "return_center")):
+                if label == "return_center":
+                    target = (target[0] + height_delta, target[1])
                 self._two_stage_move(
                     target,
                     label,
                     s["rotation_duration_s"] if label == "rotate" else None,
                 )
+                if (
+                    label == "rotate"
+                    and s["test_only"]
+                    and s["rotation_deg"] not in (-90, 90)
+                ):
+                    self._two_stage_check()
+                    self._init_observe(
+                        "two_stage_rotation_test_complete",
+                        rotation_deg=s["rotation_deg"],
+                        left_at_retreat=True,
+                        gripper_open_width_m=0.135,
+                        note="No return to specimen, no stage-2 centering, not a collection reference",
+                    )
+                    self.get_logger().warning(
+                        "Small-angle rotation test complete: left OPEN at RETREAT; "
+                        "no return to specimen or second-stage centering. Not reusable for collection."
+                    )
+                    return True
+                if label == "rotate" and s["post_rotation_z_offset_m"] != 0:
+                    # Keep the gripper open and the retreat displacement while
+                    # changing height. Return only after the new height is reached.
+                    self._two_stage_move(
+                        (target[0] + height_delta, target[1]), "post_rotation_height"
+                    )
             lateral = offset.get("lateral_m", 0)
             if lateral:
                 before = self._two_stage_pose()

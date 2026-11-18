@@ -45,6 +45,49 @@ class GeometryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.settings_from({"initialization": raw})
 
+    def test_small_angles_only_for_test_mode(self):
+        for angle in (-20, 20, -0.5, 0.5):
+            self.assertEqual(
+                m.settings_from(
+                    {"initialization": {**settings(), "rotation_deg": angle}}
+                )["rotation_deg"],
+                angle,
+            )
+            with self.assertRaises(ValueError):
+                m.settings_from(
+                    {
+                        "initialization": {
+                            **settings(),
+                            "rotation_deg": angle,
+                            "test_only": False,
+                            "require_gelsight": True,
+                        }
+                    }
+                )
+        for angle in (0, True, "-20", float("nan"), float("inf"), -91):
+            with self.assertRaises(ValueError):
+                m.settings_from(
+                    {"initialization": {**settings(), "rotation_deg": angle}}
+                )
+
+    def test_height_offset_defaults_and_validation(self):
+        self.assertEqual(
+            m.settings_from({"initialization": settings()})["post_rotation_z_offset_m"],
+            0,
+        )
+        for dz in (-0.02, 0.02):
+            self.assertEqual(
+                m.settings_from(
+                    {"initialization": {**settings(), "post_rotation_z_offset_m": dz}}
+                )["post_rotation_z_offset_m"],
+                dz,
+            )
+        for dz in (True, "-0.02", float("nan"), float("inf"), -0.101, 0.101):
+            with self.assertRaises(ValueError):
+                m.settings_from(
+                    {"initialization": {**settings(), "post_rotation_z_offset_m": dz}}
+                )
+
     def test_missing_pivot_and_retreat_rejected(self):
         for key in (
             "pivot_tcp_m",
@@ -241,6 +284,73 @@ class SequenceTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(len([x for x in f.records if x[0] == "contact"]), 1)
+
+    def test_small_angle_stops_open_at_retreat_before_return_and_stage_two(self):
+        for angle in (-20, 20):
+            f = Fake()
+            f._two_stage_settings["rotation_deg"] = angle
+            self.assertTrue(self.run_fake(f))
+            self.assertEqual(
+                [x[0] for x in f.moves],
+                ["clamp_coarse_center", "gripper", "gripper", "retreat", "rotate"],
+            )
+            self.assertEqual(len(f.centers), 1)
+            self.assertEqual(f.moves[2], ("gripper", 0.135))
+            kinds = [x[0] for x in f.records]
+            self.assertIn("two_stage_rotation_test_complete", kinds)
+            self.assertNotIn("contact", kinds)
+            self.assertNotIn("two_stage_complete", kinds)
+            self.assertFalse(f._two_stage_running)
+
+    def test_height_change_after_rotation_before_return_for_both_signs(self):
+        for angle in (-90, 90):
+            for dz in (-0.02, 0.02):
+                f = Fake()
+                f._two_stage_settings.update(
+                    rotation_deg=angle, post_rotation_z_offset_m=dz
+                )
+                self.assertTrue(self.run_fake(f))
+                labels = [x[0] for x in f.moves]
+                self.assertLess(
+                    labels.index("rotate"), labels.index("post_rotation_height")
+                )
+                self.assertLess(
+                    labels.index("post_rotation_height"), labels.index("return_center")
+                )
+                self.assertEqual(f.moves[2], ("gripper", 0.135))
+                pose0 = f._two_stage_pose()
+                pivot = np.array(f._two_stage_settings["pivot_tcp_m"])
+                expected = m.rotation_targets(
+                    *pose0, pivot, f._two_stage_settings["retreat_base_m"], angle
+                )
+                moves = {label: target for label, target in f.moves}
+                np.testing.assert_allclose(
+                    moves["post_rotation_height"][0], expected[1][0] + [0, 0, dz]
+                )
+                final_p, final_r = moves["return_center"]
+                np.testing.assert_allclose(
+                    final_p + final_r @ pivot, pose0[0] + pose0[1] @ pivot + [0, 0, dz]
+                )
+                np.testing.assert_allclose(
+                    moves["clamp_coarse_center"][0][2], pose0[0][2]
+                )
+                self.assertEqual(len(f.centers), 2)
+
+    def test_small_angle_ignores_height_change(self):
+        f = Fake()
+        f._two_stage_settings.update(rotation_deg=-20, post_rotation_z_offset_m=-0.02)
+        self.assertTrue(self.run_fake(f))
+        self.assertNotIn("post_rotation_height", [x[0] for x in f.moves])
+        self.assertNotIn("return_center", [x[0] for x in f.moves])
+
+    def test_height_failure_stops_before_return_and_second_centering(self):
+        f = Fake()
+        f._two_stage_settings["post_rotation_z_offset_m"] = -0.02
+        f.fail = "post_rotation_height"
+        self.assertFalse(self.run_fake(f))
+        self.assertEqual(len(f.centers), 1)
+        self.assertNotIn("return_center", [x[0] for x in f.moves])
+        self.assertIn("stop", f._cmd_pub.messages)
 
     def test_failed_rotation_never_returns_or_runs_stage_two(self):
         f = Fake()
